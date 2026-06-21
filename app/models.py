@@ -1,0 +1,63 @@
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, LargeBinary, Enum
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship
+from datetime import datetime
+
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    rooms = relationship("RoomMember", back_populates="user")
+    messages = relationship("Message", back_populates="user")
+
+class Room(Base):
+    __tablename__ = "rooms"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    secret_phrase_hash = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    # Relationships
+    owner = relationship("User", foreign_keys=[owner_id])
+    members = relationship("RoomMember", back_populates="room")
+    messages = relationship("Message", back_populates="room")
+
+class RoomMember(Base):
+    __tablename__ = "room_members"
+
+    id = Column(Integer, primary_key=True, index=True)
+    room_id = Column(Integer, ForeignKey("rooms.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    joined_at = Column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    room = relationship("Room", back_populates="members")
+    user = relationship("User", back_populates="rooms")
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    room_id = Column(Integer, ForeignKey("rooms.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    message_type = Column(Enum('text', 'image', 'file', 'video', name='messagetype'), nullable=False)
+    content = Column(Text)  # for text messages
+    data = Column(LargeBinary)  # for binary data (image, file, video)
+    thumbnail = Column(LargeBinary)  # for image thumbnail
+    file_name = Column(String)
+    mime_type = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    room = relationship("Room", back_populates="messages")
+    user = relationship("User", back_populates="messages")

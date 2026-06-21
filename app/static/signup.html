@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Create account · Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="auth-body">
+    <main class="auth-card">
+        <h1>Create your account</h1>
+        <p class="auth-sub">Pick a username to get a room you can share.</p>
+        <form id="signup-form" novalidate>
+            <label>
+                <span>Username</span>
+                <input type="text" id="signup-username" name="username" autocomplete="username" required>
+            </label>
+            <label>
+                <span>Email</span>
+                <input type="email" id="signup-email" name="email" autocomplete="email" required>
+            </label>
+            <label>
+                <span>Password</span>
+                <input type="password" id="signup-password" name="password" autocomplete="new-password" minlength="6" required>
+            </label>
+            <button type="submit" class="btn btn-primary">Create account</button>
+            <p id="signup-error" class="form-error" role="alert"></p>
+        </form>
+        <p class="auth-foot">Already have an account? <a href="/login">Sign in</a></p>
+    </main>
+    <script src="/static/script.js"></script>
+</body>
+</html>

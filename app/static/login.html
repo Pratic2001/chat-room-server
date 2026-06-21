@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign in · Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="auth-body">
+    <main class="auth-card">
+        <h1>Welcome back</h1>
+        <p class="auth-sub">Sign in to continue chatting with your rooms.</p>
+        <form id="login-form" novalidate>
+            <label>
+                <span>Username</span>
+                <input type="text" id="login-username" name="username" autocomplete="username" required>
+            </label>
+            <label>
+                <span>Password</span>
+                <input type="password" id="login-password" name="password" autocomplete="current-password" required>
+            </label>
+            <button type="submit" class="btn btn-primary">Sign in</button>
+            <p id="login-error" class="form-error" role="alert"></p>
+        </form>
+        <p class="auth-foot">Don't have an account? <a href="/signup">Create one</a></p>
+    </main>
+    <script src="/static/script.js"></script>
+</body>
+</html>
