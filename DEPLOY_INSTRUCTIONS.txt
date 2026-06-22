@@ -1,0 +1,511 @@
+================================================================================
+  chat-room-server — full deployment runbook
+  (Jenkins host 192.168.0.111  →  k8s cluster 192.168.0.104 / 192.168.0.106)
+================================================================================
+
+This runbook walks you through everything from a fresh 192.168.0.111
+(assuming the k8s cluster at 192.168.0.104/192.168.0.106 is already
+running) to a fully automated CI/CD pipeline that builds containerd
+images on every push to `main` and rolls them out to the cluster.
+
+KEY DESIGN DECISION
+-------------------
+Jenkins NEVER reads your personal dev directory. It always clones the
+repo into its own workspace ($JENKINS_HOME/workspace/chatroom-server
+by default). This avoids:
+  * "dubious ownership" errors from git refusing to trust your home
+    directory's ownership
+  * permission fights between pratic and jenkins
+  * accidental deploys of uncommitted local edits
+
+You have two ways to expose the source to Jenkins, in order of
+preference:
+
+  (A) Git remote (recommended) — push the repo to GitHub / Gitea /
+      a bare repo on the Jenkins host. Jenkins pulls via SSH/HTTPS.
+  (B) Local bare repo on the Jenkins host — if you have no remote
+      yet, create a bare clone at /home/pratic/chatroom-server.git
+      on the Jenkins host and push to it from your dev machine.
+      Jenkins clones from that bare repo via the local filesystem.
+
+Either way, Jenkins never touches /home/pratic/Desktop/chat-room-server.
+
+All commands assume you are logged in as the `pratic` user on
+192.168.0.111 unless stated otherwise.
+
+--------------------------------------------------------------------------------
+SECTION 1.  EXPOSE THE SOURCE TO JENKINS (one-time, pick A or B)
+--------------------------------------------------------------------------------
+
+1A.  Use a Git remote (recommended)
+
+       # from your dev machine, push to wherever you host git
+       cd /home/pratic/Desktop/chat-room-server
+       git remote add origin git@github.com:pratic/chat-room-server.git   # example
+       git push -u origin main
+
+     Then in the Jenkins job (section 2.5 below) use:
+         Repository URL: git@github.com:pratic/chat-room-server.git
+         Credentials:    the SSH credential for that remote
+
+1B.  Use a local bare repo on the Jenkins host
+
+     If you have no remote yet, a bare repo on the same host is the
+     simplest "remote":
+
+       # one-time, on 192.168.0.111 as pratic:
+       git clone --bare /home/pratic/Desktop/chat-room-server \
+                     /home/pratic/chatroom-server.git
+
+       # add it as a remote and push, from your dev machine:
+       cd /home/pratic/Desktop/chat-room-server
+       git remote add jenkins /home/pratic/chatroom-server.git
+       git push jenkins main
+
+     Then in the Jenkins job use:
+         Repository URL: file:///home/pratic/chatroom-server.git
+         Credentials:    - none -
+
+     No "dubious ownership" warning here either, because:
+       * the repo's owning user (pratic) matches the SSH login user
+       * the bare repo's permissions are whatever pratic normally uses
+       * Jenkins reads it as pratic (via the SSH agent credential)
+         and never needs to run `git` against it itself
+
+--------------------------------------------------------------------------------
+SECTION 2.  INSTALL JENKINS + BUILD-KIT ON THE JENKINS HOST (192.168.0.111)
+--------------------------------------------------------------------------------
+
+2.1  Install Jenkins (LTS, official apt repo)
+
+    curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key \
+      | sudo tee /usr/share/keyrings/jenkins-keyring.asc >/dev/null
+    echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] \
+      https://pkg.jenkins.io/debian-stable binary/" \
+      | sudo tee /etc/apt/sources.list.d/jenkins.list >/dev/null
+    sudo apt update
+    sudo apt install -y jenkins openjdk-17-jdk
+    sudo systemctl enable --now jenkins
+    sudo systemctl status jenkins --no-pager
+
+    Unlock with the initial admin password:
+
+        sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+
+    Open  http://192.168.0.111:8080  in a browser and:
+      - Paste the unlock password
+      - Choose "Install suggested plugins"
+      - Create the first admin user (use any creds; the admin password
+        here is unrelated to the SSH key the pipeline uses)
+      - Leave the default Jenkins URL as http://192.168.0.111:8080
+
+2.2  Install the required Jenkins plugins
+
+    Manage Jenkins  →  Plugins  →  Available plugins
+    Install these (search by name, tick the box, click Install):
+
+      * Pipeline
+      * Git
+      * SSH Agent
+      * Credentials Binding
+      * Timestamper
+
+    SKIP the suggested "Docker Pipeline" and "Kubernetes" plugins — we
+    drive everything from the Jenkinsfile and sshagent, so they add
+    no value here.
+
+    Restart Jenkins when prompted.
+
+2.3  Install buildkit on the host (NOT inside Jenkins)
+
+    sudo apt install -y buildkitd buildctl
+    sudo systemctl enable --now buildkitd
+    sudo systemctl status buildkitd --no-pager
+
+    Make sure the `jenkins` user can reach the buildkit socket:
+
+        sudo chmod 755 /run/buildkit
+        sudo systemctl restart buildkitd
+
+    Sanity check (must succeed without sudo):
+
+        sudo -u jenkins buildctl --addr unix:///run/buildkit/buildkitd.sock debug workers
+
+2.4  Add the SSH credential Jenkins will use to reach the k8s nodes
+
+    Manage Jenkins  →  Credentials  →  System  →  Global credentials
+    →  Add Credentials
+
+      Kind:               SSH Username with private key
+      Scope:              Global
+      ID:                 pratic-ssh          <-- exact ID matters, the
+                                                 Jenkinsfile references it
+      Username:           pratic
+      Private Key:        Enter directly  →  paste the contents of
+                              /home/pratic/.ssh/id_ed25519
+      Passphrase:         (empty)
+      Treat username as secret:  unchecked
+
+    This is the same key pratic already uses to ssh to 192.168.0.104
+    and 192.168.0.106 from 192.168.0.111. The same key also
+    authenticates to the git remote (option 1A above) if it's an SSH
+    URL — add it to the GitHub/Gitea account, or create a second
+    Jenkins credential for the git remote if it lives elsewhere.
+
+    IF you use a local bare repo (option 1B), no extra git credential
+    is needed; the bare repo's filesystem permissions are what matter
+    (see section 1B).
+
+2.5  Create the pipeline job
+
+    New Item  →  name: chatroom-server
+              →  type: Pipeline  →  OK
+
+      Definition:        Pipeline script from SCM
+      SCM:               Git
+
+      # ----- if you went with option 1A (remote) -----
+      Repository URL:    git@github.com:pratic/chat-room-server.git
+      Credentials:       the SSH credential for that remote
+      # -----------------------------------------------
+
+      # ----- if you went with option 1B (local bare repo) -----
+      Repository URL:    file:///home/pratic/chatroom-server.git
+      Credentials:       - none -
+      # ------------------------------------------------------
+
+      Branches:          */main
+      Script Path:       Jenkinsfile
+
+      Build Triggers:    Poll SCM   schedule:  H/5 * * * *
+                         (every 5 min, offset to avoid the :00 spike).
+                         Switch to "GitHub hook trigger" once a
+                         webhook is set up.
+
+    Save.  Do NOT click "Build Now" yet — the cluster is not bootstrapped.
+
+2.6  Confirm Jenkins can clone
+
+    Open the job → "Build Now" once.
+
+    Expected:
+      ✓ Checkout    — completes; the workspace shows the repo files
+
+    If you see "fatal: detected dubious ownership" or similar, you
+    used a local filesystem URL but the repo is owned by a user that
+    doesn't match who Jenkins runs as. Fix by switching to option 1A
+    or 1B above; do NOT run `git config --global --add safe.directory`
+    because the workspace directory is recreated on every build.
+
+--------------------------------------------------------------------------------
+SECTION 3.  BOOTSTRAP THE KUBERNETES CLUSTER (one-time)
+--------------------------------------------------------------------------------
+
+These steps are wrapped in scripts/bootstrap.sh. The script is
+idempotent; re-running it later is safe and is the recommended way to
+handle "I added a new k8s node" scenarios.
+
+3.1  Verify SSH access to both k8s nodes from 192.168.0.111
+
+    ssh -o BatchMode=yes pratic@192.168.0.104 'echo OK; hostname; kubectl get nodes'
+    ssh -o BatchMode=yes pratic@192.168.0.106 'echo OK; hostname'
+
+    Both must succeed without prompting for a password. If the worker
+    refuses the host key, accept it once interactively:
+
+        ssh pratic@192.168.0.106
+
+3.2  Install the `local-path` StorageClass (kubeadm ships without one)
+
+    ssh pratic@192.168.0.104 'kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.30/deploy/local-path-storage.yaml'
+    ssh pratic@192.168.0.104 'kubectl annotate storageclass local-path storageclass.kubernetes.io/is-default-class=true --overwrite'
+    ssh pratic@192.168.0.104 'kubectl get storageclass'
+
+    You should see `local-path` listed as the default. The MySQL PVC
+    in k8s/30-mysql-statefulset.yaml requests this class.
+
+3.3  Run the bootstrap script
+
+    cd /home/pratic/Desktop/chat-room-server
+    bash scripts/bootstrap.sh
+
+    What it does, in order:
+      1.  Verifies SSH to all k8s nodes
+      2.  Installs local-path-provisioner (skipped if already present)
+      3.  Installs the sudoers snippet (ctr + kubectl, scoped tightly)
+          on every node currently in the cluster
+      4.  Applies k8s/00-namespace.yaml (creates `chatroom` namespace)
+      5.  Renders a ConfigMap from database_setup.sql for the init Job
+      6.  Generates random passwords (mysql root, app user, JWT
+          secret, Fernet key) and writes them to
+              ~/.chatroom-bootstrap/secrets.env   (mode 0600)
+          These values are NEVER echoed to the terminal and NEVER
+          committed to git. Back this file up — you'll need it to
+          recreate the live k8s Secrets if disaster strikes.
+      7.  Creates the live k8s `mysql-secret` and `chatroom-secrets`
+          with real values via `kubectl create secret --from-literal=`
+      8.  Applies k8s/30-mysql-statefulset.yaml and waits for mysql-0
+          to become Ready (timeout 5 minutes)
+      9.  Applies k8s/35-mysql-init-job.yaml and waits for the Job to
+          complete (timeout 5 minutes) — this loads database_setup.sql
+          and creates the `chatroom` MySQL user
+     10.  Applies k8s/20-configmap.yaml, k8s/40-deployment.yaml (with a
+          placeholder tag), and k8s/50-service.yaml
+     11.  Patches /etc/nginx/nginx.conf so the existing TLS server
+          proxies to http://192.168.0.104:30800 (the new NodePort),
+          with WebSocket upgrade headers and `client_max_body_size 100m`
+
+    Expected output ends with:
+        bootstrap complete. You can now trigger a Jenkins build.
+
+3.4  Verify the cluster looks right
+
+    ssh pratic@192.168.0.104 'kubectl -n chatroom get all'
+    # Expect: pod/mysql-0 (Running), pod/mysql-init-* (Completed or
+    # absent), service/mysql (ClusterIP), service/chatroom-server
+    # (NodePort 30800). The chatroom-server-* pods will only appear
+    # after the first Jenkins build (the placeholder tag is not in
+    # any node's image store yet).
+
+    ssh pratic@192.168.0.104 'kubectl -n chatroom get pvc'
+    # Expect: mysql-data-mysql-0  Bound  5Gi  local-path
+
+    ssh pratic@192.168.0.104 'kubectl -n chatroom exec mysql-0 -- \
+      mysql -u root -p"$MYSQL_ROOT_PASSWORD" -e "SHOW DATABASES;"'
+    # Expect: chatroom_db listed
+
+3.5  (Optional) Migrate data from the old MySQL on 192.168.0.111
+
+    If your current local MySQL on 192.168.0.111 has data you want to
+    keep, dump it now and restore into the cluster's MySQL:
+
+        mysqldump -u root -p --single-transaction --routines --triggers \
+          --databases chatroom_db \
+          | gzip > /tmp/chatroom_db.sql.gz
+        scp /tmp/chatroom_db.sql.gz pratic@192.168.0.104:/tmp/
+        ssh pratic@192.168.0.104
+        kubectl -n chatroom exec -i mysql-0 -- \
+          bash -c 'gunzip | mysql -u root -p"$MYSQL_ROOT_PASSWORD" chatroom_db' \
+          < /tmp/chatroom_db.sql.gz
+
+3.6  (Optional) Decommission the old local MySQL and uvicorn
+
+    On 192.168.0.111:
+
+        sudo systemctl disable --now mysql          # or mariadb
+        pkill -f 'uvicorn app.main:app'             # stop the old backend
+
+    Wait at least 24 hours and confirm the cluster is healthy before
+    permanently closing port 3306 in the firewall.
+
+--------------------------------------------------------------------------------
+SECTION 4.  TRIGGER THE FIRST JENKINS BUILD
+--------------------------------------------------------------------------------
+
+4.1  Open the Jenkins UI
+
+    http://192.168.0.111:8080/job/chatroom-server
+
+    Click "Build Now" on the left sidebar.  Watch the stages in the
+    "Stage View".
+
+4.2  Expected stage progression
+
+      ✓ Checkout                  (clones into Jenkins workspace)
+      ✓ Lint                      (skipped if hadolint missing)
+      ✓ Ensure BuildKit
+      ✓ Build app image           (uses files from the cloned workspace)
+      ✓ Distribute to cluster     <-- key stage: discovers nodes via
+                                      kubectl, scp's the tarball,
+                                      ctr-imports to each
+      ✓ Smoke test (any node)
+      ✓ Deploy                    <-- scp's k8s/*.yaml to control
+                                      plane, envsubst, kubectl apply,
+                                      set image, rollout status
+      ✓ Verify                    <-- curl http://K8S_API:30800/healthz
+                                      and https://localhost/healthz
+
+    Total wall time: roughly 1-2 minutes for the build, plus 30-60s
+    for the rolling update.
+
+4.3  Troubleshooting first-run failures
+
+    | Stage             | Symptom                                    | Fix
+    |-------------------|--------------------------------------------|-----------------------------
+    | Checkout          | "dubious ownership"                        | You're pointing Jenkins at a
+    |                   |                                            | path it shouldn't be reading
+    |                   |                                            | (your dev dir). Switch to
+    |                   |                                            | option 1A or 1B in section 1.
+    | Checkout          | "Permission denied" (publickey)            | If using an SSH remote, add
+    |                   |                                            | the deploy key to the git
+    |                   |                                            | host, or create a credential
+    |                   |                                            | in Jenkins with the right
+    |                   |                                            | key and pick it in the job.
+    | Ensure BuildKit   | "buildkitd not reachable"                  | `sudo systemctl restart buildkitd; sudo chmod 755 /run/buildkit`
+    | Distribute        | "Permission denied" running `sudo -n ctr`  | Re-run `bash scripts/bootstrap.sh` (sudoers snippet not installed)
+    | Distribute        | "Host key verification failed"             | `ssh pratic@<new-node>` once from 192.168.0.111 to trust the key
+    | Distribute        | "no nodes discovered"                      | Check that `kubectl get nodes` works on 192.168.0.104 as pratic
+    | Deploy            | "No such file or directory" (k8s/40…)      | The Jenkinsfile couldn't scp
+    |                   |                                            | the manifests — re-check the
+    |                   |                                            | Workspace path is set as the
+    |                   |                                            | CWD for the ssh step.
+    | Deploy            | "forbidden" from `kubectl apply`           | Verify `kubectl auth can-i create deployments` returns yes for pratic
+    | Deploy            | "ImagePullBackOff"                         | The MySQL image failed to pull — check internet egress on the node
+    | Verify            | "502 Bad Gateway"                           | Pods are still starting; wait 30s and retry. If it persists, check
+    |                   |                                            | `kubectl -n chatroom get pods` for CrashLoopBackOff
+    | Verify            | "Connection refused" on localhost          | nginx not reloaded: `sudo systemctl reload nginx`
+
+--------------------------------------------------------------------------------
+SECTION 5.  DAY-TO-DAY USAGE
+--------------------------------------------------------------------------------
+
+5.1  Push code, get a deploy
+
+    # --- option 1A (remote) ---
+    cd /home/pratic/Desktop/chat-room-server
+    git push origin main
+
+    # --- option 1B (local bare repo) ---
+    cd /home/pratic/Desktop/chat-room-server
+    git push jenkins main
+
+    Jenkins polls every 5 minutes. Within ~5 min of the push, a build
+    starts automatically. Total time from push to green rollout:
+    ~3-6 minutes.
+
+    Important: Jenkins reads from the remote/bare-repo HEAD, not from
+    your uncommitted dev files. Commit + push before expecting a
+    build to pick up your changes.
+
+5.2  Manual build (e.g. for testing)
+
+    http://192.168.0.111:8080/job/chatroom-server  →  Build Now
+
+5.3  Roll back to the previous image
+
+    ssh pratic@192.168.0.104 \
+      'kubectl -n chatroom rollout undo deployment/chatroom-server'
+
+    That goes back one revision. For a specific tag:
+
+        ssh pratic@192.168.0.104 \
+          'kubectl -n chatroom set image deployment/chatroom-server \
+             chatroom-server=docker.io/library/chatroom-server:abc1234-41 --record'
+        ssh pratic@192.168.0.104 \
+          'kubectl -n chatroom rollout status deployment/chatroom-server --timeout=180s'
+
+5.4  Tail app logs
+
+    ssh pratic@192.168.0.104 \
+      'kubectl -n chatroom logs -l app=chatroom-server --tail=100 -f'
+
+    Tail MySQL logs:
+
+    ssh pratic@192.168.0.104 \
+      'kubectl -n chatroom logs mysql-0 --tail=100 -f'
+
+5.5  Get into the app pod
+
+    ssh pratic@192.168.0.104 \
+      'kubectl -n chatroom exec -it deploy/chatroom-server -- /bin/bash'
+
+    Get into the MySQL pod:
+
+    ssh pratic@192.168.0.104 \
+      'kubectl -n chatroom exec -it mysql-0 -- /bin/bash'
+
+5.6  Rotate a secret (e.g. MAIL_PASSWORD)
+
+    ssh pratic@192.168.0.104 \
+      'kubectl -n chatroom edit secret chatroom-secrets'
+    # change the value, save, exit
+    ssh pratic@192.168.0.104 \
+      'kubectl -n chatroom rollout restart deployment/chatroom-server'
+
+    The new pods pick up the new env. The old pods are terminated by
+    the rolling update.
+
+--------------------------------------------------------------------------------
+SECTION 6.  ADDING A NEW KUBERNETES NODE
+--------------------------------------------------------------------------------
+
+The pipeline auto-discovers all nodes via `kubectl get nodes`, so no
+Jenkinsfile edit is needed. The new node needs two manual steps:
+
+6.1  Add the new node to the cluster (kubeadm join)
+
+    On the new node, run the `kubeadm join` command you got from the
+    original `kubeadm init`. Standard procedure.
+
+6.2  Make sure pratic has SSH access from 192.168.0.111
+
+    From 192.168.0.111:
+        ssh pratic@<new-node-ip>     # accepts the host key, exits
+    Make sure pratic's ed25519 public key is in
+    <new-node>:~/.ssh/authorized_keys.
+
+6.3  Install the sudoers snippet on the new node
+
+    The bootstrap script discovers all current nodes via kubectl, so
+    re-running it will reach the new node automatically:
+
+        cd /home/pratic/Desktop/chat-room-server
+        bash scripts/bootstrap.sh
+
+    It will install the snippet on every node (including the new one)
+    and skip everything else (markers say those steps are done).
+
+6.4  Trigger a build
+
+    The next build will `ctr import` the image onto the new node.
+    After that, the deployment can schedule pods on it (the soft
+    node-affinity in k8s/40-deployment.yaml prefers the control plane
+    but allows the worker too).
+
+--------------------------------------------------------------------------------
+SECTION 7.  REBUILDING FROM SCRATCH (DR)
+--------------------------------------------------------------------------------
+
+If the cluster is lost or you want to start over:
+
+7.1  Re-bootstrap
+
+        bash scripts/bootstrap.sh
+
+    This is safe to run multiple times. It will re-apply the
+    StorageClass, sudoers, namespace, secrets, MySQL StatefulSet,
+    init Job, and nginx patch.
+
+7.2  Reset the live secrets (if you lost secrets.env)
+
+    If you also lost ~/.chatroom-bootstrap/secrets.env, delete the
+    live secrets first so bootstrap.sh regenerates them:
+
+        ssh pratic@192.168.0.104 \
+          'kubectl -n chatroom delete secret mysql-secret chatroom-secrets'
+
+    Then re-run bootstrap.sh.
+
+7.3  Wipe MySQL data (start with a clean DB)
+
+        ssh pratic@192.168.0.104 \
+          'kubectl -n chatroom delete statefulset mysql'
+        ssh pratic@192.168.0.104 \
+          'kubectl -n chatroom delete pvc -l app=mysql'
+        ssh pratic@192.168.0.104 \
+          'kubectl -n chatroom delete job mysql-init'
+
+    Re-run bootstrap.sh.
+
+7.4  Rebuild the Jenkins job
+
+    If Jenkins itself is lost, follow section 2 again. The job config
+    is stored in `$JENKINS_HOME/jobs/chatroom-server/` — it can be
+    backed up periodically with:
+
+        sudo tar czf chatroom-jenkins-job.tgz \
+          /var/lib/jenkins/jobs/chatroom-server/
+
+================================================================================
+  End of runbook
+================================================================================

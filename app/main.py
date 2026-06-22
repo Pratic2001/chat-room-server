@@ -62,5 +62,12 @@ def signup_page():
     else:
         return {"message": "Signup page not found."}
 
+@app.get("/healthz")
+def healthz():
+    # Cheap JSON ping used by k8s liveness/readiness/startup probes.
+    # Deliberately does NOT touch the database — a transient DB blip
+    # must not cause Kubernetes to kill the pod.
+    return {"status": "ok"}
+
 if __name__ == "__main__":
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

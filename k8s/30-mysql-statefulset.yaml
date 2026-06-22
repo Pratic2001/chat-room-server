@@ -1,0 +1,124 @@
+---
+# ClusterIP Service the app connects to.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: chatroom
+  labels:
+    app: mysql
+spec:
+  type: ClusterIP
+  selector:
+    app: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+      protocol: TCP
+---
+# Headless Service gives the StatefulSet pod stable DNS:
+#   mysql-0.mysql-headless.chatroom.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-headless
+  namespace: chatroom
+  labels:
+    app: mysql
+spec:
+  clusterIP: None
+  selector:
+    app: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: chatroom
+  labels:
+    app: mysql
+spec:
+  serviceName: mysql-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      securityContext:
+        # mysql:8.0 image's entrypoint already runs `mysqld` as uid 999 (the
+        # `mysql` user). Setting fsGroup ensures the PVC is writable on
+        # first mount.
+        fsGroup: 999
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: mysql
+              containerPort: 3306
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: mysql-secret
+          env:
+            # Allow root login from any host (%); required so the init Job
+            # can connect from a different pod. Once the app user is
+            # created, the app uses that restricted user instead.
+            - name: MYSQL_ROOT_HOST
+              value: "%"
+            # Pin the data directory explicitly so it's obvious in `kubectl describe`.
+            - name: MYSQL_DATA_DIR
+              value: /var/lib/mysql
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          livenessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+    - metadata:
+        name: mysql-data
+        namespace: chatroom
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # The default StorageClass is installed by scripts/bootstrap.sh
+        # (local-path-provisioner). If the cluster already has a different
+        # default, set storageClassName here.
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 5Gi
