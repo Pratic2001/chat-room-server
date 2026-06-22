@@ -22,8 +22,13 @@ class Room(Base):
     __tablename__ = "rooms"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, nullable=False)
-    secret_phrase_hash = Column(String, nullable=False)
+    # Room name is the user-facing identifier (used in invite emails, the
+    # join-by-name flow, and the sidebar). Enforce uniqueness so lookups
+    # by name are unambiguous.
+    name = Column(String, nullable=False, unique=True, index=True)
+    # Stores an encrypted (Fernet) token for the secret phrase, or NULL when
+    # the room has no pass phrase and anyone with the room name may join.
+    secret_phrase_hash = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 

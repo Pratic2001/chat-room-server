@@ -69,6 +69,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
         for msg in messages:
             # Convert to WSMessage format
             common = {
+                "id": msg.id,
                 "user_id": msg.user_id,
                 "username": msg.user.username if msg.user else None,
                 "created_at": msg.created_at,
@@ -174,6 +175,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
             # Broadcast to all connections in the room
             if db_msg:
                 common = {
+                    "id": db_msg.id,
                     "user_id": db_msg.user_id,
                     "username": user.username,
                     "created_at": db_msg.created_at,

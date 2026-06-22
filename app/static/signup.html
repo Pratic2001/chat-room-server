@@ -4,10 +4,33 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Create account · Chat</title>
+    <script>
+        (function () {
+            try {
+                var mode = localStorage.getItem('chat_theme') || 'system';
+                if (mode === 'system') {
+                    mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                }
+                document.documentElement.setAttribute('data-theme', mode);
+                var accent = localStorage.getItem('chat_accent');
+                if (accent) {
+                    var s = JSON.parse(accent);
+                    var r = document.documentElement.style;
+                    r.setProperty('--accent', s.accent);
+                    r.setProperty('--accent-hover', s.accentHover);
+                    r.setProperty('--accent-soft', s.accentSoft);
+                    r.setProperty('--sent', s.accent);
+                }
+            } catch (e) { /* fall through */ }
+        })();
+    </script>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body class="auth-body">
     <main class="auth-card">
+        <div class="auth-theme-row">
+            <button id="theme-picker-btn" class="btn btn-ghost btn-sm theme-toggle" type="button" aria-label="Theme settings">🎨</button>
+        </div>
         <h1>Create your account</h1>
         <p class="auth-sub">Pick a username to get a room you can share.</p>
         <form id="signup-form" novalidate>
@@ -28,6 +51,23 @@
         </form>
         <p class="auth-foot">Already have an account? <a href="/login">Sign in</a></p>
     </main>
+
+    <!-- Theme popover -->
+    <div id="theme-popover-backdrop" class="theme-popover-backdrop" hidden></div>
+    <div id="theme-popover" class="theme-popover" hidden role="dialog" aria-label="Theme settings">
+        <h4>Mode</h4>
+        <div class="theme-modes" role="radiogroup" aria-label="Theme mode">
+            <button type="button" class="theme-mode" data-mode="light"  role="radio" aria-checked="false"><span class="theme-mode-icon">☀</span>Light</button>
+            <button type="button" class="theme-mode" data-mode="dark"   role="radio" aria-checked="false"><span class="theme-mode-icon">🌙</span>Dark</button>
+            <button type="button" class="theme-mode" data-mode="system" role="radio" aria-checked="false"><span class="theme-mode-icon">🖥</span>System</button>
+        </div>
+        <h4>Accent</h4>
+        <div class="theme-swatches" id="theme-swatches"></div>
+        <div class="theme-popover-foot">
+            <button type="button" id="theme-popover-close" class="btn btn-ghost">Close</button>
+        </div>
+    </div>
+
     <script src="/static/script.js"></script>
 </body>
 </html>

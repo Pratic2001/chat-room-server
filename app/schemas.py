@@ -43,13 +43,34 @@ class RoomBase(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     name: str
-    secret_phrase: str
+    # Optional: leave empty / null for rooms anyone with the room name can join.
+    secret_phrase: Optional[str] = None
 
 class RoomCreate(RoomBase):
     pass
 
 class RoomJoin(BaseModel):
-    secret_phrase: str
+    # Optional: must match the room's pass phrase if one is set; ignored if
+    # the room has no pass phrase.
+    secret_phrase: Optional[str] = None
+
+class RoomJoinByName(BaseModel):
+    # Used by the "Join room" flow in the sidebar. The user types the name
+    # (and optional pass phrase) from the invite email; the server looks
+    # the room up by name and adds the caller as a member.
+    name: str = Field(..., min_length=1, max_length=255)
+    # Optional: same rules as RoomJoin.secret_phrase above.
+    secret_phrase: Optional[str] = None
+
+class RoomInvite(BaseModel):
+    email: EmailStr
+    # Optional personal note from the inviter, included above the join
+    # instructions in the email body.
+    message: Optional[str] = Field(default=None, max_length=2000)
+
+class RoomInviteResponse(BaseModel):
+    sent: bool
+    message: str
 
 class RoomResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -82,6 +103,10 @@ class MessageResponse(MessageBase):
 
 # WebSocket message schemas (for sending/receiving over WS)
 class WSMessage(BaseModel):
+    # Message id (set by server when broadcasting, ignored when received).
+    # The client uses this to dedupe the WS echo against the HTTP POST
+    # response, which carries the same id.
+    id: Optional[int] = None
     message_type: str
     content: Optional[str] = None
     file_name: Optional[str] = None

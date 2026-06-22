@@ -18,13 +18,28 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
 def _serialize(msg):
-    """Convert a Message ORM instance into a MessageResponse with base64 data."""
-    msg_dict = schemas.MessageResponse.model_validate(msg).model_dump()
-    if msg.data:
-        msg_dict["data"] = base64.b64encode(msg.data).decode("utf-8")
-    if msg.thumbnail:
-        msg_dict["thumbnail"] = base64.b64encode(msg.thumbnail).decode("utf-8")
-    return schemas.MessageResponse(**msg_dict)
+    """Convert a Message ORM instance into a MessageResponse with base64 data.
+
+    We build the dict by hand rather than calling MessageResponse.model_validate
+    on the ORM instance, because `Message.data` / `Message.thumbnail` are
+    `LargeBinary` (bytes) columns while MessageResponse declares them as `str`.
+    Pydantic v2 won't auto-coerce bytes to str and raises "Expected valid
+    string, error parsing unicode" — which is exactly the error attachments
+    hit on upload.
+    """
+    return schemas.MessageResponse(
+        id=msg.id,
+        room_id=msg.room_id,
+        user_id=msg.user_id,
+        username=msg.user.username if msg.user else None,
+        message_type=msg.message_type,
+        content=msg.content,
+        file_name=msg.file_name,
+        mime_type=msg.mime_type,
+        created_at=msg.created_at,
+        data=base64.b64encode(msg.data).decode("utf-8") if msg.data else None,
+        thumbnail=base64.b64encode(msg.thumbnail).decode("utf-8") if msg.thumbnail else None,
+    )
 
 
 @router.get("/{room_id}/messages", response_model=List[schemas.MessageResponse])
@@ -102,9 +117,12 @@ async def create_message(
     payload["username"] = current_user.username
 
     # Build a WSMessage with the same shape we send over the WebSocket so the
-    # client can render the HTTP response and the WS echo uniformly.
+    # client can render the HTTP response and the WS echo uniformly. Carry
+    # the message id so the client can dedupe the echo against the HTTP
+    # response it just rendered.
     if body.message_type == "text":
         ws_msg = schemas.WSMessage(
+            id=db_msg.id,
             message_type=body.message_type,
             content=body.content,
             user_id=current_user.id,
@@ -113,6 +131,7 @@ async def create_message(
         )
     else:
         ws_msg = schemas.WSMessage(
+            id=db_msg.id,
             message_type=body.message_type,
             file_name=body.file_name,
             mime_type=body.mime_type,

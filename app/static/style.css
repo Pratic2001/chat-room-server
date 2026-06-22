@@ -28,6 +28,34 @@
     box-sizing: border-box;
 }
 
+/* ---------- Dark mode ----------
+ * Overrides only the variables that need to change for dark backgrounds.
+ * Accent / danger / success are vivid enough on both backgrounds that we
+ * leave them alone — tweaking them here would just create churn for the
+ * user-defined custom accent overrides stored in localStorage.
+ */
+[data-theme="dark"] {
+    --bg: #0f1115;
+    --surface: #181b22;
+    --surface-2: #1f232c;
+    --border: #2a2f3a;
+    --border-strong: #353b48;
+    --text: #e7e9ee;
+    --text-muted: #9aa0ac;
+    --accent-soft: #1f2740;
+    --received: #232733;
+    --received-text: #e7e9ee;
+    --danger-soft: #3a1f1f;
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+
+/* Auth pages use a slight gradient in light mode; in dark mode we want
+ * something more uniformly dark to avoid a visible seam with the surface. */
+[data-theme="dark"] .auth-body {
+    background: linear-gradient(180deg, #0f1115 0%, #14171f 100%);
+}
+
 html, body {
     margin: 0;
     padding: 0;
@@ -117,10 +145,29 @@ input[type="password"] {
 }
 input[type="text"]:focus,
 input[type="email"]:focus,
-input[type="password"]:focus {
+input[type="password"]:focus,
+textarea:focus {
     outline: none;
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+textarea {
+    width: 100%;
+    padding: 10px 12px;
+    font: inherit;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    resize: vertical;
+    min-height: 64px;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.optional-mark {
+    color: var(--text-muted);
+    font-weight: 400;
 }
 
 .form-error {
@@ -242,6 +289,12 @@ input[type="password"]:focus {
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--text-muted);
+}
+.sidebar-head-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
 }
 .room-list {
     list-style: none;
@@ -519,4 +572,131 @@ input[type="password"]:focus {
         border-bottom: 1px solid var(--border);
     }
     .room-list { padding: 4px 12px 12px; }
+}
+
+/* ---------- Theme toggle ---------- */
+.theme-toggle {
+    font-size: 18px;
+    line-height: 1;
+    padding: 6px 10px;
+}
+
+/* ---------- Theme popover ---------- */
+.theme-popover-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(15, 23, 42, 0.45);
+    z-index: 150;
+}
+.theme-popover-backdrop[hidden] { display: none; }
+
+.theme-popover {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 100%;
+    max-width: 360px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 22px 22px 18px;
+    box-shadow: var(--shadow-md);
+    z-index: 200;
+}
+.theme-popover[hidden] { display: none; }
+
+.theme-popover h4 {
+    margin: 0 0 8px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+}
+.theme-popover h4:not(:first-child) { margin-top: 18px; }
+
+.theme-modes {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    margin-bottom: 4px;
+}
+.theme-mode {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    padding: 10px 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+    transition: border-color 0.15s ease, background 0.15s ease;
+}
+.theme-mode:hover { background: var(--surface-2); }
+.theme-mode.active {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
+}
+.theme-mode .theme-mode-icon { font-size: 18px; line-height: 1; }
+
+.theme-swatches {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    gap: 8px;
+}
+.swatch {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    border: 2px solid var(--border);
+    border-radius: 50%;
+    cursor: pointer;
+    padding: 0;
+    background-clip: content-box;
+    transition: transform 0.1s ease, border-color 0.15s ease;
+}
+.swatch:hover { transform: scale(1.08); }
+.swatch.active {
+    border-color: var(--text);
+    transform: scale(1.08);
+}
+.swatch-input {
+    appearance: none;
+    -webkit-appearance: none;
+    padding: 0;
+    background: linear-gradient(135deg,
+        #ff7a7a 0%, #ff7a7a 16.66%,
+        #ffd07a 16.66%, #ffd07a 33.33%,
+        #7aff8a 33.33%, #7aff8a 50%,
+        #7acaff 50%, #7acaff 66.66%,
+        #a07aff 66.66%, #a07aff 83.33%,
+        #ff7ae9 83.33%, #ff7ae9 100%);
+    overflow: hidden;
+}
+.swatch-input::-webkit-color-swatch-wrapper { padding: 0; }
+.swatch-input::-webkit-color-swatch { border: none; border-radius: 50%; }
+.swatch-input::-moz-color-swatch { border: none; border-radius: 50%; }
+
+.theme-popover-foot {
+    margin-top: 18px;
+    display: flex;
+    justify-content: flex-end;
+}
+.theme-popover-foot .btn { padding: 6px 14px; font-size: 13px; }
+
+/* ---------- Auth-page theme button ---------- */
+.auth-theme-row {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 12px;
+}
+.auth-theme-row .theme-toggle {
+    background: transparent;
+    border-color: var(--border);
 }

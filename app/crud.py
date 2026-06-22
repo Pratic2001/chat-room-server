@@ -1,7 +1,13 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from app import models, schemas
-from app.utils import get_password_hash, verify_password
+from app.utils import (
+    encrypt_secret,
+    decrypt_secret,
+    constant_time_equal,
+    get_password_hash,
+    verify_password,
+)
 from datetime import datetime
 
 # User CRUD
@@ -42,7 +48,14 @@ def get_room_by_name(db: Session, name: str):
     return db.query(models.Room).filter(models.Room.name == name).first()
 
 def create_room(db: Session, room: schemas.RoomCreate, owner_id: int):
-    secret_phrase_hash = get_password_hash(room.secret_phrase)
+    # Empty / None phrase means the room has no pass phrase; we store NULL
+    # so anyone who finds the room can join. Otherwise encrypt the phrase
+    # so we can later include the exact text in an invitation email.
+    phrase = (room.secret_phrase or "").strip()
+    if phrase:
+        secret_phrase_hash = encrypt_secret(phrase)
+    else:
+        secret_phrase_hash = None
     db_room = models.Room(
         name=room.name,
         secret_phrase_hash=secret_phrase_hash,
@@ -60,12 +73,27 @@ def create_room(db: Session, room: schemas.RoomCreate, owner_id: int):
 def get_rooms_by_user(db: Session, user_id: int):
     return db.query(models.Room).join(models.RoomMember).filter(models.RoomMember.user_id == user_id).all()
 
-def join_room(db: Session, room_id: int, user_id: int, secret_phrase: str):
+def join_room(db: Session, room_id: int, user_id: int, secret_phrase: str | None):
     room = get_room_by_id(db, room_id)
     if not room:
         return False
-    if not verify_password(secret_phrase, room.secret_phrase_hash):
-        return False
+    provided = (secret_phrase or "").strip()
+    if room.secret_phrase_hash is None:
+        # Room has no pass phrase. Accept empty input, reject a non-empty
+        # one — supplying a phrase when none is required is almost always
+        # a user error worth surfacing.
+        if provided:
+            return False
+    else:
+        # Room has a phrase. The provided value must match.
+        if not provided:
+            return False
+        try:
+            actual = decrypt_secret(room.secret_phrase_hash)
+        except ValueError:
+            return False
+        if not constant_time_equal(provided, actual):
+            return False
     # Check if already a member
     existing = db.query(models.RoomMember).filter(
         and_(

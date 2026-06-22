@@ -4,6 +4,30 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Chat</title>
+    <script>
+        // Runs synchronously in <head> before any stylesheet paints, so the
+        // body is already in the right theme. localStorage can be blocked
+        // (private mode, file://) so wrap the whole thing in try/catch and
+        // fall back to the default light theme.
+        (function () {
+            try {
+                var mode = localStorage.getItem('chat_theme') || 'system';
+                if (mode === 'system') {
+                    mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                }
+                document.documentElement.setAttribute('data-theme', mode);
+                var accent = localStorage.getItem('chat_accent');
+                if (accent) {
+                    var s = JSON.parse(accent);
+                    var r = document.documentElement.style;
+                    r.setProperty('--accent', s.accent);
+                    r.setProperty('--accent-hover', s.accentHover);
+                    r.setProperty('--accent-soft', s.accentSoft);
+                    r.setProperty('--sent', s.accent);
+                }
+            } catch (e) { /* fall through */ }
+        })();
+    </script>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body class="app-body">
@@ -14,6 +38,8 @@
                 <span>Chat</span>
             </div>
             <div class="app-user">
+                <button id="theme-cycle-btn" class="btn btn-ghost btn-sm theme-toggle" type="button" aria-label="Cycle theme"></button>
+                <button id="theme-picker-btn" class="btn btn-ghost btn-sm theme-toggle" type="button" aria-label="Theme settings">🎨</button>
                 <span id="username-display" class="app-username"></span>
                 <button id="logout-btn" class="btn btn-ghost" type="button">Log out</button>
             </div>
@@ -23,7 +49,10 @@
             <aside class="sidebar" aria-label="Rooms">
                 <div class="sidebar-head">
                     <h2>Rooms</h2>
-                    <button id="create-room-btn" class="btn btn-primary btn-sm" type="button">New room</button>
+                    <div class="sidebar-head-actions">
+                        <button id="join-by-name-btn" class="btn btn-ghost btn-sm" type="button">Join room</button>
+                        <button id="create-room-btn" class="btn btn-primary btn-sm" type="button">New room</button>
+                    </div>
                 </div>
                 <ul id="room-list" class="room-list" role="list">
                     <li class="room-empty" id="room-empty">No rooms yet. Create one to start chatting.</li>
@@ -62,15 +91,15 @@
     <div id="modal-backdrop" class="modal-backdrop" hidden>
         <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
             <h3 id="modal-title">Create a room</h3>
-            <p class="modal-sub">Anyone with the name and secret phrase can join.</p>
+            <p class="modal-sub">Pick a name and (optionally) a pass phrase. With a phrase, anyone with both can join; without one, anyone with the room name can.</p>
             <form id="create-room-form">
                 <label>
                     <span>Room name</span>
                     <input type="text" id="new-room-name" required maxlength="80">
                 </label>
                 <label>
-                    <span>Secret phrase</span>
-                    <input type="text" id="new-room-secret" required maxlength="80">
+                    <span>Secret phrase <span class="optional-mark">(optional)</span></span>
+                    <input type="text" id="new-room-secret" maxlength="80" autocomplete="off">
                 </label>
                 <p id="create-room-error" class="form-error" role="alert"></p>
                 <div class="modal-actions">
@@ -85,11 +114,11 @@
     <div id="join-backdrop" class="modal-backdrop" hidden>
         <div class="modal" role="dialog" aria-modal="true" aria-labelledby="join-title">
             <h3 id="join-title">Join a room</h3>
-            <p class="modal-sub" id="join-sub">Enter the secret phrase to join.</p>
+            <p class="modal-sub" id="join-sub">Enter the pass phrase if the room has one.</p>
             <form id="join-room-form">
                 <label>
-                    <span>Secret phrase</span>
-                    <input type="text" id="join-secret" required maxlength="80" autocomplete="off">
+                    <span>Secret phrase <span class="optional-mark">(only if the room requires one)</span></span>
+                    <input type="text" id="join-secret" maxlength="80" autocomplete="off">
                 </label>
                 <p id="join-room-error" class="form-error" role="alert"></p>
                 <div class="modal-actions">
@@ -97,6 +126,68 @@
                     <button type="submit" class="btn btn-primary">Join</button>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <!-- Join room modal (invite flow: user pastes the room name + pass phrase) -->
+    <div id="join-by-name-backdrop" class="modal-backdrop" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="join-by-name-title">
+            <h3 id="join-by-name-title">Join a room</h3>
+            <p class="modal-sub">Enter the room name (and pass phrase, if any) from your invitation.</p>
+            <form id="join-by-name-form">
+                <label>
+                    <span>Room name</span>
+                    <input type="text" id="join-by-name-name" required maxlength="255" autocomplete="off">
+                </label>
+                <label>
+                    <span>Pass phrase <span class="optional-mark">(only if the room requires one)</span></span>
+                    <input type="text" id="join-by-name-secret" maxlength="255" autocomplete="off">
+                </label>
+                <p id="join-by-name-error" class="form-error" role="alert"></p>
+                <div class="modal-actions">
+                    <button type="button" id="join-by-name-cancel" class="btn btn-ghost">Cancel</button>
+                    <button type="submit" id="join-by-name-submit" class="btn btn-primary">Join</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Invite modal -->
+    <div id="invite-backdrop" class="modal-backdrop" hidden>
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="invite-title">
+            <h3 id="invite-title">Invite to this room</h3>
+            <p class="modal-sub" id="invite-sub">Send an invitation email with the room name and pass phrase.</p>
+            <form id="invite-form">
+                <label>
+                    <span>Recipient email</span>
+                    <input type="email" id="invite-email" required maxlength="254" autocomplete="off">
+                </label>
+                <label>
+                    <span>Personal note <span class="optional-mark">(optional)</span></span>
+                    <textarea id="invite-message" rows="3" maxlength="2000" placeholder="Hey! Join me in this room…"></textarea>
+                </label>
+                <p id="invite-error" class="form-error" role="alert"></p>
+                <div class="modal-actions">
+                    <button type="button" id="invite-cancel" class="btn btn-ghost">Cancel</button>
+                    <button type="submit" id="invite-send" class="btn btn-primary">Send invite</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Theme popover -->
+    <div id="theme-popover-backdrop" class="theme-popover-backdrop" hidden></div>
+    <div id="theme-popover" class="theme-popover" hidden role="dialog" aria-label="Theme settings">
+        <h4>Mode</h4>
+        <div class="theme-modes" role="radiogroup" aria-label="Theme mode">
+            <button type="button" class="theme-mode" data-mode="light"  role="radio" aria-checked="false"><span class="theme-mode-icon">☀</span>Light</button>
+            <button type="button" class="theme-mode" data-mode="dark"   role="radio" aria-checked="false"><span class="theme-mode-icon">🌙</span>Dark</button>
+            <button type="button" class="theme-mode" data-mode="system" role="radio" aria-checked="false"><span class="theme-mode-icon">🖥</span>System</button>
+        </div>
+        <h4>Accent</h4>
+        <div class="theme-swatches" id="theme-swatches"></div>
+        <div class="theme-popover-foot">
+            <button type="button" id="theme-popover-close" class="btn btn-ghost">Close</button>
         </div>
     </div>
 

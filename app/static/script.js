@@ -3,6 +3,310 @@
 
 const STORAGE_TOKEN = 'chat_token';
 const STORAGE_USER = 'chat_user';
+const STORAGE_THEME = 'chat_theme';      // 'light' | 'dark' | 'system'
+const STORAGE_ACCENT = 'chat_accent';    // JSON({ accent, accentHover, accentSoft }) or null
+
+// The accent picker offers a small set of named presets. The last slot is a
+// freeform <input type="color"> so the user can pick anything.
+const ACCENT_PRESETS = [
+    { id: 'blue',   label: 'Blue',   accent: '#4f6df5', accentHover: '#3d5ce0', accentSoft: '#eef1ff' },
+    { id: 'purple', label: 'Purple', accent: '#8b5cf6', accentHover: '#7c3aed', accentSoft: '#f3edff' },
+    { id: 'teal',   label: 'Teal',   accent: '#14b8a6', accentHover: '#0d9488', accentSoft: '#e6fffa' },
+    { id: 'rose',   label: 'Rose',   accent: '#e11d48', accentHover: '#be123c', accentSoft: '#ffe4e6' },
+    { id: 'amber',  label: 'Amber',  accent: '#f59e0b', accentHover: '#d97706', accentSoft: '#fffbeb' },
+    { id: 'green',  label: 'Green',  accent: '#16a34a', accentHover: '#15803d', accentSoft: '#e8f7ee' },
+];
+// Default accent (the first preset) — used when the user clears their
+// custom accent or hasn't picked one yet.
+const DEFAULT_ACCENT = ACCENT_PRESETS[0];
+
+const MODE_ICONS = { light: '☀', dark: '🌙', system: '🖥' };
+const MODE_LABELS = { light: 'Light', dark: 'Dark', system: 'System' };
+
+// ---------- Theme ----------
+
+class Theme {
+    constructor() {
+        this.mode = this._readMode();
+        this.accent = this._readAccent();
+        this._media = window.matchMedia('(prefers-color-scheme: dark)');
+    }
+
+    init() {
+        // The head bootstrap script has already set data-theme + accent
+        // variables before paint. Here we just wire up DOM bindings and
+        // re-apply so any code that reads from this Theme instance sees
+        // the current state.
+        this.apply();
+
+        // System-mode change → re-apply if the user is on "system".
+        // Older Safari uses addListener; modern uses addEventListener.
+        if (this._media.addEventListener) {
+            this._media.addEventListener('change', () => this._onMediaChange());
+        } else if (this._media.addListener) {
+            this._media.addListener(() => this._onMediaChange());
+        }
+
+        this._buildSwatches();
+        this._bindUI();
+    }
+
+    // Resolve the currently-effective theme name (used by the cycle button
+    // icon — for "system" we want to show the icon that reflects what the
+    // user is actually seeing).
+    effectiveMode() {
+        if (this.mode === 'system') {
+            return this._media.matches ? 'dark' : 'light';
+        }
+        return this.mode;
+    }
+
+    apply() {
+        const effective = this.effectiveMode();
+        document.documentElement.setAttribute('data-theme', effective);
+        // Keep the accent custom properties in sync with what we have in
+        // memory; the head script set them on first paint but anything
+        // changed since then (the user picked a different preset, or the
+        // storage value was wiped) needs to land here too.
+        this._applyAccent();
+        this._updateCycleButton();
+        this._updateModeRadios();
+        this._updateSwatches();
+    }
+
+    cycleMode() {
+        const order = ['light', 'dark', 'system'];
+        const i = order.indexOf(this.mode);
+        const next = order[(i + 1) % order.length];
+        this.setMode(next);
+    }
+
+    setMode(mode) {
+        if (!['light', 'dark', 'system'].includes(mode)) return;
+        this.mode = mode;
+        try { localStorage.setItem(STORAGE_THEME, mode); } catch (e) { /* private mode */ }
+        this.apply();
+    }
+
+    setAccent(accent) {
+        // null/undefined → reset to default accent.
+        this.accent = accent || null;
+        try {
+            if (this.accent) localStorage.setItem(STORAGE_ACCENT, JSON.stringify(this.accent));
+            else localStorage.removeItem(STORAGE_ACCENT);
+        } catch (e) { /* private mode */ }
+        this._applyAccent();
+        this._updateSwatches();
+    }
+
+    // Popover
+    openPopover() {
+        const popover = document.getElementById('theme-popover');
+        const backdrop = document.getElementById('theme-popover-backdrop');
+        if (!popover || !backdrop) return;
+        popover.hidden = false;
+        backdrop.hidden = false;
+        this._updateModeRadios();
+        this._updateSwatches();
+    }
+    closePopover() {
+        const popover = document.getElementById('theme-popover');
+        const backdrop = document.getElementById('theme-popover-backdrop');
+        if (popover) popover.hidden = true;
+        if (backdrop) backdrop.hidden = true;
+    }
+    togglePopover() {
+        const popover = document.getElementById('theme-popover');
+        if (!popover) return;
+        if (popover.hidden) this.openPopover();
+        else this.closePopover();
+    }
+
+    // ---- internals ----
+
+    _readMode() {
+        try {
+            const v = localStorage.getItem(STORAGE_THEME);
+            return ['light', 'dark', 'system'].includes(v) ? v : 'system';
+        } catch (e) { return 'system'; }
+    }
+    _readAccent() {
+        try {
+            const raw = localStorage.getItem(STORAGE_ACCENT);
+            if (!raw) return null;
+            const obj = JSON.parse(raw);
+            // Sanity-check the shape; an entry from a future schema might
+            // be missing fields and we shouldn't blow up.
+            if (obj && obj.accent && obj.accentHover && obj.accentSoft) return obj;
+            return null;
+        } catch (e) { return null; }
+    }
+    _applyAccent() {
+        const r = document.documentElement.style;
+        if (this.accent) {
+            r.setProperty('--accent', this.accent.accent);
+            r.setProperty('--accent-hover', this.accent.accentHover);
+            r.setProperty('--accent-soft', this.accent.accentSoft);
+            r.setProperty('--sent', this.accent.accent);
+        } else {
+            // Reset to whatever :root defaults to. Setting empty string
+            // removes the inline override, letting the stylesheet win.
+            r.removeProperty('--accent');
+            r.removeProperty('--accent-hover');
+            r.removeProperty('--accent-soft');
+            r.removeProperty('--sent');
+        }
+    }
+    _onMediaChange() {
+        // Only relevant when we're on "system" — otherwise the user has
+        // explicitly chosen a fixed mode and the OS preference is ignored.
+        if (this.mode === 'system') this.apply();
+    }
+    _updateCycleButton() {
+        const btn = document.getElementById('theme-cycle-btn');
+        if (!btn) return;
+        // Show the *effective* icon so users see what they're actually
+        // looking at (e.g. on system mode they see ☀ or 🌙 depending on
+        // the OS), not the abstract "system" marker.
+        const eff = this.effectiveMode();
+        btn.textContent = MODE_ICONS[eff];
+        btn.title = `Theme: ${MODE_LABELS[this.mode]}${this.mode === 'system' ? ' (currently ' + MODE_LABELS[eff] + ')' : ''} — click to cycle`;
+        btn.setAttribute('aria-label', btn.title);
+    }
+    _updateModeRadios() {
+        document.querySelectorAll('.theme-mode').forEach((el) => {
+            const active = el.dataset.mode === this.mode;
+            el.classList.toggle('active', active);
+            el.setAttribute('aria-checked', String(active));
+        });
+    }
+    _buildSwatches() {
+        const wrap = document.getElementById('theme-swatches');
+        if (!wrap || wrap.dataset.built) return;
+        wrap.dataset.built = '1';
+        ACCENT_PRESETS.forEach((p) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'swatch';
+            b.style.background = p.accent;
+            b.title = p.label;
+            b.setAttribute('aria-label', `Use ${p.label} accent`);
+            b.dataset.accentId = p.id;
+            b.dataset.accent = JSON.stringify(p);
+            b.addEventListener('click', () => this.setAccent(p));
+            wrap.appendChild(b);
+        });
+        // Freeform color input — styled as a swatch so it slots into the
+        // grid. When the user picks a color we synthesize the hover/soft
+        // shades so the rest of the UI still has a consistent accent
+        // family around whatever the user chose.
+        const inp = document.createElement('input');
+        inp.type = 'color';
+        inp.className = 'swatch swatch-input';
+        inp.title = 'Custom color';
+        inp.setAttribute('aria-label', 'Pick a custom accent color');
+        inp.addEventListener('input', () => {
+            const accent = synthesizeAccent(inp.value);
+            this.setAccent(accent);
+        });
+        wrap.appendChild(inp);
+    }
+    _updateSwatches() {
+        const wrap = document.getElementById('theme-swatches');
+        if (!wrap) return;
+        // Highlight whichever swatch matches the current accent.
+        const currentId = this.accent && this.accent.id;
+        wrap.querySelectorAll('.swatch').forEach((el) => {
+            el.classList.toggle('active', el.dataset.accentId === currentId);
+        });
+    }
+    _bindUI() {
+        // Cycle button (only present on the app page)
+        const cycle = document.getElementById('theme-cycle-btn');
+        if (cycle) cycle.addEventListener('click', () => this.cycleMode());
+
+        // Picker button (present on all three pages)
+        const picker = document.getElementById('theme-picker-btn');
+        if (picker) picker.addEventListener('click', () => this.togglePopover());
+
+        // Popover close
+        const closeBtn = document.getElementById('theme-popover-close');
+        if (closeBtn) closeBtn.addEventListener('click', () => this.closePopover());
+        const backdrop = document.getElementById('theme-popover-backdrop');
+        if (backdrop) backdrop.addEventListener('click', () => this.closePopover());
+
+        // Mode radios
+        document.querySelectorAll('.theme-mode').forEach((el) => {
+            el.addEventListener('click', () => this.setMode(el.dataset.mode));
+        });
+
+        // Escape closes the popover (capture so we always run, even if
+        // another handler stops propagation).
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                const popover = document.getElementById('theme-popover');
+                if (popover && !popover.hidden) this.closePopover();
+            }
+        });
+    }
+}
+
+// Synthesize an accent family (main + hover + soft) from a single hex
+// color. Hover is ~12% darker; soft is a 90% blend toward white. Both
+// work in HSL space so the relationship stays predictable for any input.
+function synthesizeAccent(hex) {
+    const { h, s, l } = hexToHsl(hex);
+    const main = hslToHex(h, s, l);
+    const hover = hslToHex(h, s, Math.max(0, l - 0.10));
+    const soft = hslToHex(h, s, Math.min(1, l + 0.45));
+    return { accent: main, accentHover: hover, accentSoft: soft };
+}
+
+function hexToHsl(hex) {
+    const v = hex.replace('#', '');
+    const r = parseInt(v.substring(0, 2), 16) / 255;
+    const g = parseInt(v.substring(2, 4), 16) / 255;
+    const b = parseInt(v.substring(4, 6), 16) / 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    let h = 0, s = 0;
+    const l = (max + min) / 2;
+    if (max !== min) {
+        const d = max - min;
+        s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+        switch (max) {
+            case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+            case g: h = (b - r) / d + 2; break;
+            case b: h = (r - g) / d + 4; break;
+        }
+        h /= 6;
+    }
+    return { h, s, l };
+}
+
+function hslToHex(h, s, l) {
+    function hue2rgb(p, q, t) {
+        if (t < 0) t += 1;
+        if (t > 1) t -= 1;
+        if (t < 1/6) return p + (q - p) * 6 * t;
+        if (t < 1/2) return q;
+        if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+        return p;
+    }
+    let r, g, b;
+    if (s === 0) { r = g = b = l; }
+    else {
+        const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+        const p = 2 * l - q;
+        r = hue2rgb(p, q, h + 1/3);
+        g = hue2rgb(p, q, h);
+        b = hue2rgb(p, q, h - 1/3);
+    }
+    const toHex = (x) => Math.round(x * 255).toString(16).padStart(2, '0');
+    return '#' + toHex(r) + toHex(g) + toHex(b);
+}
+
+// Single shared instance used by every page.
+const theme = new Theme();
 
 class ChatApp {
     constructor() {
@@ -15,6 +319,12 @@ class ChatApp {
         this.pendingJoinRoomName = null;
         this.isSending = false;
         this.page = this._detectPage();
+        // Set of message ids already rendered in the current room. Used to
+        // dedupe: when a user enters a room, the WebSocket sends the last 50
+        // messages on connect AND _loadHistory fetches the same messages via
+        // HTTP — without deduping by id, every historical message would
+        // appear twice. Bounded so it doesn't grow forever in a long session.
+        this._renderedIds = new Set();
         this.init();
     }
 
@@ -127,7 +437,8 @@ class ChatApp {
 
         document.getElementById('logout-btn').addEventListener('click', () => this._logout());
         document.getElementById('create-room-btn').addEventListener('click', () => this._openCreateModal());
-        document.getElementById('invite-btn').addEventListener('click', () => this._shareInvite());
+        document.getElementById('join-by-name-btn').addEventListener('click', () => this._openJoinByNameModal());
+        document.getElementById('invite-btn').addEventListener('click', () => this._openInviteModal());
         document.getElementById('leave-room-btn').addEventListener('click', () => this._leaveRoom());
 
         const form = document.getElementById('message-form');
@@ -176,6 +487,35 @@ class ChatApp {
         });
         document.getElementById('join-secret').addEventListener('keydown', (e) => {
             if (e.key === 'Escape') this._closeJoinModal();
+        });
+
+        // Join-by-name modal (sidebar "Join room" button — invite flow)
+        document.getElementById('join-by-name-cancel').addEventListener('click', () => this._closeJoinByNameModal());
+        document.getElementById('join-by-name-backdrop').addEventListener('click', (e) => {
+            if (e.target.id === 'join-by-name-backdrop') this._closeJoinByNameModal();
+        });
+        document.getElementById('join-by-name-form').addEventListener('submit', (e) => {
+            e.preventDefault();
+            this._handleJoinByName();
+        });
+        document.getElementById('join-by-name-name').addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') this._closeJoinByNameModal();
+        });
+        document.getElementById('join-by-name-secret').addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') this._closeJoinByNameModal();
+        });
+
+        // Invite modal
+        document.getElementById('invite-cancel').addEventListener('click', () => this._closeInviteModal());
+        document.getElementById('invite-backdrop').addEventListener('click', (e) => {
+            if (e.target.id === 'invite-backdrop') this._closeInviteModal();
+        });
+        document.getElementById('invite-form').addEventListener('submit', (e) => {
+            e.preventDefault();
+            this._handleSendInvite();
+        });
+        document.getElementById('invite-email').addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') this._closeInviteModal();
         });
 
         this._loadRooms();
@@ -250,11 +590,13 @@ class ChatApp {
             }
             this._toast('Room deleted.');
             if (this.currentRoomId === roomId) {
-                // Active room is being deleted — clear the chat pane.
+                // Active room is being deleted — clear the chat pane first,
+                // then refresh the sidebar so the room disappears.
                 this._leaveRoom();
-            } else {
-                await this._loadRooms();
             }
+            // Auto-refresh the room list (and, for non-active deletions,
+            // re-render the sidebar so the row disappears immediately).
+            await this._loadRooms();
         } catch (err) {
             this._toast(err.message, true);
         }
@@ -276,21 +618,22 @@ class ChatApp {
         const secret = document.getElementById('new-room-secret').value.trim();
         const errEl = document.getElementById('create-room-error');
         errEl.textContent = '';
-        if (!name || !secret) {
-            errEl.textContent = 'Both fields are required.';
+        if (!name) {
+            errEl.textContent = 'Please enter a room name.';
             return;
         }
         try {
             const res = await this._authFetch('/rooms/', {
                 method: 'POST',
-                body: JSON.stringify({ name, secret_phrase: secret }),
+                // Pass secret_phrase: null when empty so the server stores NULL
+                // and the room becomes open to anyone with the name.
+                body: JSON.stringify({ name, secret_phrase: secret || null }),
             });
             const data = await res.json();
             if (!res.ok) throw new Error(data.detail || 'Failed to create room');
             this._closeCreateModal();
             await this._loadRooms();
-            // The owner is already a member (crud.create_room needs to add the creator).
-            // Fall back to the join modal if the open attempt fails.
+            // The owner is already a member (crud.create_room adds the creator).
             this._enterRoom(data.id, data.name);
         } catch (err) {
             errEl.textContent = err.message;
@@ -305,7 +648,7 @@ class ChatApp {
         }
         this.pendingJoinRoomId = roomId;
         this.pendingJoinRoomName = roomName;
-        document.getElementById('join-sub').textContent = `Enter the secret phrase for "${roomName}".`;
+        document.getElementById('join-sub').textContent = `Joining "${roomName}". Enter the pass phrase if the room has one.`;
         document.getElementById('join-secret').value = '';
         document.getElementById('join-room-error').textContent = '';
         document.getElementById('join-backdrop').hidden = false;
@@ -321,10 +664,9 @@ class ChatApp {
         const secret = document.getElementById('join-secret').value.trim();
         const errEl = document.getElementById('join-room-error');
         errEl.textContent = '';
-        if (!secret) {
-            errEl.textContent = 'Please enter the secret phrase.';
-            return;
-        }
+        // The phrase is optional now: pass null when empty so the server
+        // either accepts (room has no phrase) or returns a useful 400
+        // ("Invalid secret phrase or room not found").
         const roomId = this.pendingJoinRoomId;
         const roomName = this.pendingJoinRoomName;
         if (!roomId) {
@@ -334,7 +676,7 @@ class ChatApp {
         try {
             const res = await this._authFetch(`/rooms/${roomId}/join`, {
                 method: 'POST',
-                body: JSON.stringify({ secret_phrase: secret }),
+                body: JSON.stringify({ secret_phrase: secret || null }),
             });
             const data = await res.json();
             if (!res.ok) throw new Error(data.detail || 'Could not join room');
@@ -342,6 +684,54 @@ class ChatApp {
             this._enterRoom(roomId, data.name || roomName);
         } catch (err) {
             errEl.textContent = err.message;
+        }
+    }
+
+    // Join-by-name (invite flow): user pastes room name + pass phrase from
+    // an invitation email. On success we refresh the room list so the new
+    // row appears, then enter the room.
+    _openJoinByNameModal() {
+        document.getElementById('join-by-name-name').value = '';
+        document.getElementById('join-by-name-secret').value = '';
+        document.getElementById('join-by-name-error').textContent = '';
+        document.getElementById('join-by-name-backdrop').hidden = false;
+        setTimeout(() => document.getElementById('join-by-name-name').focus(), 0);
+    }
+    _closeJoinByNameModal() {
+        document.getElementById('join-by-name-backdrop').hidden = true;
+    }
+
+    async _handleJoinByName() {
+        const name = document.getElementById('join-by-name-name').value.trim();
+        const secret = document.getElementById('join-by-name-secret').value.trim();
+        const errEl = document.getElementById('join-by-name-error');
+        const submitBtn = document.getElementById('join-by-name-submit');
+        errEl.textContent = '';
+        if (!name) {
+            errEl.textContent = 'Please enter a room name.';
+            return;
+        }
+        submitBtn.disabled = true;
+        try {
+            const res = await this._authFetch('/rooms/join-by-name', {
+                method: 'POST',
+                body: JSON.stringify({
+                    name,
+                    // Empty phrase → null so the server accepts it for
+                    // rooms with no pass phrase set.
+                    secret_phrase: secret || null,
+                }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || 'Could not join room');
+            this._closeJoinByNameModal();
+            // Refresh sidebar so the new room row appears, then enter it.
+            await this._loadRooms();
+            this._enterRoom(data.id, data.name);
+        } catch (err) {
+            errEl.textContent = err.message;
+        } finally {
+            submitBtn.disabled = false;
         }
     }
 
@@ -365,6 +755,10 @@ class ChatApp {
         // Clear messages pane
         const messagesEl = document.getElementById('messages-container');
         messagesEl.innerHTML = '';
+        // Reset the rendered-id set: a different room has different messages,
+        // and old ids must not block new ones that happen to share an id
+        // (autoincrement is shared across rooms).
+        this._renderedIds = new Set();
 
         this._connectWebSocket(roomId);
         this._loadHistory(roomId);
@@ -395,15 +789,48 @@ class ChatApp {
         document.querySelectorAll('.room-item').forEach((el) => el.classList.remove('active'));
     }
 
-    _shareInvite() {
+    _openInviteModal() {
         if (!this.currentRoomId || !this.currentRoomName) return;
-        const text = `Join my chat room "${this.currentRoomName}" on Chat. Ask me for the secret phrase.`;
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(text)
-                .then(() => this._toast('Invite copied to clipboard.'))
-                .catch(() => this._toast(text));
-        } else {
-            this._toast(text);
+        document.getElementById('invite-email').value = '';
+        document.getElementById('invite-message').value = '';
+        document.getElementById('invite-error').textContent = '';
+        document.getElementById('invite-sub').textContent =
+            `Send an invitation email for "${this.currentRoomName}".`;
+        document.getElementById('invite-backdrop').hidden = false;
+        setTimeout(() => document.getElementById('invite-email').focus(), 0);
+    }
+    _closeInviteModal() {
+        document.getElementById('invite-backdrop').hidden = true;
+    }
+
+    async _handleSendInvite() {
+        const email = document.getElementById('invite-email').value.trim();
+        const message = document.getElementById('invite-message').value.trim();
+        const errEl = document.getElementById('invite-error');
+        const sendBtn = document.getElementById('invite-send');
+        errEl.textContent = '';
+        if (!email) {
+            errEl.textContent = 'Please enter the recipient email.';
+            return;
+        }
+        if (!this.currentRoomId) {
+            errEl.textContent = 'No room selected.';
+            return;
+        }
+        sendBtn.disabled = true;
+        try {
+            const res = await this._authFetch(`/rooms/${this.currentRoomId}/invite`, {
+                method: 'POST',
+                body: JSON.stringify({ email, message: message || null }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.detail || 'Could not send invite');
+            this._closeInviteModal();
+            this._toast(data.message || `Invite sent to ${email}.`);
+        } catch (err) {
+            errEl.textContent = err.message;
+        } finally {
+            sendBtn.disabled = false;
         }
     }
 
@@ -534,10 +961,15 @@ class ChatApp {
 
     _renderMessage(msg) {
         if (!msg || !msg.message_type) return;
-        // The HTTP POST response and the WebSocket echo carry the same id, so
-        // skip the second arrival.
-        if (msg.id != null && msg.id === this._lastRenderedId) return;
-        if (msg.id != null) this._lastRenderedId = msg.id;
+        // Dedupe by message id. The HTTP POST response and the WebSocket
+        // echo carry the same id; on room enter the WebSocket sends the
+        // last 50 messages on connect AND _loadHistory fetches the same
+        // messages via HTTP — both arrive in the client. Tracking every
+        // rendered id (not just the last one) catches both cases.
+        if (msg.id != null) {
+            if (this._renderedIds.has(msg.id)) return;
+            this._renderedIds.add(msg.id);
+        }
         const messagesEl = document.getElementById('messages-container');
         // Drop the placeholder
         const empty = messagesEl.querySelector('.messages-empty');
@@ -701,5 +1133,9 @@ class ChatApp {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+    // Theme runs on every page (app + auth). The head bootstrap script
+    // already applied the persisted theme before paint; init() just wires
+    // up the DOM bindings.
+    theme.init();
     window.chatApp = new ChatApp();
 });
