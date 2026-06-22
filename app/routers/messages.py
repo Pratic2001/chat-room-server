@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app import crud, models, schemas
 from app.database import get_db
 from app.routers.auth import get_current_user
+from app.ws_manager import manager
 
 router = APIRouter()
 
@@ -45,7 +46,7 @@ def get_messages_for_room(
 
 
 @router.post("", response_model=schemas.MessageResponse)
-def create_message(
+async def create_message(
     room_id: int,
     body: schemas.WSMessage,
     db: Session = Depends(get_db),
@@ -59,6 +60,7 @@ def create_message(
         raise HTTPException(status_code=403, detail="Not a member of this room")
 
     binary_data = None
+    thumbnail_data = None
     if body.data:
         try:
             binary_data = base64.b64decode(body.data)
@@ -93,4 +95,33 @@ def create_message(
         file_name=body.file_name,
         mime_type=body.mime_type,
     )
-    return _serialize(db_msg)
+    serialized = _serialize(db_msg)
+    # Include the sender's username so the client can render the bubble
+    # without an extra round-trip.
+    payload = serialized.model_dump()
+    payload["username"] = current_user.username
+
+    # Build a WSMessage with the same shape we send over the WebSocket so the
+    # client can render the HTTP response and the WS echo uniformly.
+    if body.message_type == "text":
+        ws_msg = schemas.WSMessage(
+            message_type=body.message_type,
+            content=body.content,
+            user_id=current_user.id,
+            username=current_user.username,
+            created_at=db_msg.created_at,
+        )
+    else:
+        ws_msg = schemas.WSMessage(
+            message_type=body.message_type,
+            file_name=body.file_name,
+            mime_type=body.mime_type,
+            data=payload.get("data"),
+            thumbnail=payload.get("thumbnail"),
+            user_id=current_user.id,
+            username=current_user.username,
+            created_at=db_msg.created_at,
+        )
+    await manager.broadcast(ws_msg.model_dump_json(), room_id)
+
+    return schemas.MessageResponse(**payload)

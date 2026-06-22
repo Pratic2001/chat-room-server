@@ -211,20 +211,52 @@ class ChatApp {
             li.className = 'room-item';
             li.dataset.roomId = room.id;
             if (this.currentRoomId === room.id) li.classList.add('active');
+            // Only the owner gets a delete affordance.
+            const isOwner = room.owner_id != null && this.user && room.owner_id === this.user.id;
             li.innerHTML = `
                 <span class="room-name"></span>
                 <button type="button" class="room-leave" title="Leave room" aria-label="Leave room">×</button>
+                ${isOwner ? '<button type="button" class="room-delete" title="Delete room" aria-label="Delete room">🗑</button>' : ''}
             `;
             li.querySelector('.room-name').textContent = room.name;
             li.addEventListener('click', (e) => {
-                if (e.target.closest('.room-leave')) return;
+                if (e.target.closest('.room-leave') || e.target.closest('.room-delete')) return;
                 this._openJoinModal(room.id, room.name);
             });
             li.querySelector('.room-leave').addEventListener('click', (e) => {
                 e.stopPropagation();
                 this._leaveRoom(room.id, room.name);
             });
+            const delBtn = li.querySelector('.room-delete');
+            if (delBtn) {
+                delBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this._deleteRoom(room.id, room.name);
+                });
+            }
             list.appendChild(li);
+        }
+    }
+
+    async _deleteRoom(roomId, roomName) {
+        if (!confirm(`Delete the room "${roomName}"? This removes it from your list. Other members keep their access.`)) {
+            return;
+        }
+        try {
+            const res = await this._authFetch(`/rooms/${roomId}`, { method: 'DELETE' });
+            if (res.status !== 204 && !res.ok) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(data.detail || 'Could not delete room');
+            }
+            this._toast('Room deleted.');
+            if (this.currentRoomId === roomId) {
+                // Active room is being deleted — clear the chat pane.
+                this._leaveRoom();
+            } else {
+                await this._loadRooms();
+            }
+        } catch (err) {
+            this._toast(err.message, true);
         }
     }
 
@@ -442,6 +474,12 @@ class ChatApp {
                 const data = await res.json().catch(() => ({}));
                 throw new Error(data.detail || 'Failed to send');
             }
+            // The HTTP response is a serialized message identical in shape to
+            // what the WebSocket will echo. Render it now so the sender sees
+            // their own message immediately; the WS echo is deduped by id in
+            // _renderMessage.
+            const sent = await res.json().catch(() => null);
+            if (sent) this._renderMessage(sent);
             input.value = '';
             document.getElementById('send-btn').disabled = true;
         } catch (err) {
@@ -496,6 +534,10 @@ class ChatApp {
 
     _renderMessage(msg) {
         if (!msg || !msg.message_type) return;
+        // The HTTP POST response and the WebSocket echo carry the same id, so
+        // skip the second arrival.
+        if (msg.id != null && msg.id === this._lastRenderedId) return;
+        if (msg.id != null) this._lastRenderedId = msg.id;
         const messagesEl = document.getElementById('messages-container');
         // Drop the placeholder
         const empty = messagesEl.querySelector('.messages-empty');

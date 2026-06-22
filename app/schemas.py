@@ -75,6 +75,7 @@ class MessageResponse(MessageBase):
     id: int
     room_id: int
     user_id: int
+    username: Optional[str] = None
     created_at: datetime
     data: Optional[str] = None  # base64 encoded binary data
     thumbnail: Optional[str] = None  # base64 encoded thumbnail

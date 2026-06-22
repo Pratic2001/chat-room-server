@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from app import crud, models, schemas
 from app.database import get_db
 from app.utils import SECRET_KEY, ALGORITHM
+from app.ws_manager import manager
 from jose import JWTError, jwt
 import json
 from PIL import Image, UnidentifiedImageError
@@ -42,29 +43,6 @@ async def get_current_user_ws(websocket: WebSocket, db: Session):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return None
     return user
-
-class ConnectionManager:
-    def __init__(self):
-        # room_id -> list of websockets
-        self.active_connections: dict[int, list[WebSocket]] = {}
-
-    async def connect(self, websocket: WebSocket, room_id: int):
-        await websocket.accept()
-        if room_id not in self.active_connections:
-            self.active_connections[room_id] = []
-        self.active_connections[room_id].append(websocket)
-
-    def disconnect(self, websocket: WebSocket, room_id: int):
-        if room_id in self.active_connections:
-            if websocket in self.active_connections[room_id]:
-                self.active_connections[room_id].remove(websocket)
-
-    async def broadcast(self, message: str, room_id: int):
-        if room_id in self.active_connections:
-            for connection in self.active_connections[room_id]:
-                await connection.send_text(message)
-
-manager = ConnectionManager()
 
 @router.websocket("/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = Depends(get_db)):
