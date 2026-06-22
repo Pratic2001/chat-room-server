@@ -54,8 +54,11 @@ pipeline {
 
     stage('Lint') {
       steps {
-        sh '''
-          set -e
+        sh '''#!/bin/bash
+          # Force bash: Jenkins' sh step defaults to /bin/sh (dash on
+          # Debian/Ubuntu), which lacks `[[ ]]`, `mapfile`, and
+          # `<(...)`. Stages that need any of those must be bash.
+          set -euo pipefail
           if which hadolint >/dev/null 2>&1; then
             hadolint Dockerfile
           else
@@ -73,8 +76,8 @@ pipeline {
 
     stage('Build app image') {
       steps {
-        sh '''
-          set -e
+        sh '''#!/bin/bash
+          set -euo pipefail
           # The build context is the repo root. .dockerignore keeps .env,
           # k8s/, *.pem etc. out of the image.
           buildctl --addr "$BUILDKIT_HOST" build \
@@ -92,8 +95,21 @@ pipeline {
     stage('Distribute to cluster') {
       steps {
         sshagent([SSH_CRED_ID]) {
-          sh '''
-            set -e
+          sh '''#!/bin/bash
+            # This stage needs bash (not dash) for two reasons:
+            #   (a) `mapfile -t NODES < <(...)` uses process
+            #       substitution, which dash's parser rejects with
+            #       "Syntax error: redirection unexpected".
+            #   (b) `[[ ${#NODES[@]} -eq 0 ]]` is a bash keyword; dash
+            #       only has `[ ... ]` (and that one would need
+            #       different quoting too).
+            # The shebang above makes Jenkins re-exec this script with
+            # bash. `set -o pipefail` is also load-bearing here: the
+            # `ssh ... | sort -u` pipeline would otherwise swallow
+            # ssh's non-zero exit (sort sees empty input and exits 0),
+            # and a failed node-discovery would silently look like an
+            # empty cluster.
+            set -euo pipefail
             # Discover all node InternalIPs from the cluster. This way,
             # adding or removing nodes does not require editing this
             # Jenkinsfile — the next build picks them up automatically.
@@ -126,8 +142,8 @@ pipeline {
     stage('Smoke test (any node)') {
       steps {
         sshagent([SSH_CRED_ID]) {
-          sh '''
-            set -e
+          sh '''#!/bin/bash
+            set -euo pipefail
             REF=docker.io/library/${IMAGE}:${TAG}
             # Pick any node to run the smoke test on. We use the
             # control plane (K8S_API) because it's the same host that
@@ -147,13 +163,51 @@ pipeline {
     stage('Deploy') {
       steps {
         sshagent([SSH_CRED_ID]) {
-          sh '''
-            set -e
+          sh '''#!/bin/bash
+            set -euo pipefail
             # Jenkins is running against a freshly-cloned workspace
             # (see JENKINS_SETUP.md section 5/6). The k8s/ manifests
             # exist on the Jenkins agent, not on the control plane, so
             # we scp them across before invoking kubectl there.
-            export TAG=${TAG}
+            #
+            # Three gotchas this stage used to get wrong (and that this
+            # rewrite fixes):
+            #
+            #   (1) The remote control-plane's /bin/sh is dash, which
+            #       does NOT support process substitution `<(...)`.
+            #       The previous form `kubectl apply -f <(envsubst < …)`
+            #       therefore crashed silently (the `|| true` later in
+            #       the loop swallowed the error), the deployment never
+            #       got its image tag, and the pods sat in
+            #       InvalidImageName for ~4 minutes. We now write
+            #       envsubst's output to a temp file on the remote and
+            #       `kubectl apply -f` it.
+            #
+            #   (2) envsubst with no args substitutes every ${VAR} in
+            #       the yaml and treats unset vars as empty, which would
+            #       clobber any other $ in the file. The restricted
+            #       form `envsubst '${TAG}'` substitutes ONLY $TAG and
+            #       leaves everything else (ConfigMap data, kustomize
+            #       patches, etc.) alone.
+            #
+            #   (3) The remote ssh shell has no $TAG in its env. We
+            #       can't just prepend `TAG=…` to the remote command,
+            #       because OpenSSH strips non-LC_* env vars on the
+            #       server side (AcceptEnv default). We pipe the tag
+            #       over ssh's stdin (which always passes through) and
+            #       `read` + `export` it on the remote before calling
+            #       envsubst. envsubst only sees exported variables.
+            #
+            #   (4) The previous loop ended with `|| true`, which
+            #       swallowed any failure from the broken
+            #       process-substitution form. We no longer swallow
+            #       errors — a failure here is loud and aborts the
+            #       stage, which is the right behaviour.
+
+            # $IMAGE and $TAG below are expanded by the LOCAL shell
+            # (the Jenkins agent's bash) before ssh runs, so they get
+            # embedded in the remote command as literal characters.
+            # No env propagation needed for the set image line.
             SSH_TARGET=${SSH_USER}@${K8S_API}
             REMOTE_K8S=/tmp/chatroom-k8s-${BUILD_NUMBER}
             ssh $SSH_TARGET "rm -rf $REMOTE_K8S && mkdir -p $REMOTE_K8S"
@@ -164,14 +218,35 @@ pipeline {
               k8s/50-service.yaml \
               $SSH_TARGET:$REMOTE_K8S/
             for f in 00-namespace.yaml 20-configmap.yaml 40-deployment.yaml 50-service.yaml; do
-              ssh $SSH_TARGET "kubectl apply -n ${NAMESPACE} -f <(envsubst < $REMOTE_K8S/$f)" || true
+              ssh "pratic@${K8S_API}" '
+                set -e
+                # envsubst only sees exported variables, and OpenSSH
+                # strips non-LC_* env vars on the server side (see the
+                # AcceptEnv default). Workaround: pipe the tag over ssh
+                # stdin (always passes through) and export it before
+                # calling envsubst.
+                IFS= read -r BUILD_TAG
+                export TAG="$BUILD_TAG"
+                # envsubst restricted form. Note: the single quotes
+                # around ${TAG} are load-bearing — they prevent the
+                # *local* shell (the one running this script) from
+                # expanding ${TAG} before envsubst sees it. envsubst
+                # needs the literal string "${TAG}" as its allowlist
+                # arg, NOT the value of $TAG.
+                envsubst '"'"'${TAG}'"'"' < '"$REMOTE_K8S"'/'"$f"' > '"$REMOTE_K8S"'/'"$f"'.sub
+                mv '"$REMOTE_K8S"'/'"$f"'.sub '"$REMOTE_K8S"'/'"$f"'
+                kubectl apply -n '"${NAMESPACE}"' -f '"$REMOTE_K8S"'/'"$f"'
+              ' <<<"${TAG}"
             done
-            # The chatroom-secrets Secret is created by bootstrap.sh;
-            # don't try to apply 10-secret.yaml (it would clobber real
-            # values with the CHANGE_ME template).
-            ssh $SSH_TARGET \
-              "kubectl -n ${NAMESPACE} set image deployment/chatroom-server \
-                 chatroom-server=docker.io/library/${IMAGE}:${TAG} --record"
+            # Reaffirm the image tag explicitly. This makes the deploy
+            # idempotent — even if a previous build's apply left an old
+            # tag, this overrides it. --record is deprecated but kept
+            # so the kubernetes.io/change-cause annotation still gets
+            # written for rollback discoverability.
+            ssh $SSH_TARGET "
+              kubectl -n ${NAMESPACE} set image deployment/chatroom-server \
+                chatroom-server=docker.io/library/${IMAGE}:${TAG} --record=true
+            "
             ssh $SSH_TARGET \
               "kubectl -n ${NAMESPACE} rollout status deployment/chatroom-server --timeout=180s"
             ssh $SSH_TARGET \
@@ -184,8 +259,8 @@ pipeline {
 
     stage('Verify') {
       steps {
-        sh '''
-          set -e
+        sh '''#!/bin/bash
+          set -euo pipefail
           sleep 3
           echo "--- direct NodePort ---"
           curl -fsS --max-time 5 http://${K8S_API}:${APP_NODEPORT}/healthz && echo

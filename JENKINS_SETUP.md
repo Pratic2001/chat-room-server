@@ -85,13 +85,13 @@ From your dev machine:
 
 ```bash
 cd /home/pratic/Desktop/chat-room-server
-git remote add origin git@github.com:pratic/chat-room-server.git   # example
+git remote add origin https://github.com/pratic/chat-room-server.git   # example
 git push -u origin main
 ```
 
 In the Jenkins job (step 6 below):
-- Repository URL: `git@github.com:pratic/chat-room-server.git`
-- Credentials: an SSH credential whose private key matches a key trusted by that remote (often the same `pratic-ssh` from step 4 if its public key is on the git host)
+- Repository URL: `https://github.com/pratic/chat-room-server.git`
+- Credentials: a **Username with password** credential where the password is a GitHub personal access token (PAT) with `repo` scope. Add it under `Manage Jenkins → Credentials → System → Global credentials → Add Credentials`, then select it from the job's Credentials dropdown.
 
 ### Option B — Local bare repo on the Jenkins host
 

@@ -20,12 +20,59 @@
 #      complete.
 #   8. Applies the rest of k8s/ (configmap, app deployment placeholder,
 #      NodePort service).
-#   9. Patches /etc/nginx/nginx.conf on this host to proxy to the new
-#      NodePort, with WebSocket support and 100 MB uploads.
+#   9. Edits /etc/nginx/nginx.conf on this host to proxy to the new
+#      NodePort, with WebSocket support and 100 MB uploads. Done with
+#      three idempotent sed substitutions rather than a unified diff
+#      because the file's existing indentation is mixed tabs/spaces.
 #
 # This script is idempotent — re-running it is safe. Secret values
 # already in the cluster are NOT overwritten.
+#
+# Sudo password
+# -------------
+# Step 3 needs to write /etc/sudoers.d/99-jenkins-deploy on each k8s node
+# via `sudo`, and `sudo` is not passwordless for that path. The password
+# can be supplied any of three ways (highest precedence first):
+#
+#   1. Pipe it on stdin — recommended for non-interactive runs:
+#        echo "$PW" | ./scripts/bootstrap.sh
+#      The script reads the first line of stdin and uses it as the sudo
+#      password on every node.
+#
+#   2. SUDO_PASSWORD env var:
+#        SUDO_PASSWORD="$PW" ./scripts/bootstrap.sh
+#
+#   3. SUDO_PASSWORD_FILE env var pointing at a readable file:
+#        SUDO_PASSWORD_FILE=~/.chatroom-bootstrap/sudo.pw ./scripts/bootstrap.sh
+#
+#   4. Interactive prompt (only when stdin is a TTY).
+#
+# The password is NEVER echoed to the terminal and is held only in the
+# script's memory for the duration of the sudoers step.
 set -euo pipefail
+
+# --- 0. sudo password (read once, before any ssh call consumes stdin) ---
+if [[ -n "${SUDO_PASSWORD:-}" ]]; then
+  :
+elif [[ -n "${SUDO_PASSWORD_FILE:-}" && -r "${SUDO_PASSWORD_FILE}" ]]; then
+  IFS= read -r SUDO_PASSWORD < "${SUDO_PASSWORD_FILE}" || SUDO_PASSWORD=""
+else
+  if [[ -t 0 ]]; then
+    read -rs -p "Enter sudo password for pratic on k8s nodes: " SUDO_PASSWORD
+    echo
+  else
+    # stdin is a pipe (e.g. `echo "$PW" | ./bootstrap.sh`).
+    IFS= read -r SUDO_PASSWORD || SUDO_PASSWORD=""
+  fi
+fi
+
+if [[ -z "${SUDO_PASSWORD:-}" ]]; then
+  echo "ERROR: no sudo password supplied." >&2
+  echo "  Pipe it:        echo \"\$PW\" | $0" >&2
+  echo "  Or set:         SUDO_PASSWORD=... $0" >&2
+  echo "  Or set:         SUDO_PASSWORD_FILE=/path/to/file $0" >&2
+  exit 1
+fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 K8S_DIR="$REPO_ROOT/k8s"
@@ -70,17 +117,50 @@ SUDOERS_CONTENT='%sudo ALL=(ALL) NOPASSWD: /usr/bin/ctr -n k8s.io images import 
 %sudo ALL=(ALL) NOPASSWD: /usr/bin/ctr -n k8s.io images ls *
 %sudo ALL=(ALL) NOPASSWD: /usr/local/bin/kubectl *
 '
+# Write the snippet to a local temp file first so we don't have to pipe
+# its content through sudo's stdin (sudo -S wants only the password on
+# stdin — anything else gets fed to the command, which corrupts tee).
+SUDOERS_TMP=$(mktemp)
+chmod 600 "$SUDOERS_TMP"
+trap 'rm -f "$SUDOERS_TMP"' EXIT
+printf '%s\n' "$SUDOERS_CONTENT" > "$SUDOERS_TMP"
+
 mapfile -t NODE_IPS < <(ssh "$K8S_HOST" \
   "kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type==\"InternalIP\")].address}{\"\\n\"}{end}'")
 for IP in "${NODE_IPS[@]}"; do
   log "installing sudoers snippet on pratic@${IP}"
-  ssh "pratic@${IP}" "echo '$SUDOERS_CONTENT' | sudo -S tee $SUDOERS_SNIPPET >/dev/null && sudo -S chmod 440 $SUDOERS_SNIPPET"
+  # scp avoids the "stdin is shared between sudo -S and the command" trap.
+  scp -q "$SUDOERS_TMP" "pratic@${IP}:/tmp/99-jenkins-deploy"
+
+  # Why we pipe the password via `<<<` instead of `SUDO_PASSWORD=…`:
+  # OpenSSH's server-side `AcceptEnv` is restrictive by default — it
+  # only accepts variables prefixed with `LC_*`. Anything else sent via
+  # ssh's `VAR=value command` syntax is silently dropped by sshd before
+  # the remote shell runs, so $SUDO_PASSWORD ends up empty on the
+  # remote side and sudo -S receives a blank password → "Authentication
+  # failed" even though the password was correct locally.
+  #
+  # ssh's stdin, in contrast, always passes through to the remote
+  # command. The remote `read` consumes the first line as the password
+  # (sudo wants "password\n", which is exactly what printf produces),
+  # then the snippet is tee'd into place via sudo -S.
+  #
+  # No `-t`: sudo -S does not need a PTY when its stdin is a pipe, and
+  # forcing a PTY would re-prompt for the password on the local
+  # keyboard and fail under non-interactive shells (CI, `echo ... |
+  # bootstrap.sh`, etc.).
+  ssh "pratic@${IP}" '
+    IFS= read -r SUDO_PW
+    printf "%s\n" "$SUDO_PW" | sudo -S -p "" tee '"$SUDOERS_SNIPPET"' >/dev/null \
+      && sudo -S -p "" chmod 440 '"$SUDOERS_SNIPPET"' \
+      && rm -f /tmp/99-jenkins-deploy
+  ' <<<"$SUDO_PASSWORD"
 done
 mark_done sudoers-installed
 
 # --- 4. namespace + secrets + configmap (idempotent) ---
 log "applying namespace"
-ssh "$K8S_HOST" "kubectl apply -f $K8S_DIR/00-namespace.yaml"
+ssh "$K8S_HOST" "kubectl apply -f -" < "$K8S_DIR/00-namespace.yaml"
 mark_done ns-applied
 
 # Build a ConfigMap from database_setup.sql so the init Job can mount it.
@@ -159,7 +239,7 @@ fi
 
 # --- 6. apply MySQL StatefulSet ---
 log "applying MySQL StatefulSet"
-ssh "$K8S_HOST" "kubectl apply -f $K8S_DIR/30-mysql-statefulset.yaml"
+ssh "$K8S_HOST" "kubectl apply -f -" < "$K8S_DIR/30-mysql-statefulset.yaml"
 
 if ! ssh "$K8S_HOST" 'kubectl -n chatroom get pod -l app=mysql -o name | grep -q .'; then
   log "waiting for mysql-0 to become Ready (timeout 5m)"
@@ -169,7 +249,7 @@ mark_done mysql-statefulset-applied
 
 # --- 7. apply init Job ---
 log "applying mysql-init Job"
-ssh "$K8S_HOST" "kubectl apply -f $K8S_DIR/35-mysql-init-job.yaml"
+ssh "$K8S_HOST" "kubectl apply -f -" < "$K8S_DIR/35-mysql-init-job.yaml"
 
 # Idempotent: if the Job already succeeded, skip the wait.
 if ! ssh "$K8S_HOST" 'kubectl -n chatroom get job mysql-init -o jsonpath="{.status.succeeded}" 2>/dev/null | grep -q 1'; then
@@ -178,20 +258,85 @@ if ! ssh "$K8S_HOST" 'kubectl -n chatroom get job mysql-init -o jsonpath="{.stat
 fi
 mark_done mysql-init-completed
 
-# --- 8. apply configmap + app secret + deployment placeholder + nodeport service ---
-log "applying ConfigMap, app Secret template, Deployment placeholder, NodePort service"
-ssh "$K8S_HOST" "kubectl apply -f $K8S_DIR/20-configmap.yaml"
-ssh "$K8S_HOST" "kubectl apply -f $K8S_DIR/10-secret.yaml || true   # template; values are in chatroom-secrets"
-ssh "$K8S_HOST" "kubectl apply -f $K8S_DIR/40-deployment.yaml"   # the Jenkinsfile rewrites the image on first build
-ssh "$K8S_HOST" "kubectl apply -f $K8S_DIR/50-service.yaml"
+# --- 8. apply configmap + app secret + nodeport service ---
+# 40-deployment.yaml is intentionally NOT applied here: its `image:`
+# field contains an unsubstituted `${TAG}` placeholder that this script
+# has no way to fill in (only a Jenkins build knows the real tag).
+# The first Jenkins build will `kubectl apply` the manifest with the
+# real tag substituted; subsequent builds will be no-ops for the
+# deployment except for the image update. The Deployment object will
+# not exist on the cluster until that first build, so the NodePort
+# service (50-service.yaml) will have no backing pods in the
+# meantime — which is the correct, expected state.
+log "applying ConfigMap, app Secret template, and NodePort service (deployment is created by the first Jenkins build)"
+ssh "$K8S_HOST" "kubectl apply -f -" < "$K8S_DIR/20-configmap.yaml"
+# 10-secret.yaml is a template; live values are in chatroom-secrets. Tolerate
+# `AlreadyExists` (k8s disallows `kubectl create secret` over an existing
+# secret but `kubectl apply` updates are fine — if apply succeeds, this
+# just no-ops; if it fails for any other reason, we still want the rest
+# of step 8 to run).
+ssh "$K8S_HOST" "kubectl apply -f -" < "$K8S_DIR/10-secret.yaml" || true
+ssh "$K8S_HOST" "kubectl apply -f -" < "$K8S_DIR/50-service.yaml"
 mark_done remaining-manifests-applied
 
-# --- 9. nginx patch ---
+# --- 9. nginx proxy + WebSocket + upload-size config ---
+# Done with sed rather than `patch` because /etc/nginx/nginx.conf on the
+# Jenkins host has mixed-tabs/spaces indentation that breaks unified-diff
+# context matching. The three substitutions below are idempotent and
+# whitespace-insensitive:
+#
+#   1. proxy_pass 127.0.0.1:8000  ->  192.168.0.104:30800
+#      (substitution only; sed leaves the line alone if the value is
+#      already correct)
+#   2. inject WebSocket upgrade headers inside `location / { ... }`
+#   3. inject `client_max_body_size 100m;` inside `server { ... }`
+#      (right after the listen line)
+#
+# Idempotency for (2) and (3): the script first greps for a sentinel
+# value that is only present if the injection has already happened, and
+# skips the inject if so. Re-runs are safe.
 NGINX_CONF="/etc/nginx/nginx.conf"
-if ! grep -q "192.168.0.104:30800" "$NGINX_CONF" 2>/dev/null; then
-  log "patching /etc/nginx/nginx.conf"
+
+# We need sudo to read/write the file. The script's earlier sudo
+# password plumbing only runs if the sudoers snippet is not yet
+# installed; from this point forward (on 192.168.0.111) we are running
+# on the local host as pratic, and a sudo password may again be needed.
+# The same password the script already read is reused — we just route it
+# to the local sudo. (If this script were ever run *on* the Jenkins
+# host, the local sudo would be a no-op for pratic if NOPASSWD is set
+# in /etc/sudoers for the local user.)
+if [[ -n "${SUDO_PASSWORD:-}" ]] && ! sudo -n true 2>/dev/null; then
+  log "authenticating local sudo for nginx edits"
+  printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' true
+fi
+
+if ! sudo grep -q "192.168.0.104:30800" "$NGINX_CONF" 2>/dev/null; then
+  log "patching $NGINX_CONF (proxy target, WebSocket, upload size)"
   sudo cp "$NGINX_CONF" "$NGINX_CONF.bak.$(date +%s)"
-  sudo patch -p0 "$NGINX_CONF" < "$DEPLOY_DIR/nginx-location.patch"
+
+  # 1. Swap the proxy_pass target. -E for extended regex; matches the
+  #    value alone so indentation differences don't matter.
+  sudo sed -i -E 's|proxy_pass[[:space:]]+http://127\.0\.0\.1:8000;|proxy_pass http://192.168.0.104:30800;|' "$NGINX_CONF"
+
+  # 2. Inject WebSocket headers right after the `location / {` line, but
+  #    only if the sentinel header `proxy_http_version 1.1;` is not
+  #    already in the file (i.e. we've already done this on a prior
+  #    run).
+  if ! sudo grep -q 'proxy_http_version 1.1;' "$NGINX_CONF"; then
+    sudo sed -i -E '/location[[:space:]]+\/[[:space:]]*\{/a\
+                proxy_http_version 1.1;\
+                proxy_set_header Upgrade $http_upgrade;\
+                proxy_set_header Connection "upgrade";\
+                proxy_read_timeout 300s;' "$NGINX_CONF"
+  fi
+
+  # 3. Inject client_max_body_size 100m right after the listen 443 ssl;
+  #    line, but only if not already present.
+  if ! sudo grep -q 'client_max_body_size 100m;' "$NGINX_CONF"; then
+    sudo sed -i -E '/listen[[:space:]]+443[[:space:]]+ssl;/a\
+                client_max_body_size 100m;' "$NGINX_CONF"
+  fi
+
   sudo nginx -t
   sudo systemctl reload nginx
   mark_done nginx-patched

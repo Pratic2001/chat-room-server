@@ -41,12 +41,12 @@ SECTION 1.  EXPOSE THE SOURCE TO JENKINS (one-time, pick A or B)
 
        # from your dev machine, push to wherever you host git
        cd /home/pratic/Desktop/chat-room-server
-       git remote add origin git@github.com:pratic/chat-room-server.git   # example
+       git remote add origin https://github.com/pratic/chat-room-server.git   # example
        git push -u origin main
 
-     Then in the Jenkins job (section 2.5 below) use:
-         Repository URL: git@github.com:pratic/chat-room-server.git
-         Credentials:    the SSH credential for that remote
+     Then in the Jenkins job (section 2.6 below) use:
+         Repository URL: https://github.com/pratic/chat-room-server.git
+         Credentials:    the username/password (or token) credential for that remote
 
 1B.  Use a local bare repo on the Jenkins host
 
@@ -147,16 +147,123 @@ SECTION 2.  INSTALL JENKINS + BUILD-KIT ON THE JENKINS HOST (192.168.0.111)
       Treat username as secret:  unchecked
 
     This is the same key pratic already uses to ssh to 192.168.0.104
-    and 192.168.0.106 from 192.168.0.111. The same key also
-    authenticates to the git remote (option 1A above) if it's an SSH
-    URL — add it to the GitHub/Gitea account, or create a second
-    Jenkins credential for the git remote if it lives elsewhere.
+    and 192.168.0.106 from 192.168.0.111. This credential is for
+    reaching the k8s nodes ONLY — it does NOT authenticate git
+    cloning. For that, see section 2.4b below if you went with
+    option 1A (HTTPS remote).
 
     IF you use a local bare repo (option 1B), no extra git credential
     is needed; the bare repo's filesystem permissions are what matter
     (see section 1B).
 
-2.5  Create the pipeline job
+2.4b  Add the GitHub PAT credential Jenkins uses to clone the repo
+      (option 1A / HTTPS only — skip for option 1B)
+
+      Why this is needed: with the HTTPS remote, the job config in
+      section 2.6 references a credential of kind "Username with
+      password" so git can authenticate when Jenkins clones. The
+      password is a GitHub Personal Access Token (PAT), not your
+      GitHub account password (GitHub password auth to git has been
+      disabled since Aug 2021).
+
+      Step 1 — generate the PAT on GitHub
+      ------------------------------------
+        1. Go to  https://github.com/settings/tokens
+        2. Click  "Generate new token"  →  "Generate new token
+           (classic)"  (the fine-grained variant works too; see note
+           below)
+        3. Note:           jenkins-chatroom-server
+        4. Expiration:     pick a date — 90 days is a sensible
+                           default. GitHub will email you before it
+                           expires.
+        5. Scopes:         tick  repo  (full control of private
+                           repositories). That is all you need for
+                           `git clone` / `git push`.
+        6. Click  "Generate token".
+        7. COPY THE TOKEN NOW.  GitHub shows it only once.
+
+        Fine-grained token equivalent (if you prefer the narrower
+        permission set): Repository access = "All repositories" (or
+        just this one); Permissions → Repository → Contents = "Read
+        and write". Save with the same one-time-copy rule.
+
+      Step 2 — add it to Jenkins
+      --------------------------
+        Manage Jenkins  →  Credentials  →  System  →  Global
+        credentials  →  Add Credentials
+
+          Kind:               Username with password
+          Scope:              Global
+          Username:           Pratic2001            <-- your GitHub
+                                                       username
+          Password:           <paste the PAT here>
+          ID:                 github-pat            <-- any memorable
+                                                       ID; you will
+                                                       pick this in the
+                                                       job config
+          Description:        GitHub HTTPS — chat-room-server
+          Treat username as secret:  unchecked
+
+        Click  Create.
+
+        SECURITY: the PAT is stored in Jenkins's credentials.xml
+        (usually under
+        /var/lib/jenkins/credentials.xml), encrypted with the
+        instance secret. Treat the Jenkins host's filesystem the
+        same way you'd treat a file with a database password in it.
+
+      Step 3 — (optional) avoid re-typing the token on your dev box
+      ------------------------------------------------------------
+        Once Jenkins clones via credential, your DEV machine also
+        needs to be able to push to https://github.com/.... Pick one:
+
+          A. Credential helper (recommended for personal dev boxes):
+
+               git config --global credential.helper store
+                                                    # or 'cache'
+                                                    # for 15-min memory
+               git push origin main                # prompts once
+
+             `store` writes the token to ~/.git-credentials in
+             plaintext. Fine on a personal dev box; not on shared
+             infra. Use `cache` if you'd rather it forget.
+
+          B. Embed the PAT in the remote URL (handy for CI scripts,
+             not recommended for everyday dev work):
+
+               git remote set-url origin \
+                 https://Pratic2001:<TOKEN>@github.com/Pratic2001/chat-room-server.git
+
+             This puts the token in .git/config in plaintext.
+
+      Step 4 — (optional) skip the 5-min poll with a GitHub webhook
+      -------------------------------------------------------------
+        In GitHub → repo → Settings → Webhooks → Add webhook:
+
+          Payload URL:    http://192.168.0.111:8080/github-webhook/
+          Content type:   application/json
+          Event:          "Just the push event."  (or "Send me
+                          everything" if you also want PR builds)
+          Active:         ✓
+
+        Then in the Jenkins job config (section 2.6) tick
+          Build Triggers  →  "GitHub hook trigger for GITScm polling"
+        You can leave the Poll SCM schedule in place too — redundant
+        but harmless, and a useful safety net if the webhook ever
+        silently fails.
+
+      ROTATION: PATs expire. When the credential stops working, the
+      symptom is `Checkout` failing with:
+
+          fatal: Authentication failed for
+          https://github.com/Pratic2001/chat-room-server.git/
+
+      Fix: generate a new PAT on GitHub (step 1), then in Jenkins
+      go to  Manage Jenkins  →  Credentials  →  <your credential>
+      →  Update, and replace the password. No job reconfiguration
+      needed — the credential ID stays the same.
+
+2.6  Create the pipeline job
 
     New Item  →  name: chatroom-server
               →  type: Pipeline  →  OK
@@ -165,8 +272,8 @@ SECTION 2.  INSTALL JENKINS + BUILD-KIT ON THE JENKINS HOST (192.168.0.111)
       SCM:               Git
 
       # ----- if you went with option 1A (remote) -----
-      Repository URL:    git@github.com:pratic/chat-room-server.git
-      Credentials:       the SSH credential for that remote
+      Repository URL:    https://github.com/pratic/chat-room-server.git
+      Credentials:       the username/password (or token) credential for that remote
       # -----------------------------------------------
 
       # ----- if you went with option 1B (local bare repo) -----
@@ -184,7 +291,7 @@ SECTION 2.  INSTALL JENKINS + BUILD-KIT ON THE JENKINS HOST (192.168.0.111)
 
     Save.  Do NOT click "Build Now" yet — the cluster is not bootstrapped.
 
-2.6  Confirm Jenkins can clone
+2.7  Confirm Jenkins can clone
 
     Open the job → "Build Now" once.
 
@@ -226,8 +333,28 @@ handle "I added a new k8s node" scenarios.
 
 3.3  Run the bootstrap script
 
-    cd /home/pratic/Desktop/chat-room-server
-    bash scripts/bootstrap.sh
+    The script needs your sudo password to install the sudoers snippet
+    on every k8s node (step 3 of the script). Pick one of these ways
+    to supply it — the password is held only in the script's memory
+    and is never echoed to the terminal:
+
+      # (A) Pipe it in via echo — recommended for non-interactive runs
+      echo 'yourSudoPassword' | bash scripts/bootstrap.sh
+
+      # (B) Pass it as an env var
+      SUDO_PASSWORD='yourSudoPassword' bash scripts/bootstrap.sh
+
+      # (C) Read it from a file (chmod 600 the file!)
+      SUDO_PASSWORD_FILE=~/.chatroom-bootstrap/sudo.pw \
+        bash scripts/bootstrap.sh
+
+      # (D) Just run the script — if your terminal is interactive, it
+      #     will prompt you once and use that password for every node
+
+    On re-runs after the first time, step 3 is skipped (the
+    sudoers-installed marker means no password is needed). The
+    password is only asked for the first time, or when adding a new
+    k8s node.
 
     What it does, in order:
       1.  Verifies SSH to all k8s nodes
@@ -249,23 +376,96 @@ handle "I added a new k8s node" scenarios.
       9.  Applies k8s/35-mysql-init-job.yaml and waits for the Job to
           complete (timeout 5 minutes) — this loads database_setup.sql
           and creates the `chatroom` MySQL user
-     10.  Applies k8s/20-configmap.yaml, k8s/40-deployment.yaml (with a
-          placeholder tag), and k8s/50-service.yaml
-     11.  Patches /etc/nginx/nginx.conf so the existing TLS server
-          proxies to http://192.168.0.104:30800 (the new NodePort),
-          with WebSocket upgrade headers and `client_max_body_size 100m`
+     10.  Applies k8s/20-configmap.yaml, k8s/10-secret.yaml (template;
+          live values live in chatroom-secrets), and k8s/50-service.yaml.
+          Does NOT apply k8s/40-deployment.yaml — that manifest's
+          `image:` field contains an unsubstituted `${TAG}`
+          placeholder, and this script has no way to know the real
+          tag. The Deployment is created on the first Jenkins build,
+          which substitutes a real tag and runs `kubectl apply`. Until
+          that build runs, the NodePort service has no backing pods,
+          which is the correct, expected state.
+     11.  Edits /etc/nginx/nginx.conf on this host so the existing TLS
+          server proxies to http://192.168.0.104:30800 (the new
+          NodePort), with WebSocket upgrade headers and
+          `client_max_body_size 100m`. Done with three idempotent sed
+          substitutions (the file's existing indentation is mixed
+          tabs/spaces, so a unified diff wouldn't apply cleanly).
 
     Expected output ends with:
         bootstrap complete. You can now trigger a Jenkins build.
+
+3.3.1  Why the password is needed, and the security model
+
+    Step 3 of the script writes a sudoers snippet to
+    /etc/sudoers.d/99-jenkins-deploy on every k8s node. The snippet
+    is intentionally narrow — it only passwordless-es `ctr` (for
+    importing the built image) and `kubectl` (so Jenkins can do its
+    own `kubectl` work after the image is on every node):
+
+        %sudo ALL=(ALL) NOPASSWD: /usr/bin/ctr -n k8s.io images import *
+        %sudo ALL=(ALL) NOPASSWD: /usr/bin/ctr -n k8s.io images tag *
+        %sudo ALL=(ALL) NOPASSWD: /usr/bin/ctr -n k8s.io images ls *
+        %sudo ALL=(ALL) NOPASSWD: /usr/local/bin/kubectl *
+
+    The bootstrap script itself needs sudo ONCE, on each node, to
+    install that file. After that, the pratic user (and Jenkins via
+    the pratic SSH key) can run ctr and kubectl with no password. The
+    rest of sudo still requires a password — nothing else is opened
+    up.
+
+    When you re-run bootstrap.sh:
+      * If the marker file exists (the snippet is already on every
+        node), step 3 is skipped and no password is asked for.
+      * If a new node has been added to the cluster, the script
+        discovers it via `kubectl get nodes` and only asks for the
+        password on the nodes it's actually going to install the
+        snippet on.
+
+    TROUBLESHOOTING step 3:
+      | Symptom                                    | Fix
+      |--------------------------------------------|---------------------------
+      | "no sudo password supplied"                | Pipe/env/file as in 3.3;
+      |                                            | you're probably running
+      |                                            | the script under a
+      |                                            | non-interactive shell
+      |                                            | (cron, CI) and forgot
+      |                                            | one of the four inputs.
+      | "Sorry, try again" / "Authentication       | The password fed to sudo
+      | failed" from sudo, even though the         | was empty. In older
+      | password is correct                        | versions of bootstrap.sh
+      |                                            | the password was sent
+      |                                            | via `ssh VAR=value …`,
+      |                                            | which sshd silently
+      |                                            | dropped (AcceptEnv only
+      |                                            | allows LC_* by default).
+      |                                            | Make sure you have the
+      |                                            | fixed version — re-pull
+      |                                            | / re-clone the repo.
+      | "sudo: a password is required" (no prompt) | The remote node's sudoers
+      |                                            | has `requiretty` (or
+      |                                            | similar) set for the
+      |                                            | pratic user. Fix the
+      |                                            | node-side sudoers, or
+      |                                            | install the snippet by
+      |                                            | hand on that node.
+      | Script hangs after "installing sudoers     | The snippet was already
+      | snippet on pratic@X"                       | on the node, but the
+      |                                            | marker is missing —
+      |                                            | safe to Ctrl-C, then
+      |                                            | run:
+      |                                            |   touch ~/.chatroom-bootstrap/
+      |                                            |         markers/sudoers-installed
+      |                                            | to skip the step on
+      |                                            | the next run.
 
 3.4  Verify the cluster looks right
 
     ssh pratic@192.168.0.104 'kubectl -n chatroom get all'
     # Expect: pod/mysql-0 (Running), pod/mysql-init-* (Completed or
     # absent), service/mysql (ClusterIP), service/chatroom-server
-    # (NodePort 30800). The chatroom-server-* pods will only appear
-    # after the first Jenkins build (the placeholder tag is not in
-    # any node's image store yet).
+    # (NodePort 30800). No chatroom-server-* pods yet — the
+    # Deployment is created by the first Jenkins build.
 
     ssh pratic@192.168.0.104 'kubectl -n chatroom get pvc'
     # Expect: mysql-data-mysql-0  Bound  5Gi  local-path
@@ -342,7 +542,10 @@ SECTION 4.  TRIGGER THE FIRST JENKINS BUILD
     |                   |                                            | in Jenkins with the right
     |                   |                                            | key and pick it in the job.
     | Ensure BuildKit   | "buildkitd not reachable"                  | `sudo systemctl restart buildkitd; sudo chmod 755 /run/buildkit`
-    | Distribute        | "Permission denied" running `sudo -n ctr`  | Re-run `bash scripts/bootstrap.sh` (sudoers snippet not installed)
+    | Distribute        | "Permission denied" running `sudo -n ctr`  | Re-run bootstrap.sh (sudoers snippet not installed on that node). See
+    |                   |                                            | section 3.3 for the four ways to pass the password. If the marker
+    |                   |                                            | says sudoers is installed but the error persists, ssh in and
+    |                   |                                            | `sudo cat /etc/sudoers.d/99-jenkins-deploy` to verify the file.
     | Distribute        | "Host key verification failed"             | `ssh pratic@<new-node>` once from 192.168.0.111 to trust the key
     | Distribute        | "no nodes discovered"                      | Check that `kubectl get nodes` works on 192.168.0.104 as pratic
     | Deploy            | "No such file or directory" (k8s/40…)      | The Jenkinsfile couldn't scp
@@ -447,12 +650,14 @@ Jenkinsfile edit is needed. The new node needs two manual steps:
 6.3  Install the sudoers snippet on the new node
 
     The bootstrap script discovers all current nodes via kubectl, so
-    re-running it will reach the new node automatically:
+    re-running it will reach the new node automatically. The script
+    will only ask for a sudo password for the new node (others are
+    skipped because their marker file exists) — see section 3.3 for
+    the four ways to supply it. The simplest non-interactive form:
 
-        cd /home/pratic/Desktop/chat-room-server
-        bash scripts/bootstrap.sh
+        echo 'yourSudoPassword' | bash scripts/bootstrap.sh
 
-    It will install the snippet on every node (including the new one)
+    It will install the snippet on every node that doesn't have it
     and skip everything else (markers say those steps are done).
 
 6.4  Trigger a build
@@ -470,11 +675,13 @@ If the cluster is lost or you want to start over:
 
 7.1  Re-bootstrap
 
-        bash scripts/bootstrap.sh
+        echo 'yourSudoPassword' | bash scripts/bootstrap.sh
+        #   (or any of the four forms documented in section 3.3;
+        #    if step 3's marker exists, no password is needed)
 
     This is safe to run multiple times. It will re-apply the
     StorageClass, sudoers, namespace, secrets, MySQL StatefulSet,
-    init Job, and nginx patch.
+    init Job, and nginx config.
 
 7.2  Reset the live secrets (if you lost secrets.env)
 
