@@ -80,7 +80,18 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
     exit 0
 fi
 
-[[ -f "$RUNTIME_ENV" ]] || fail "$RUNTIME_ENV not found. Run scripts/build_images.sh first."
+[[ -f "$RUNTIME_ENV" ]] || fail "$RUNTIME_ENV not found.
+  Two ways to create it:
+
+    1. Build the images locally:   ./scripts/build_images.sh
+    2. Images were built elsewhere (CI / a teammate / registry):
+         ./scripts/write_runtime_env.sh --from-stdin
+       then paste MYSQL_PASSWORD, SECRET_KEY, and ROOM_SECRET_KEY
+       (one per line, in that order).
+
+  The MySQL image's 99-grants.sql was baked with a specific
+  MYSQL_PASSWORD at build time, so the value you supply must match
+  the one used when the MySQL image was built. See the runbook §6.3."
 [[ -d "$K8S_DIR" ]]     || fail "$K8S_DIR not found. Is the repo layout intact?"
 
 # -----------------------------------------------------------------------------

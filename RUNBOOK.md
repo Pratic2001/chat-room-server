@@ -11,6 +11,11 @@ can hand it to anyone and they can follow it from a clean clone.
 > `./scripts/deploy_k8s.sh`. Everything else in this document is the
 > detailed explanation of what those two commands do and what to do when
 > they go wrong.
+>
+> **If you built the images elsewhere** (CI, a teammate, or in a
+> registry): run `./scripts/write_runtime_env.sh --from-stdin` and paste
+> `MYSQL_PASSWORD`, `SECRET_KEY`, and `ROOM_SECRET_KEY` — one per line,
+> in that order — then run `./scripts/deploy_k8s.sh`. See §6.5.
 
 ---
 
