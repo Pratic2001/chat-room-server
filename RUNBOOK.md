@@ -879,6 +879,127 @@ PW=$(python3 -c "from urllib.parse import unquote; \
 mysql -h 127.0.0.1 -P 3306 -u root -p"$PW" chatroom_db
 ```
 
+### 9.1.3 `sqlalchemy.exc.OperationalError: (1045, "Access denied for user 'root'@'<ip>' (using password: YES)")` from the app
+
+The app pod has the binary, the URL, and the password — and it's *sending*
+a password (`using password: YES` confirms this; the previous "using
+password: NO" was a different bug, see §9.1.2). MySQL is rejecting it.
+
+This means the password the **app** has doesn't match the password the
+**MySQL** pod was initialised with. Most common cause: the
+`chatroom-app` k8s Secret and the `chatroom-mysql` image's
+`99-grants.sql` were last written from **different** `app/.env.runtime`
+values — typically because the image was rebuilt (or `--rebuild` was
+used) but `scripts/deploy_k8s.sh` was not re-run, or vice versa.
+
+The encoded form of the password is what both sides need to agree on
+(`url_encode_value` in `scripts/_random_password.sh` is what keeps
+them in lock-step — see §9.1.2 for why). If they ever disagree, the
+image and the Secret need to be regenerated from the same
+`app/.env.runtime` value.
+
+**Step 1 — find the MySQL pod's IP and name.** You need both: the IP
+to know which pod is logging the rejection, and the name to `exec`
+into it for the password check.
+
+```
+kubectl -n chatroom get pods -l app.kubernetes.io/component=mysql -o wide
+# NAME                     READY   STATUS    RESTARTS   AGE   IP            NODE       ...
+# mysql-xxxxxxxxxx-yyyyy   1/1     Running   0          ...   10.244.0.xx   node-1     ...
+```
+
+The `IP` column is the pod's cluster-internal IP. The app's connection
+URL is `mysql://root:...@mysql:3306/chatroom_db` (the Service name
+`mysql` resolves to the Service's ClusterIP, which DNATs to this pod
+IP). The IP in the error message is the **app pod's** IP, not MySQL's
+— but the MySQL pod IP is what you need for the next step.
+
+**Step 2 — check what password MySQL actually expects.** Connect to
+the MySQL pod directly (bypassing the app) using the same password
+the app *thinks* it has, and see whether the server accepts it:
+
+```
+# Password the app reads from the chatroom-app Secret (URL-encoded form).
+APP_PW=$(kubectl -n chatroom get secret chatroom-app \
+  -o jsonpath='{.data.MYSQL_PASSWORD}' | base64 --decode)
+echo "App thinks password is: $APP_PW"
+
+# Password baked into the MySQL image's 99-grants.sql at build time.
+IMG_PW="$(awk -F= '/^MYSQL_PASSWORD=/{print $2}' app/.env.runtime)"
+echo "Image baked password is: $IMG_PW"
+```
+
+If `$APP_PW` and `$IMG_PW` print different values, that's the bug —
+the app's Secret was last written from a different `app/.env.runtime`
+than the MySQL image was built from. Both are URL-encoded forms
+(both will look like base64-ish strings without URL-specials); the
+mismatch will be visible as different strings.
+
+**Step 3 — try logging into MySQL with the app's password.** This
+proves whether the app's password is the one MySQL is rejecting:
+
+```
+# Decode the app's password (the chatroom-app Secret holds the encoded form).
+APP_PW_DECODED=$(printf '%s' "$APP_PW" | python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))')
+
+# Try logging in. If THIS works, MySQL accepts the app's password —
+# the problem is the wrong app replica pointing at the wrong pod (rare;
+# skip to step 4). If this fails too, the password is genuinely wrong.
+kubectl -n chatroom exec -it deploy/mysql -- \
+    mysql -u root -p"$APP_PW_DECODED" chatroom_db -e "SELECT 1;"
+```
+
+**Step 4 — the most common case: regenerate and reconcile.** Re-run
+both build and deploy, in that order, so the k8s Secret is rewritten
+from the *same* `app/.env.runtime` the image was just baked from:
+
+```
+./scripts/build_images.sh
+./scripts/deploy_k8s.sh
+```
+
+`build_images.sh` is idempotent — it re-uses the existing
+`app/.env.runtime` if present, bakes that exact value into
+`99-grants.sql`, and the new `deploy_k8s.sh` writes the same value
+into both k8s Secrets. The app pods automatically pick up the new
+Secret and reconnect.
+
+**Step 5 — verify the fix.** Re-run the failing query from the app
+(or watch the app's logs):
+
+```
+# Tail the app logs while you re-trigger the failing action.
+kubectl -n chatroom logs -f deploy/chatroom-app --tail=50
+
+# Confirm the app pod can now log in by triggering a simple query
+# (the /healthz endpoint is DB-free, so it won't help here — sign in
+# via the UI or curl /auth/login instead).
+```
+
+**If `$APP_PW` and `$IMG_PW` are identical but MySQL still rejects:**
+the password in `app/.env.runtime` is no longer the one either side
+was initialised with. This can happen if `app/.env.runtime` was
+hand-edited, or if a previous `build_images.sh` was run with
+`--rebuild` on a different machine and the file was rsync'd over
+without the image being rebuilt. Force a full rotation:
+
+```
+./scripts/build_images.sh --rebuild    # generates a new password, bakes it into a new image
+./scripts/deploy_k8s.sh                # writes the same new value into both Secrets
+kind load docker-image chatroom-mysql:latest   # or k3d / minikube equivalent
+kubectl -n chatroom delete pod -l app.kubernetes.io/component=mysql   # pick up the new image
+kubectl -n chatroom rollout status deploy/mysql --timeout=2m
+```
+
+**Why "update the MySQL pod's password" is the wrong instinct.** You
+*can* change MySQL's root password with `ALTER USER ... IDENTIFIED
+BY` from inside the running pod — but the chatroom-mysql image is
+baked from `99-grants.sql` at first boot, and the k8s Secret isn't
+auto-synced to the new value. The next pod restart (e.g. from
+`imagePullPolicy` flip, node reboot, or an `evict`) re-runs
+`99-grants.sql` and resets the password back to the image-baked
+value. Always regenerate-and-reconcile; never hand-edit either side.
+
 ### 9.2 `chatroom-app-*` CrashLoopBackOff
 
 ```
@@ -899,6 +1020,11 @@ Common values to verify against `app/.env.runtime`:
 - `MYSQL_USER=root` (matches what `mysql/Dockerfile` bakes).
 - `MYSQL_PASSWORD` matches the value in `app/.env.runtime` and the
   MySQL image.
+
+If the app is logging `sqlalchemy.exc.OperationalError: (1045, ...)`
+specifically, jump to §9.1.3 — that section has the step-by-step
+diagnostic for the password-mismatch case, including how to extract
+the MySQL pod IP and read the app Secret directly.
 
 ### 9.3 WebSocket connections drop after ~60s
 
