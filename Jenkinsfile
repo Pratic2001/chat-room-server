@@ -117,9 +117,16 @@ pipeline {
             # Requires: SSH_USER can ssh to every node and has the
             # passwordless-sudo snippet from scripts/bootstrap.sh
             # installed (/usr/bin/ctr -n k8s.io images …).
+            #
+            # --kubeconfig is required: sudo resets $HOME to /root, so
+            # kubectl would otherwise look for /root/.kube/config and
+            # fail with "connection refused to localhost:8080". Passing
+            # the path explicitly avoids depending on $HOME preservation
+            # (sudo --preserve-env=HOME) and keeps the call
+            # self-contained — works regardless of who owns the file.
             mapfile -t NODES < <(
               ssh ${SSH_USER}@${K8S_API} \
-                "sudo -n kubectl get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type==\"InternalIP\")].address}{\"\\n\"}{end}'" \
+                "sudo -n kubectl --kubeconfig=/home/${SSH_USER}/.kube/config get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type==\"InternalIP\")].address}{\"\\n\"}{end}'" \
                 | sort -u
             )
             if [[ ${#NODES[@]} -eq 0 ]]; then
