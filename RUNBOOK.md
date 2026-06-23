@@ -677,6 +677,101 @@ project.)
 This is destructive: it deletes the PVC and the data on it. To preserve
 the data, take a dump first (§8.2), then uninstall.
 
+### 8.6 Restarting containers
+
+There are four common reasons to want a restart, and they have different
+"right answers" — picking the wrong one either causes downtime or leaves
+the cluster in the same state as before.
+
+#### 8.6.1 Pick a new image (you rebuilt `build_images.sh`)
+
+After `./scripts/build_images.sh`, the cluster's local Docker daemon has
+the new image, but the running pods are still running the old one
+(`imagePullPolicy: Never` means k8s never re-checks). Force a rollout so
+the new image is picked up:
+
+```
+kubectl -n chatroom rollout restart deploy/mysql
+kubectl -n chatroom rollout restart deploy/chatroom-app
+kubectl -n chatroom rollout status deploy/mysql --timeout=2m
+kubectl -n chatroom rollout status deploy/chatroom-app --timeout=3m
+```
+
+`rollout restart` issues a rolling update — the app Deployment has
+`replicas: 2` + `maxUnavailable: 0` + `maxSurge: 1`, so traffic stays
+served throughout (old pod only stops accepting connections once the
+new pod is `Ready`). The MySQL Deployment is single-replica so expect a
+brief gap of a few seconds while it comes back up.
+
+For the MySQL pod specifically, an equivalent (and slightly cheaper)
+form is just to delete the pod — the ReplicaSet controller re-creates
+it immediately, picking up the new image:
+
+```
+kubectl -n chatroom delete pod -l app.kubernetes.io/component=mysql
+```
+
+Either form is fine. Use whichever you can type faster.
+
+#### 8.6.2 Pick up a changed ConfigMap or Secret
+
+ConfigMaps and Secrets are mounted into the pod at start; changing the
+resource does **not** restart the pod automatically. The app pod
+mounts the chatroom-app Secret as env vars (`envFrom: secretRef`), so
+env changes also need a restart to take effect. Same commands as 8.6.1:
+
+```
+kubectl -n chatroom rollout restart deploy/chatroom-app
+kubectl -n chatroom rollout status deploy/chatroom-app --timeout=3m
+```
+
+For Secrets only (no code change), you can also use
+`scripts/deploy_k8s.sh` — it re-applies the imperative Secret and rolls
+the Deployment so the new values are read.
+
+#### 8.6.3 A pod is wedged (CrashLoopBackOff, hung, OOM-killed)
+
+Don't `rollout restart` — that only helps if a new pod would actually
+succeed. Investigate first:
+
+```
+kubectl -n chatroom describe pod -l app.kubernetes.io/component=app | tail -40
+kubectl -n chatroom logs --previous -l app.kubernetes.io/component=app --tail=200
+```
+
+Once you understand the failure and have a reason to believe a fresh
+start would succeed (e.g. you've fixed the upstream cause, or it's
+clearly a transient runtime state issue), restart just that component:
+
+```
+kubectl -n chatroom delete pod -l app.kubernetes.io/component=app
+# ReplicaSet creates a new one. Both replicas are replaced, but with
+# maxUnavailable=0 the Service keeps serving throughout.
+```
+
+#### 8.6.4 Quick "bounce everything"
+
+```
+kubectl -n chatroom rollout restart deploy/mysql
+kubectl -n chatroom rollout restart deploy/chatroom-app
+```
+
+Use this when you've changed cluster-wide infra (e.g. updated the
+Ingress controller, rotated the MySQL root password via 8.1 and want
+both pods to come up cleanly with the new Secret). Order matters:
+restart MySQL first so the app pods can reconnect to it once they
+come back up.
+
+#### 8.6.5 What's safe to skip
+
+- `kubectl delete deploy/...` is **not** a restart — it tears down
+  the Deployment and (without `--cascade=orphan`) the ReplicaSet and
+  Pods, leaving the cluster without the app until you re-apply the
+  manifests. Use only for §8.5 teardown.
+- `kubectl drain` / `kubectl cordon` are for node maintenance, not
+  pod restart. They evict pods to a different node, which is the
+  wrong tool here.
+
 ---
 
 ## 9. Troubleshooting
