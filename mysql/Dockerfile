@@ -8,8 +8,20 @@
 # /docker-entrypoint-initdb.d/ directory runs every *.sql file in lexical
 # order on first boot of an empty datadir.
 
-ARG MYSQL_IMAGE=mysql:8.0
+ARG MYSQL_IMAGE=mysql:8.0-debian
 FROM ${MYSQL_IMAGE}
+
+# Install MySQL client tools so `kubectl exec ... -- mysql ...` works.
+# On Debian (mysql:8.0-debian base) the `mysql` CLI ships in `default-mysql-client`,
+# not in the `mysql-client` meta-package — that one pulls in MariaDB's client
+# (`mariadb` binary) on modern Debian releases.
+RUN set -eux; \
+    if command -v apt-get > /dev/null; then \
+        apt-get update && apt-get install -y --no-install-recommends default-mysql-client && rm -rf /var/lib/apt/lists/*; \
+    else \
+        apk add --no-cache mysql-client; \
+    fi
+
 
 # Build-time only: the root password the app will use. Not exposed in the
 # final image as a layer env var (we sed-substitute it into a file and then

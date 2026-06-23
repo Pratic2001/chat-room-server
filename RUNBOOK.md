@@ -620,8 +620,9 @@ From a build host that has the `mysql` client and can reach the cluster:
 ```
 # Start a port-forward to the MySQL Service
 kubectl -n chatroom port-forward svc/mysql 3306:3306 &
-# Read the password
-MYSQL_PASSWORD="$(grep ^MYSQL_PASSWORD= app/.env.runtime | cut -d= -f2-)"
+# Read the password (URL-decoded — see §9.1.2 for why)
+MYSQL_PASSWORD="$(python3 -c "from urllib.parse import unquote; \
+  print(unquote(open('app/.env.runtime').read().split('MYSQL_PASSWORD=',1)[1].split('\n',1)[0]))")"
 # Dump
 mysqldump -h 127.0.0.1 -P 3306 -u root -p"$MYSQL_PASSWORD" \
     --single-transaction --routines --triggers \
@@ -656,8 +657,13 @@ init file only runs on an **empty** datadir. To apply schema changes
 without nuking the PVC, run them manually:
 
 ```
-kubectl -n chatroom exec -it mysql-0 -- mysql -uroot -p"$MYSQL_PASSWORD" chatroom_db < my-migration.sql
+MYSQL_PASSWORD="$(python3 -c "from urllib.parse import unquote; \
+  print(unquote(open('app/.env.runtime').read().split('MYSQL_PASSWORD=',1)[1].split('\n',1)[0]))")"
+kubectl -n chatroom exec -i mysql-0 -- mysql -uroot -p"$MYSQL_PASSWORD" chatroom_db < my-migration.sql
 ```
+
+(`-i` instead of `-it` so stdin isn't a TTY and the heredoc pipes in
+cleanly. The password is URL-decoded — see §9.1.2.)
 
 (Or use Alembic / a proper migration tool — out of scope for this
 project.)
@@ -702,6 +708,78 @@ Common causes, in order of likelihood:
 - **No default StorageClass.** `kubectl get storageclass` shows none
   marked `(default)`. Either mark one as default or set
   `storageClassName:` in `k8s/20-mysql-pvc.yaml`.
+
+### 9.1.1 `kubectl exec ... -- mysql` fails: `exec: " ": executable file not found in $PATH`
+
+```
+kubectl -n chatroom exec -it deploy/mysql -- \
+    mysql -u root -p$(awk '/^MYSQL_ROOT_PASSWORD=/{print $2}' app/.env.runtime)
+# error: ... exec failed: ... exec: " ": executable file not found in $PATH
+# Command 'mysql' not found, but can be installed with:
+# sudo apt install mariadb-client-core  # version ...
+# sudo apt install mysql-client-core    # version ...
+```
+
+The `mysql` CLI is not installed in the running `chatroom-mysql` image.
+This happens on `mysql:8.0-debian`-based images: the `mysql-client`
+Debian package is a virtual meta-package that resolves to **MariaDB's**
+client (which provides a `mariadb` binary, not `mysql`). The shipped
+`mysql/Dockerfile` installs the right package (`default-mysql-client`)
+— but if you're running an image built before the fix landed, you have
+the old one.
+
+**Fix** — rebuild the image and reload it into the cluster:
+
+```
+./scripts/build_images.sh --rebuild
+kind load docker-image chatroom-mysql:latest          # or k3d / minikube equivalent
+kubectl -n chatroom delete pod -l app.kubernetes.io/component=mysql
+# pod re-creates with the new image; the schema and the data on the PVC
+# are untouched
+```
+
+If you don't want to rotate the MySQL password, drop `--rebuild` — the
+Dockerfile change alone is enough to install the `mysql` binary.
+
+### 9.1.2 `mysql: Access denied` even after the binary is present
+
+Same `kubectl exec` command, but you get:
+
+```
+ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: YES)
+```
+
+`scripts/_random_password.sh::write_runtime_env_file` URL-encodes the
+three secrets before writing `app/.env.runtime` (so they're safe to
+embed in a SQLAlchemy URL and in a `kubectl create secret` value
+without shell expansion surprises). That means the literal you read
+with `awk`/`grep` is the **encoded** form, not the password MySQL was
+initialised with. Pass it through `urllib.parse.unquote` first.
+
+**Don't** quote-fix this by stripping `%` or editing `.env.runtime` —
+both the encoded form (in the file and in the k8s Secret) and the
+real password (in the MySQL image's `99-grants.sql`) have to stay in
+sync, and `url_encode_value` is what keeps them aligned.
+
+**One-liner that decodes and execs in one go** (uses the k8s
+Service name as the host so you don't need a port-forward):
+
+```
+PW=$(python3 -c "from urllib.parse import unquote; \
+  print(unquote([l.split('=',1)[1].strip() for l in open('app/.env.runtime') \
+                 if l.startswith('MYSQL_PASSWORD=')][0]))")
+kubectl -n chatroom exec -it deploy/mysql -- mysql -u root -p"$PW" chatroom_db
+```
+
+Or use the same port-forward pattern as §8.2, but URL-decode the
+password first:
+
+```
+kubectl -n chatroom port-forward svc/mysql 3306:3306 &
+PW=$(python3 -c "from urllib.parse import unquote; \
+  print(unquote(open('app/.env.runtime').read().split('MYSQL_PASSWORD=',1)[1].split('\n',1)[0]))")
+mysql -h 127.0.0.1 -P 3306 -u root -p"$PW" chatroom_db
+```
 
 ### 9.2 `chatroom-app-*` CrashLoopBackOff
 
@@ -789,6 +867,10 @@ path shows up in the error:
 If you want to bypass the script and build manually:
 
 ```
+# NOTE: pass the URL-encoded value as-is. The Dockerfile `sed`s it
+# straight into 99-grants.sql, so the literal there must match the
+# literal in app/.env.runtime (and in the k8s Secret that
+# deploy_k8s.sh creates). Don't URL-decode here — see §9.1.2.
 docker build \
     --build-arg MYSQL_ROOT_PASSWORD="$(grep ^MYSQL_PASSWORD= app/.env.runtime | cut -d= -f2-)" \
     -f mysql/Dockerfile \
