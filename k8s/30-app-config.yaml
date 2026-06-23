@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chatroom-app
+  namespace: chatroom
+  labels:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: app
+data:
+  # Inside the cluster, the MySQL service is reachable at the DNS name
+  # `mysql` (the Service in 22-mysql-service.yaml).
+  MYSQL_HOST: "mysql"
+  MYSQL_PORT: "3306"
+  MYSQL_USER: "root"
+  MYSQL_DB: "chatroom_db"
+  ALGORITHM: "HS256"
+  ACCESS_TOKEN_EXPIRE_MINUTES: "60"
+  # SMTP is optional. If left blank, the Invite flow will raise a 502 with
+  # a clear message. Fill in your own SMTP relay to enable invites.
+  MAIL_HOST: ""
+  MAIL_PORT: "587"
+  MAIL_USER: ""
+  MAIL_FROM: "Chat Room <no-reply@example.com>"
+  MAIL_USE_TLS: "true"
+  # The values that must stay secret (MYSQL_PASSWORD, SECRET_KEY,
+  # ROOM_SECRET_KEY) live in the chatroom-app Secret, not here.

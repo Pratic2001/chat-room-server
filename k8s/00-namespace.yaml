@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: chatroom
+  labels:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/part-of: chatroom

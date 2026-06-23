@@ -1,0 +1,19 @@
+-- 99-grants.sql.template
+-- -----------------------------------------------------------------------------
+-- This file is sed-rendered at image-build time by mysql/Dockerfile.
+-- The placeholder __MYSQL_ROOT_PASSWORD__ is replaced with the value
+-- passed as the MYSQL_ROOT_PASSWORD build-arg from scripts/build_images.sh.
+--
+-- The file ends up at /docker-entrypoint-initdb.d/99-grants.sql in the
+-- final image and runs LAST on first boot, after 01-schema.sql. Its job
+-- is to pin the root user's password to the build-time value, so the
+-- application container's MYSQL_PASSWORD env matches the DB side.
+--
+-- The official mysql entrypoint creates root with a random initial password
+-- (or the value of MYSQL_ROOT_PASSWORD, which we don't set on the k8s
+-- Deployment). This script writes the password to the value the app will
+-- use, so the connection string in app/database.py lines up exactly.
+
+ALTER USER 'root'@'localhost' IDENTIFIED BY '__MYSQL_ROOT_PASSWORD__';
+ALTER USER 'root'@'%'         IDENTIFIED BY '__MYSQL_ROOT_PASSWORD__';
+FLUSH PRIVILEGES;

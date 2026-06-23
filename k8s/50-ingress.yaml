@@ -1,0 +1,51 @@
+# Ingress for the chatroom app.
+#
+# The Ingress controller terminates TLS (or passes plaintext through, see
+# annotations below) and routes to the chatroom-app Service on port 80.
+# This file is committed; the host and TLS configuration live in
+# k8s/secrets.runtime.yaml / are owned by the operator running the cluster.
+#
+# Defaults:
+#   - ingressClassName: nginx   (works with ingress-nginx; swap for your
+#     controller of choice — e.g. "traefik", "kong", or your cloud's L7 LB)
+#   - No TLS section, per the project decision that TLS is terminated
+#     outside the cluster. The commented block below shows how to add
+#     cert-manager-managed TLS in 5 lines if/when you want to flip that.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chatroom
+  namespace: chatroom
+  labels:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: app
+  annotations:
+    # WebSocket support: ingress-nginx's defaults already pass the
+    # `Upgrade` and `Connection` headers, but make the timeouts explicit
+    # so a long-lived chat connection isn't torn down by an idle LB.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Larger request bodies so image/file uploads up to the in-app
+    # 10MB limit aren't truncated by the proxy.
+    nginx.ingress.kubernetes.io/proxy-body-size: "12m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: chatroom.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: chatroom-app
+                port:
+                  number: 80
+  # To enable TLS via cert-manager, uncomment the block below and replace
+  # "chatroom.local" with the real hostname the cert should cover.
+  #
+  # tls:
+  #   - hosts:
+  #       - chatroom.local
+  #     secretName: chatroom-tls

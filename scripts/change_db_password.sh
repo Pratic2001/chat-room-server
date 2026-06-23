@@ -20,6 +20,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="$REPO_ROOT/.env"
 
+# Shared URL-safe password generator (also used by build_images.sh so the
+# no-@-:-/-?-#-[-]-% invariant lives in one place).
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/_random_password.sh"
+
 log()  { printf '\033[1;34m[%s]\033[0m %s\n' "change-db" "$*" >&2; }
 fail() { printf '\033[1;31m[%s]\033[0m %s\n' "change-db" "$*" >&2; exit 1; }
 
@@ -50,24 +55,7 @@ MYSQL_DB="$(get_env_var MYSQL_DB)"
 log "Target:  user=$MYSQL_USER  host=$MYSQL_HOST  db=$MYSQL_DB"
 log "Repo:    $REPO_ROOT"
 
-# -----------------------------------------------------------------------------
-# 2. Generate a URL-safe random password
-# -----------------------------------------------------------------------------
-# Strategy: 32 chars from /dev/urandom, base64-encoded, then strip every char
-# that is special in a URL userinfo component. Loop until non-empty (vanishingly
-# unlikely to loop, but cheap to guard).
-generate_password() {
-    local candidate
-    while :; do
-        candidate="$(head -c 32 /dev/urandom | base64 | tr -d '=+/@\?#[]:%' | tr -d '\n')"
-        [[ -n "$candidate" ]] || continue
-        [[ ${#candidate} -ge 16 ]] || continue
-        printf '%s' "$candidate"
-        return
-    done
-}
-
-NEW_PASSWORD="$(generate_password)"
+NEW_PASSWORD="$(generate_url_safe_password)"
 
 # -----------------------------------------------------------------------------
 # 3. Prompt for the CURRENT MySQL password
@@ -132,18 +120,6 @@ log "Backed up $ENV_FILE -> $BACKUP_FILE"
 
 # Defensive URL-encode for the value we write into .env. The generated password
 # already avoids reserved chars, but this protects against future hand-edits.
-url_encode_value() {
-    local s="$1"
-    s="${s//\%/%25}"
-    s="${s//@/%40}"
-    s="${s//:/%3A}"
-    s="${s//\//%2F}"
-    s="${s//\?/%3F}"
-    s="${s//#/%23}"
-    s="${s//\[/%5B}"
-    s="${s//\]/%5D}"
-    printf '%s' "$s"
-}
 NEW_PASSWORD_ENCODED="$(url_encode_value "$NEW_PASSWORD")"
 
 TMP_ENV="$(mktemp "${ENV_FILE}.XXXXXX")"

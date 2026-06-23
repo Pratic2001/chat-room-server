@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: chatroom
+  labels:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: mysql
+spec:
+  # MySQL is a singleton — leader-election across replicas is out of scope
+  # for this project. If you want HA, swap in a MySQL operator (e.g.
+  # mysql-operator, percona-xtradb-cluster-operator).
+  replicas: 1
+  strategy:
+    type: Recreate  # PVC is RWO; Recreate is the only safe option.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chatroom
+      app.kubernetes.io/component: mysql
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chatroom
+        app.kubernetes.io/component: mysql
+    spec:
+      # No hostPath, no nodeSelector, no nodeName — this pod can land on
+      # any node that the scheduler chooses. Works on every cluster.
+      containers:
+        - name: mysql
+          image: chatroom-mysql:latest
+          imagePullPolicy: Never  # built locally by build_images.sh
+          ports:
+            - name: mysql
+              containerPort: 3306
+              protocol: TCP
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: chatroom-mysql
+                  key: MYSQL_ROOT_PASSWORD
+            - name: MYSQL_ROOT_HOST
+              value: "%"
+            - name: MYSQL_DATABASE
+              value: "chatroom_db"
+          args:
+            - --default-authentication-plugin=caching_sha2_password
+            - --character-set-server=utf8mb4
+            - --collation-server=utf8mb4_unicode_ci
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          livenessProbe:
+            # mysqladmin ping returns 0 on success. The official mysql image
+            # ships mysqladmin, so no extra tooling needed.
+            exec:
+              command:
+                - mysqladmin
+                - ping
+                - -h
+                - "127.0.0.1"
+                - -uroot
+                - -p$(MYSQL_ROOT_PASSWORD)
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            # TCP probe is enough — once 3306 accepts, the server is up. The
+            # schema migrations in /docker-entrypoint-initdb.d/ finish before
+            # the listener is opened, so this is a fair readiness signal.
+            tcpSocket:
+              port: mysql
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: chatroom-mysql-data

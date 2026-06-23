@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chatroom-app
+  namespace: chatroom
+  labels:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: app
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chatroom
+      app.kubernetes.io/component: app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chatroom
+        app.kubernetes.io/component: app
+    spec:
+      # No hostPath, no nodeSelector, no nodeName — works on every cluster.
+      # Spread pods across nodes for a small amount of HA within a single
+      # cluster. Soft constraint: best-effort, not required.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: chatroom
+              app.kubernetes.io/component: app
+      containers:
+        - name: app
+          image: chat-room-server:latest
+          imagePullPolicy: Never  # built locally by build_images.sh
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: chatroom-app
+            - secretRef:
+                name: chatroom-app
+          env:
+            - name: MAIL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: chatroom-app
+                  key: MAIL_PASSWORD
+                  optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          livenessProbe:
+            # /healthz is intentionally DB-free (see app/main.py), so a
+            # transient MySQL hiccup will not restart the app pods.
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # WebSockets benefit from a higher connection limit and longer
+          # timeouts. uvicorn's defaults are fine for short-poll HTTP, but
+          # we'd rather not have an idle chat connection torn down by a
+          # proxy. The Service is ClusterIP, so no public LB is involved
+          # yet — the Ingress is the place to tune timeouts.
