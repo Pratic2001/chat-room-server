@@ -167,20 +167,49 @@ for TARGET in "${TARGETS[@]}"; do
     continue
   fi
 
-  # Install: read password from ssh stdin, sudo -S into a single
-  # bash -c that does install + visudo -c validation + cleanup.
-  REMOTE_OUTPUT=$(ssh "$TARGET" bash -s <<EOF
-IFS= read -r SUDO_PW
-printf '%s\n' "\$SUDO_PW" | sudo -S -p '' bash -c '
-  set -e
-  install -m 0440 -o root -g root /tmp/99-jenkins-deploy.new \\
-    /etc/sudoers.d/99-jenkins-deploy \\
-    && rm -f /tmp/99-jenkins-deploy.new \\
-    && visudo -c -f /etc/sudoers.d/99-jenkins-deploy \\
-    && echo OK
-'
-EOF
-) || {
+  # Install: read password from ssh stdin, then run a single sudo
+  # invocation that does install + visudo -c validation.
+  #
+  # The remote body is a single-quoted string in the local script,
+  # passed to ssh as the command-to-execute. The single quotes
+  # suppress local variable expansion, so the body — including all
+  # `$variable` references and the inner `"…"` quotes — reaches
+  # the remote shell verbatim. The remote shell then does the
+  # expansion and execution.
+  #
+  # Why the snippet content and the password are on different
+  # streams: the original bootstrap.sh form
+  #   printf "$pw" | sudo tee file
+  # collided on the same stream. `sudo -S` reads the password
+  # from stdin, then execs `tee` with stdin exhausted. `tee` sees
+  # EOF and writes nothing, leaving a 0-byte file. We avoid that
+  # by feeding the snippet from a regular file
+  # (/tmp/99-jenkins-deploy.new, staged by the cat-on-ssh above)
+  # via `tee < "$stage"` inside the sudo'd command. Password on
+  # ssh stdin, snippet in a file. They never collide.
+  #
+  # Why `tee` (not `install`):
+  #   GNU `install` errors with EACCES when the destination
+  #   exists and the running user can't unlink it. `tee`
+  #   overwrites via `open(O_TRUNC)` which works as root.
+  REMOTE_BODY='
+    IFS= read -r SUDO_PW
+    printf "%s\n" "$SUDO_PW" | sudo -S -p "" bash -c "
+      set -e
+      install_path=/etc/sudoers.d/99-jenkins-deploy
+      stage=/tmp/99-jenkins-deploy.new
+      # Lift the existing files mode so tee can overwrite it.
+      # The 2>/dev/null tolerates the file not existing yet.
+      chmod 0644 \"\$install_path\" 2>/dev/null || true
+      tee \"\$install_path\" >/dev/null < \"\$stage\" \
+        && chown root:root \"\$install_path\" \
+        && chmod 0440 \"\$install_path\" \
+        && rm -f \"\$stage\" \
+        && visudo -c -f \"\$install_path\" \
+        && echo OK
+    "
+  '
+  REMOTE_OUTPUT=$(ssh "$TARGET" "$REMOTE_BODY" <<<"$SUDO_PASSWORD") || {
     echo "  install on $TARGET failed; sudo password wrong, or remote visudo rejected the snippet" >&2
     FAILED=$((FAILED+1))
     continue
@@ -188,26 +217,38 @@ EOF
 
   if [[ "$REMOTE_OUTPUT" == *"OK"* ]]; then
     # Verify the install actually works (defence in depth: even if
-    # the remote script said OK, run an independent sudo -n probe).
-    if ssh "$TARGET" "sudo -n true" >/dev/null 2>&1; then
-      echo "  installed and sudo -n works"
+    # the remote script said OK, run an independent sudo probe).
+    # We probe with `sudo -n -l` (list effective rights) — that
+    # succeeds only if the snippet is loaded and parsed, and it
+    # shows us whether our two rules are present. We then match on
+    # the rule strings.
+    #
+    # NB: don't probe with `sudo -n true` — `true` is NOT in the
+    # snippet's allowlist, so it would always prompt even when the
+    # install is correct. The snippet is intentionally narrow (it
+    # does NOT grant blanket NOPASSWD).
+    PROBE=$(ssh "$TARGET" "sudo -n -l" 2>&1) || {
+      echo "  installed, but sudo -n -l failed: $PROBE" >&2
+      FAILED=$((FAILED+1))
+      continue
+    }
+    if [[ "$PROBE" == *"NOPASSWD: /usr/bin/kubectl"* \
+       && "$PROBE" == *"NOPASSWD: /usr/bin/ctr -n k8s.io images"* ]]; then
+      echo "  installed and sudo -n -l confirms both rules"
       INSTALLED=$((INSTALLED+1))
-    elif [[ "$REMOTE_OUTPUT" == *"already correct"* ]]; then
-      echo "  already correct"
-      SKIPPED=$((SKIPPED+1))
     else
-      # The snippet installed but sudo -n still prompts — the
-      # snippet path likely doesn't match where kubectl/ctr live on
-      # this node.
+      # The snippet installed but at least one rule is missing or
+      # the path doesn't match where kubectl/ctr live on this node.
       REMOTE_KUBECTL=$(ssh "$TARGET" "which kubectl" 2>/dev/null || echo "")
       REMOTE_CTR=$(ssh "$TARGET" "which ctr" 2>/dev/null || echo "")
-      echo "  installed, but 'sudo -n true' still prompts." >&2
+      echo "  installed, but sudo -n -l does not list both rules." >&2
       echo "    This node's binaries are:" >&2
       echo "      kubectl: ${REMOTE_KUBECTL:-(not found in PATH)}" >&2
       echo "      ctr:     ${REMOTE_CTR:-(not found in PATH)}" >&2
       echo "    The embedded snippet assumes /usr/bin/kubectl and" >&2
       echo "    /usr/bin/ctr. Edit SNIPPET_CONTENT in this script" >&2
       echo "    to match the real paths and re-run." >&2
+      echo "    sudo -n -l said: $PROBE" >&2
       FAILED=$((FAILED+1))
     fi
   else
