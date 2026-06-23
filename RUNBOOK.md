@@ -721,12 +721,15 @@ kubectl -n chatroom exec -it deploy/mysql -- \
 ```
 
 The `mysql` CLI is not installed in the running `chatroom-mysql` image.
-This happens on `mysql:8.0-debian`-based images: the `mysql-client`
-Debian package is a virtual meta-package that resolves to **MariaDB's**
-client (which provides a `mariadb` binary, not `mysql`). The shipped
-`mysql/Dockerfile` installs the right package (`default-mysql-client`)
-— but if you're running an image built before the fix landed, you have
-the old one.
+This happens on `mysql:8.0-debian`-based images: that base image is
+configured with **only** Oracle's MySQL apt repo
+(`http://repo.mysql.com/apt/debian bookworm mysql-8.0`) — not the full
+Debian main repo. So Debian packages like `default-mysql-client`
+(and `mysql-client`, which on Debian 12 would resolve to MariaDB's
+`mariadb` binary anyway) are not installable at all. The shipped
+`mysql/Dockerfile` installs `mysql-community-client` from the MySQL
+repo (same upstream as the image's server) — but if you're running
+an image built before the fix landed, you have the old one.
 
 **Fix** — rebuild the image and reload it into the cluster:
 

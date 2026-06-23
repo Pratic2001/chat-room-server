@@ -11,13 +11,18 @@
 ARG MYSQL_IMAGE=mysql:8.0-debian
 FROM ${MYSQL_IMAGE}
 
-# Install MySQL client tools so `kubectl exec ... -- mysql ...` works.
-# On Debian (mysql:8.0-debian base) the `mysql` CLI ships in `default-mysql-client`,
-# not in the `mysql-client` meta-package — that one pulls in MariaDB's client
-# (`mariadb` binary) on modern Debian releases.
+# Install the MySQL CLI client so `kubectl exec ... -- mysql ...` works.
+#
+# The mysql:8.0-debian base image only has Oracle's MySQL apt repo configured
+# (http://repo.mysql.com/apt/debian bookworm mysql-8.0) — NOT the full
+# Debian main repo. So generic Debian packages like `default-mysql-client`
+# (or `mysql-client`, which on Debian 12 resolves to MariaDB's `mariadb`
+# binary anyway) are not installable here. The MySQL repo ships
+# `mysql-community-client` (the actual `mysql` CLI, same upstream that the
+# image's server is built from) — that's the one we need.
 RUN set -eux; \
     if command -v apt-get > /dev/null; then \
-        apt-get update && apt-get install -y --no-install-recommends default-mysql-client && rm -rf /var/lib/apt/lists/*; \
+        apt-get update && apt-get install -y --no-install-recommends mysql-community-client && rm -rf /var/lib/apt/lists/*; \
     else \
         apk add --no-cache mysql-client; \
     fi
