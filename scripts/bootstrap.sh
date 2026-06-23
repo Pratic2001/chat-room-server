@@ -112,10 +112,13 @@ mark_done storageclass-installed
 # snippet is identical on every node and idempotent (re-running is a
 # no-op apart from overwriting the file).
 SUDOERS_SNIPPET='/etc/sudoers.d/99-jenkins-deploy'
-SUDOERS_CONTENT='%sudo ALL=(ALL) NOPASSWD: /usr/bin/ctr -n k8s.io images import *
-%sudo ALL=(ALL) NOPASSWD: /usr/bin/ctr -n k8s.io images tag *
-%sudo ALL=(ALL) NOPASSWD: /usr/bin/ctr -n k8s.io images ls *
-%sudo ALL=(ALL) NOPASSWD: /usr/local/bin/kubectl *
+# Paths in the snippet must match where the binaries actually live on
+# the k8s nodes — `which kubectl` and `which ctr` from inside the
+# cluster are authoritative. The defaults here assume Ubuntu 22.04+
+# kubeadm installs (kubectl at /usr/bin/kubectl, ctr at /usr/bin/ctr);
+# edit if your cluster differs.
+SUDOERS_CONTENT='%sudo ALL=(ALL) NOPASSWD: /usr/bin/ctr -n k8s.io images *
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/kubectl *
 '
 # Write the snippet to a local temp file first so we don't have to pipe
 # its content through sudo's stdin (sudo -S wants only the password on

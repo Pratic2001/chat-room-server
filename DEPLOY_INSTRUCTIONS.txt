@@ -494,10 +494,17 @@ handle "I added a new k8s node" scenarios.
     importing the built image) and `kubectl` (so Jenkins can do its
     own `kubectl` work after the image is on every node):
 
-        %sudo ALL=(ALL) NOPASSWD: /usr/bin/ctr -n k8s.io images import *
-        %sudo ALL=(ALL) NOPASSWD: /usr/bin/ctr -n k8s.io images tag *
-        %sudo ALL=(ALL) NOPASSWD: /usr/bin/ctr -n k8s.io images ls *
-        %sudo ALL=(ALL) NOPASSWD: /usr/local/bin/kubectl *
+        %sudo ALL=(ALL) NOPASSWD: /usr/bin/ctr -n k8s.io images *
+        %sudo ALL=(ALL) NOPASSWD: /usr/bin/kubectl *
+
+    The exact binary paths (`/usr/bin/ctr`, `/usr/bin/kubectl`) are
+    what `which ctr` and `which kubectl` return on a stock Ubuntu
+    22.04+ kubeadm install. If your cluster puts them elsewhere
+    (for example, `/usr/local/bin/kubectl` on a custom build), edit
+    `SUDOERS_CONTENT` in `scripts/bootstrap.sh` to match — otherwise
+    the snippet grants no NOPASSWD access and every `sudo -n …` in
+    the Jenkinsfile will fail with `sudo: interactive authentication
+    is required` even though the snippet is in place.
 
     The bootstrap script itself needs sudo ONCE, on each node, to
     install that file. After that, the pratic user (and Jenkins via
