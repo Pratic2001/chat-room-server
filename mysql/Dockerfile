@@ -21,8 +21,12 @@ ARG MYSQL_ROOT_PASSWORD=placeholder
 # mysql entrypoint already creates 'root'@'%' from the env-supplied
 # MYSQL_ROOT_PASSWORD. The 99-grants.sql script re-pins the password to
 # the build-time value so the app's MYSQL_PASSWORD env matches.
-COPY mysql/init/01-schema.sql /docker-entrypoint-initdb.d/01-schema.sql
-COPY mysql/init/99-grants.sql.template /tmp/99-grants.sql.template
+#
+# The build context for this image is the `mysql/` directory itself
+# (passed by scripts/build_images.sh), so the COPY paths are bare
+# `init/...` rather than `mysql/init/...`.
+COPY init/01-schema.sql /docker-entrypoint-initdb.d/01-schema.sql
+COPY init/99-grants.sql.template /tmp/99-grants.sql.template
 
 # Substitute the build-arg password into the grants template. We use a
 # delimiter (|) that the password (base64-ish) will never contain, so the

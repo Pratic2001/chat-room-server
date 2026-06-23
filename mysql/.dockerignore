@@ -1,0 +1,12 @@
+# When scripts/build_images.sh builds the MySQL image, it passes
+# `mysql/` as the build context. Keep that context lean: only the init
+# SQL files and this Dockerfile are needed.
+
+# Don't recurse — the Dockerfile doesn't COPY anything from subdirs,
+# and a stray editor swap file anywhere under mysql/ shouldn't bloat
+# the image.
+*
+!init/
+!Dockerfile
+!init/01-schema.sql
+!init/99-grants.sql.template

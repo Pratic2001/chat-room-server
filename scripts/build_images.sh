@@ -152,12 +152,17 @@ APP_IMAGE="chat-room-server:latest"
 MYSQL_IMAGE="chatroom-mysql:latest"
 
 log "Building $MYSQL_IMAGE (with baked root password)..."
+# Build context is the mysql/ directory (not the repo root), so the
+# Dockerfile's `COPY init/...` lines resolve correctly. We can't use the
+# repo root here because .dockerignore strips the mysql/ tree out of the
+# context — the same ignore rules that keep the app image lean would
+# otherwise remove the SQL files this image needs.
 docker build \
     "${DOCKER_BUILD_ARGS[@]}" \
     --build-arg "MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD}" \
     -f "$REPO_ROOT/mysql/Dockerfile" \
     -t "$MYSQL_IMAGE" \
-    "$REPO_ROOT"
+    "$REPO_ROOT/mysql"
 
 log "Building $APP_IMAGE..."
 docker build \

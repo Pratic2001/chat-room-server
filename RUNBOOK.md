@@ -292,22 +292,203 @@ mysql-7d5e...                 1/1     Running   0          45s
 
 The `build_images.sh` script only tags images in the local Docker
 daemon. If your cluster's nodes can't reach that daemon (e.g. EKS, GKE,
-AKS, or a multi-node kind setup), push to a registry and update the
-Deployments to pull:
+AKS, or a multi-node kind setup), push to a registry and tell the
+Deployments to pull from there. This section uses **Docker Hub** as the
+example (the most common case); the steps are identical for any other
+OCI registry — only the hostname changes.
+
+#### 6.3.1 One-time setup on the build host
+
+1. **Create a Docker Hub account** at https://hub.docker.com/ if you
+   don't have one. Create two repositories there, both **public** (or
+   **private** if you'll configure image-pull secrets — see §6.3.4):
+
+   - `<your-dockerhub-username>/chatroom-app`
+   - `<your-dockerhub-username>/chatroom-mysql`
+
+   The repo names don't have to match the local image names exactly;
+   you choose the tag scheme below.
+
+2. **Log in once** from the build host:
+
+   ```
+   docker login
+   # Username: <your-dockerhub-username>
+   # Password: <your-personal-access-token-or-password>
+   ```
+
+   This writes `~/.docker/config.json`. The credentials persist until
+   you `docker logout`. Using a Docker Hub **personal access token**
+   (https://hub.docker.com/settings/security) instead of your account
+   password is recommended — you can scope the token to "Read, Write,
+   Delete" and revoke it without rotating your password.
+
+#### 6.3.2 Tag and push the images
+
+Pick a version tag (anything that helps you roll back — date, semver,
+git SHA, all fine). The example below uses `v1.0.0`:
 
 ```
-# Example: GitHub Container Registry
-REGISTRY=ghcr.io/your-org/chat-room-server
-docker tag chat-room-server:latest $REGISTRY:1.0.0
-docker tag chatroom-mysql:latest     $REGISTRY-mysql:1.0.0
-docker push $REGISTRY:1.0.0
-docker push $REGISTRY-mysql:1.0.0
+DOCKERHUB_USER=<your-dockerhub-username>          # edit me
+TAG=v1.0.0                                          # edit me
+
+# Tag the local images. Docker Hub addresses look like
+# docker.io/<user>/<repo>:<tag> — the docker.io/ prefix is implicit.
+docker tag chat-room-server:latest \
+           docker.io/$DOCKERHUB_USER/chatroom-app:$TAG
+docker tag chatroom-mysql:latest \
+           docker.io/$DOCKERHUB_USER/chatroom-mysql:$TAG
+
+# Push both layers.
+docker push docker.io/$DOCKERHUB_USER/chatroom-app:$TAG
+docker push docker.io/$DOCKERHUB_USER/chatroom-mysql:$TAG
 ```
 
-Then edit `k8s/21-mysql-deployment.yaml` and `k8s/40-app-deployment.yaml`
-to reference the registry tag and remove `imagePullPolicy: Never` (or
-set it to `Always`). This is the one place the committed k8s manifests
-need editing before deploy.
+You should see `digest: sha256:...` lines for each layer. If the push
+hangs or returns `denied: requested access to the resource is denied`,
+your `docker login` token has expired or you tagged under the wrong
+username — re-run `docker login` and double-check the username.
+
+Verify the push landed:
+
+```
+# In a browser:
+https://hub.docker.com/r/<your-dockerhub-username>/chatroom-app/tags
+https://hub.docker.com/r/<your-dockerhub-username>/chatroom-mysql/tags
+```
+
+#### 6.3.3 Tell the cluster to pull from Docker Hub
+
+The committed manifests have `image: chat-room-server:latest` (and
+`image: chatroom-mysql:latest`) with `imagePullPolicy: Never`. Update
+them so kubelet actually fetches from Docker Hub.
+
+**`k8s/40-app-deployment.yaml`** — change the container `image:` line:
+
+```
+        - name: app
+          image: docker.io/<your-dockerhub-username>/chatroom-app:v1.0.0   # was: chat-room-server:latest
+          imagePullPolicy: IfNotPresent                                     # was: Never
+```
+
+**`k8s/21-mysql-deployment.yaml`** — same shape:
+
+```
+        - name: mysql
+          image: docker.io/<your-dockerhub-username>/chatroom-mysql:v1.0.0 # was: chatroom-mysql:latest
+          imagePullPolicy: IfNotPresent                                     # was: Never
+```
+
+`IfNotPresent` (rather than `Always`) is fine — it means kubelet will
+skip the pull if the node already has that exact tag, which saves time
+on the second pod after a rollout. If you want every pull to be
+authoritative, use `Always`.
+
+If you'd rather not edit the committed manifests by hand, you can `sed`
+them in place before applying:
+
+```
+DOCKERHUB_USER=<your-dockerhub-username>
+TAG=v1.0.0
+sed -i.bak \
+  -e "s|image: chat-room-server:latest|image: docker.io/$DOCKERHUB_USER/chatroom-app:$TAG|" \
+  -e 's|imagePullPolicy: Never|imagePullPolicy: IfNotPresent|' \
+  k8s/40-app-deployment.yaml
+sed -i.bak \
+  -e "s|image: chatroom-mysql:latest|image: docker.io/$DOCKERHUB_USER/chatroom-mysql:$TAG|" \
+  -e 's|imagePullPolicy: Never|imagePullPolicy: IfNotPresent|' \
+  k8s/21-mysql-deployment.yaml
+```
+
+Re-run `./scripts/deploy_k8s.sh` after the edit. The `.bak` files are
+safe to delete (or add to `.gitignore`).
+
+Then watch kubelet actually pull from Docker Hub:
+
+```
+kubectl -n chatroom get pods -w
+# during the first rollout you'll see:
+#   Normal  Pulling    ...  Pulling image "docker.io/<user>/chatroom-app:v1.0.0"
+#   Normal  Pulled     ...  Successfully pulled image ... in 5.2s
+```
+
+#### 6.3.4 Private repos (image pull secrets)
+
+If you made the Docker Hub repos **private**, kubelet will fail with
+`ImagePullBackOff: pull access denied`. Fix it by creating a
+`docker-registry` Secret in the `chatroom` namespace and referencing it
+from each Deployment:
+
+```
+kubectl create secret docker-registry dockerhub-pull \
+    --namespace chatroom \
+    --docker-server=docker.io \
+    --docker-username=<your-dockerhub-username> \
+    --docker-password=<your-personal-access-token> \
+    --docker-email=<your-email>
+```
+
+Then add to **both** `k8s/40-app-deployment.yaml` and
+`k8s/21-mysql-deployment.yaml`, at the same indentation level as
+`containers:`:
+
+```
+      imagePullSecrets:
+        - name: dockerhub-pull
+```
+
+Re-apply with `kubectl apply -f k8s/`.
+
+#### 6.3.5 Pushing updates later
+
+After editing code and rerunning `./scripts/build_images.sh`, the local
+`:latest` tags are refreshed. To publish a new version:
+
+```
+TAG=v1.0.1                              # bump me
+DOCKERHUB_USER=<your-dockerhub-username>
+docker tag chat-room-server:latest docker.io/$DOCKERHUB_USER/chatroom-app:$TAG
+docker tag chatroom-mysql:latest     docker.io/$DOCKERHUB_USER/chatroom-mysql:$TAG
+docker push docker.io/$DOCKERHUB_USER/chatroom-app:$TAG
+docker push docker.io/$DOCKERHUB_USER/chatroom-mysql:$TAG
+```
+
+Then update `image:` in both Deployment manifests to the new tag (or
+apply a `kubectl set image` command). For more on rolling out app-only
+updates without touching the database image, see §8.3.
+
+#### 6.3.6 Other registries (GHCR, ECR, GCR, Quay, etc.)
+
+The flow is identical — only the hostname and login change. Examples:
+
+- **GitHub Container Registry**:
+  ```
+  echo $GITHUB_TOKEN | docker login ghcr.io -u <github-username> --password-stdin
+  docker tag chat-room-server:latest ghcr.io/<github-username>/chatroom-app:v1.0.0
+  docker tag chatroom-mysql:latest     ghcr.io/<github-username>/chatroom-mysql:v1.0.0
+  docker push ghcr.io/<github-username>/chatroom-app:v1.0.0
+  docker push ghcr.io/<github-username>/chatroom-mysql:v1.0.0
+  ```
+- **Amazon ECR** (auth token rotates every 12h, so always log in just
+  before pushing):
+  ```
+  aws ecr get-login-password --region <region> | \
+      docker login --username AWS --password-stdin <aws-account-id>.dkr.ecr.<region>.amazonaws.com
+  ECR=<aws-account-id>.dkr.ecr.<region>.amazonaws.com
+  docker tag chat-room-server:latest $ECR/chatroom-app:v1.0.0
+  docker tag chatroom-mysql:latest     $ECR/chatroom-mysql:v1.0.0
+  docker push $ECR/chatroom-app:v1.0.0
+  docker push $ECR/chatroom-mysql:v1.0.0
+  ```
+  For private ECR, also create a `docker-registry` Secret with the same
+  `aws ecr get-login-password` value as the password.
+- **Google Artifact Registry** / **Azure Container Registry**: same
+  pattern; substitute `gcloud auth configure-docker` or `az acr login`
+  for `docker login`.
+
+In every case, the `image:` line in `k8s/40-app-deployment.yaml` and
+`k8s/21-mysql-deployment.yaml` is the only thing that needs to change
+in the k8s manifests.
 
 ### 6.4 `--uninstall`
 
@@ -577,6 +758,67 @@ auto-detect a Docker socket at a non-default location; if you're using
 `DOCKER_HOST=tcp://...`, that's fine as long as the `docker` CLI binary
 is on `PATH`.
 
+### 9.8 `build_images.sh` fails with "failed to compute cache key for /mysql/init/..." (or `init/...`)
+
+This means the MySQL image's `COPY` lines can't find the SQL files in
+the build context. There are two possible causes, depending on which
+path shows up in the error:
+
+- **The error mentions `/mysql/init/...`**: the MySQL `Dockerfile` is
+  using the old `mysql/init/...` `COPY` paths. Make sure your local
+  `mysql/Dockerfile` reads:
+  ```
+  COPY init/01-schema.sql         /docker-entrypoint-initdb.d/01-schema.sql
+  COPY init/99-grants.sql.template /tmp/99-grants.sql.template
+  ```
+  and that `build_images.sh` passes `$REPO_ROOT/mysql` (not
+  `$REPO_ROOT`) as the build context. This is the configuration as
+  shipped — if you've edited either file, restore the shipped versions.
+- **The error mentions `/init/...` but the files exist**: the build
+  context was overridden (e.g. by a custom wrapper script or a
+  manual `docker build` call that used a different `-f`/`context`
+  pair). The MySQL image requires the build context to be the `mysql/`
+  directory itself, not the repo root, because the repo-root
+  `.dockerignore` strips out the `mysql/` tree.
+
+If you want to bypass the script and build manually:
+
+```
+docker build \
+    --build-arg MYSQL_ROOT_PASSWORD="$(grep ^MYSQL_PASSWORD= app/.env.runtime | cut -d= -f2-)" \
+    -f mysql/Dockerfile \
+    -t chatroom-mysql:latest \
+    mysql/
+```
+
+(That last argument — `mysql/` — is the build context, and the part
+that's easy to get wrong.)
+
+### 9.9 `ImagePullBackOff` with `pull access denied` (private registry)
+
+You pushed the images to a private Docker Hub / GHCR / ECR repo but
+didn't create a `docker-registry` Secret, or the Secret is in the wrong
+namespace. See §6.3.4 for the fix.
+
+Verify the Secret exists in the right namespace:
+
+```
+kubectl -n chatroom get secret dockerhub-pull
+# NAME             TYPE                             DATA   AGE
+# dockerhub-pull   kubernetes.io/dockerconfigjson   1      5m
+```
+
+And that the Deployment references it:
+
+```
+kubectl -n chatroom get deployment chatroom-app -o jsonpath='{.spec.template.spec.imagePullSecrets}'
+# [{"name":"dockerhub-pull"}]
+```
+
+If the Secret exists but the pull still fails with `unauthorized`, the
+stored token has expired — re-run the `kubectl create secret
+docker-registry` command with a fresh personal-access token.
+
 ---
 
 ## 10. Quick reference
@@ -589,6 +831,9 @@ is on `PATH`.
 | Load into kind | `kind load docker-image chat-room-server:latest chatroom-mysql:latest` |
 | Load into k3d | `k3d image import chat-room-server:latest chatroom-mysql:latest -c <cluster>` |
 | Load into minikube | `minikube image load chat-room-server:latest && minikube image load chatroom-mysql:latest` |
+| Log in to Docker Hub | `docker login` |
+| Tag for Docker Hub | `docker tag chat-room-server:latest docker.io/<user>/chatroom-app:v1.0.0` (and likewise for `chatroom-mysql`) |
+| Push to Docker Hub | `docker push docker.io/<user>/chatroom-app:v1.0.0` (and likewise) |
 | Deploy | `./scripts/deploy_k8s.sh` |
 | Check pod status | `kubectl -n chatroom get pods` |
 | Tail app logs | `kubectl -n chatroom logs -f -l app.kubernetes.io/component=app` |
