@@ -162,6 +162,18 @@ write_runtime_env_file "$RUNTIME_ENV" "scripts/build_images.sh"
 log "Wrote $RUNTIME_ENV (chmod 600)"
 
 # -----------------------------------------------------------------------------
+# Render the deployable k8s Secrets + ConfigMap manifest
+# -----------------------------------------------------------------------------
+# `k8s/secrets.runtime.yaml` is gitignored + dockerignored, so this is
+# where the real values land. After this point, `kubectl apply -f k8s/`
+# alone (no separate deploy step) is enough to reconcile the cluster.
+# The committed templates under k8s/ (10-mysql-secret.yaml, 31-app-secret.yaml,
+# 30-app-config.yaml) hold placeholders and are NOT valid manifests.
+K8S_SECRETS_RUNTIME="$REPO_ROOT/k8s/secrets.runtime.yaml"
+render_k8s_secrets "$K8S_SECRETS_RUNTIME" "scripts/build_images.sh"
+log "Wrote $K8S_SECRETS_RUNTIME (chmod 600)"
+
+# -----------------------------------------------------------------------------
 # Build images
 # -----------------------------------------------------------------------------
 APP_IMAGE="chat-room-server:latest"

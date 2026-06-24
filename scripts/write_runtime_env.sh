@@ -175,6 +175,15 @@ fi
 write_runtime_env_file "$RUNTIME_ENV" "scripts/write_runtime_env.sh"
 log "Wrote $RUNTIME_ENV (chmod 600)"
 
+# Also render the deployable k8s Secrets + ConfigMap manifest. Same
+# reasoning as build_images.sh: k8s/secrets.runtime.yaml is gitignored,
+# holds the real values, and is what `kubectl apply -f k8s/` picks up.
+# The committed k8s/ templates still carry `REPLACE_AT_DEPLOY_TIME`
+# placeholders and are intentionally invalid.
+K8S_SECRETS_RUNTIME="$REPO_ROOT/k8s/secrets.runtime.yaml"
+render_k8s_secrets "$K8S_SECRETS_RUNTIME" "scripts/write_runtime_env.sh"
+log "Wrote $K8S_SECRETS_RUNTIME (chmod 600)"
+
 echo
 printf '\033[1;32m============================================================\033[0m\n'
 printf '\033[1;32m  app/.env.runtime is ready\033[0m\n'

@@ -26,9 +26,9 @@ A FastAPI chat-room backend backed by MySQL, with a vanilla-JS/HTML/CSS frontend
 - `scripts/_random_password.sh` — Shared helper (sourced, not executed). Defines `generate_url_safe_password` and `url_encode_value`. Also used by `build_images.sh` so the no-`@:/?#[]%` invariant lives in one place.
 - `Dockerfile` (repo root) — App image (`python:3.11-slim`, non-root `app` user, `EXPOSE 8000`, healthcheck on `/healthz`). Reads config from environment at runtime; no `.env` baked in.
 - `mysql/Dockerfile` + `mysql/init/01-schema.sql` + `mysql/init/99-grants.sql.template` — Custom MySQL 8 image. `01-schema.sql` is the schema only (the official mysql entrypoint handles root from env). `99-grants.sql.template` is sed-rendered at build time with the build-arg password so the app's `MYSQL_PASSWORD` env matches the DB side. The rendered `99-grants.sql` is gitignored.
-- `scripts/build_images.sh` — Generates a random URL-safe MySQL root password + JWT + Fernet keys, writes them to `app/.env.runtime` (gitignored), and builds both images into the local Docker daemon as `chat-room-server:latest` and `chatroom-mysql:latest`. Idempotent (reuses `app/.env.runtime`); pass `--rebuild` to rotate the MySQL password.
-- `k8s/` — k8s manifests (namespace, MySQL + app Deployments, PVC, Services, ConfigMap, placeholder Secrets, Ingress). `imagePullPolicy: Never` (images are local-only). No `hostPath`, no `nodeSelector` — works on any cluster with a default StorageClass and an Ingress controller.
-- `scripts/deploy_k8s.sh` — Reads `app/.env.runtime`, creates the `chatroom` namespace, writes the MySQL and app Secrets imperatively (so the values never end up in committed manifests), `kubectl apply -f k8s/`, rolls out both Deployments, prints the Ingress address (or a `port-forward` hint). Supports `--uninstall` to tear down.
+- `scripts/build_images.sh` — Generates a random URL-safe MySQL root password + JWT + Fernet keys, writes them to `app/.env.runtime` (gitignored), renders the matching chatroom-mysql + chatroom-app Secrets and the chatroom-app ConfigMap into `k8s/secrets.runtime.yaml` (also gitignored + dockerignored), and builds both images into the local Docker daemon as `chat-room-server:latest` and `chatroom-mysql:latest`. Idempotent (reuses `app/.env.runtime`); pass `--rebuild` to rotate the MySQL password.
+- `k8s/` — k8s manifests (namespace, MySQL + app Deployments, PVC, Services, placeholder Secrets, Ingress). The Secrets templates (`10-mysql-secret.yaml`, `31-app-secret.yaml`) hold `REPLACE_AT_DEPLOY_TIME` placeholders and are intentionally invalid for `kubectl apply` — `build_images.sh` renders the real values into `k8s/secrets.runtime.yaml` (which is what `kubectl apply -f k8s/` actually applies). The static ConfigMap that used to live in `30-app-config.yaml` is now part of the rendered manifest too. `imagePullPolicy: Never` (images are local-only). No `hostPath`, no `nodeSelector` — works on any cluster with a default StorageClass and an Ingress controller.
+- `scripts/deploy_k8s.sh` — Pre-flight (`kubectl` + active context), creates the `chatroom` namespace, sanity-checks the cluster's chatroom-app Secret against `app/.env.runtime` (fails fast on password mismatch), `kubectl apply -f k8s/`, scales chatroom-app to one replica per cluster node, rolls out both Deployments, prints the Ingress address (or a `port-forward` hint). Supports `--uninstall` to tear down.
 - `.dockerignore` — Excludes `.git`, `__pycache__`, `*.pem`, `bdy.tar.gz`, `app/.env.runtime`, the entire `k8s/` and `mysql/` scaffolding trees, and AI-assistant state from the app image's build context.
 
 ## Running locally
@@ -47,7 +47,8 @@ Anyone with Docker and a `kubectl` context can run:
 
 ```
 ./scripts/build_images.sh      # builds chatroom-mysql + chat-room-server
-                               #   (writes app/.env.runtime, gitignored)
+                               #   (writes app/.env.runtime, renders
+                               #    k8s/secrets.runtime.yaml, both gitignored)
 ./scripts/deploy_k8s.sh        # kubectl apply -f k8s/, waits for rollout
 ```
 

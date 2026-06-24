@@ -11,10 +11,14 @@
 #   1. Refuses to run if `kubectl` is not on PATH or if the active context
 #      is empty (so it can't accidentally clobber some other cluster).
 #   2. Creates the `chatroom` namespace if it doesn't exist.
-#   3. Writes the chatroom-mysql and chatroom-app Secrets from .env.runtime.
-#   4. Applies every manifest under k8s/ in lexical order.
-#   5. Waits for both Deployments to roll out.
-#   6. Prints the Ingress address (or, if no Ingress is installed, the
+#   3. Applies every manifest under k8s/ in lexical order. This includes
+#      `k8s/secrets.runtime.yaml` (gitignored), which holds the rendered
+#      chatroom-mysql + chatroom-app Secrets and the chatroom-app ConfigMap.
+#      The committed templates under k8s/ (10-mysql-secret.yaml,
+#      31-app-secret.yaml) are intentionally invalid (`REPLACE_AT_DEPLOY_TIME`
+#      placeholders); they are NOT applied.
+#   4. Waits for both Deployments to roll out.
+#   5. Prints the Ingress address (or, if no Ingress is installed, the
 #      instructions to port-forward).
 #
 # Usage:
@@ -92,8 +96,17 @@ fi
 
   The MySQL image's 99-grants.sql was baked with a specific
   MYSQL_PASSWORD at build time, so the value you supply must match
-  the one used when the MySQL image was built. See the runbook §6.3."
+  the one used when the MySQL image was built. See the runbook §6.3.
+
+  Whichever path you take, the script also writes k8s/secrets.runtime.yaml
+  (gitignored) which is what kubectl apply -f k8s/ actually uses for
+  the chatroom-mysql + chatroom-app Secrets and the chatroom-app
+  ConfigMap."
 [[ -d "$K8S_DIR" ]]     || fail "$K8S_DIR not found. Is the repo layout intact?"
+[[ -f "$K8S_DIR/secrets.runtime.yaml" ]] \
+    || fail "$K8S_DIR/secrets.runtime.yaml not found.
+  That file is gitignored and is created by scripts/build_images.sh
+  (or scripts/write_runtime_env.sh). Re-run one of those to generate it."
 
 # -----------------------------------------------------------------------------
 # Load credentials from app/.env.runtime
@@ -151,58 +164,45 @@ MAIL_FROM="$(cat /tmp/_crs_mail_from)"
 MAIL_USE_TLS="$(cat /tmp/_crs_mail_use_tls)"
 
 # -----------------------------------------------------------------------------
-# Create namespace and Secrets
+# Create namespace
 # -----------------------------------------------------------------------------
-# The namespace manifest is a plain file, so apply it like everything else,
-# but we want to make sure it exists before we try to create the Secret.
 # `kubectl create namespace --dry-run=client -o yaml | kubectl apply -f -`
 # is the standard "create or noop" pattern.
 log "Ensuring namespace $NAMESPACE exists..."
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-# Write the Secrets imperatively. They contain values that must NOT end up
-# in committed manifests, so we generate them at deploy time from .env.runtime.
-# `kubectl create secret --dry-run=client -o yaml | kubectl apply -f -` is the
-# idempotent "create or update" pattern.
-log "Writing chatroom-mysql Secret..."
-kubectl create secret generic chatroom-mysql \
+# -----------------------------------------------------------------------------
+# Sanity check: chatroom-app Secret in the rendered manifest must hold
+# the same MYSQL_PASSWORD that's baked into the chatroom-mysql image's
+# 99-grants.sql. If the rendered file was generated against an old
+# app/.env.runtime that doesn't match the running MySQL pod, the app
+# pods will 1045. We catch that here instead of after a failed rollout.
+# -----------------------------------------------------------------------------
+RENDERED_MYSQL_PASSWORD_B64="$(kubectl get secret chatroom-app \
     --namespace "$NAMESPACE" \
-    --from-literal=MYSQL_ROOT_PASSWORD="$MYSQL_PASSWORD" \
-    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    -o jsonpath='{.data.MYSQL_PASSWORD}' 2>/dev/null || true)"
+if [[ -n "$RENDERED_MYSQL_PASSWORD_B64" ]]; then
+    RENDERED_MYSQL_PASSWORD="$(printf '%s' "$RENDERED_MYSQL_PASSWORD_B64" | base64 --decode)"
+    if [[ "$RENDERED_MYSQL_PASSWORD" != "$MYSQL_PASSWORD" ]]; then
+        fail "chatroom-app Secret in the cluster has a different MYSQL_PASSWORD than
+  app/.env.runtime. The MySQL pod is initialized with the value in
+  99-grants.sql (baked at image build time); if they disagree, the
+  app pods will 1045.
 
-log "Writing chatroom-app Secret..."
-kubectl create secret generic chatroom-app \
-    --namespace "$NAMESPACE" \
-    --from-literal=MYSQL_PASSWORD="$MYSQL_PASSWORD" \
-    --from-literal=SECRET_KEY="$SECRET_KEY" \
-    --from-literal=ROOM_SECRET_KEY="$ROOM_SECRET_KEY" \
-    --from-literal=MAIL_PASSWORD="$MAIL_PASSWORD" \
-    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  Cluster secret (decoded):  ${RENDERED_MYSQL_PASSWORD:0:8}...
+  app/.env.runtime:          ${MYSQL_PASSWORD:0:8}...
 
-# Write the chatroom-app ConfigMap imperatively too — the committed
-# k8s/30-app-config.yaml is a placeholder, just like the Secret manifest.
-# This is the path that gets MAIL_HOST / MAIL_USER / MAIL_PORT / MAIL_FROM
-# / MAIL_USE_TLS from app/.env.runtime into the running cluster.
-log "Writing chatroom-app ConfigMap..."
-kubectl create configmap chatroom-app \
-    --namespace "$NAMESPACE" \
-    --from-literal=MYSQL_HOST="$MYSQL_HOST" \
-    --from-literal=MYSQL_PORT="$MYSQL_PORT" \
-    --from-literal=MYSQL_USER="$MYSQL_USER" \
-    --from-literal=MYSQL_DB="$MYSQL_DB" \
-    --from-literal=ALGORITHM="$ALGORITHM" \
-    --from-literal=ACCESS_TOKEN_EXPIRE_MINUTES="$ACCESS_TOKEN_EXPIRE_MINUTES" \
-    --from-literal=MAIL_HOST="$MAIL_HOST" \
-    --from-literal=MAIL_PORT="$MAIL_PORT" \
-    --from-literal=MAIL_USER="$MAIL_USER" \
-    --from-literal=MAIL_FROM="$MAIL_FROM" \
-    --from-literal=MAIL_USE_TLS="$MAIL_USE_TLS" \
-    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+  Re-run ./scripts/build_images.sh so k8s/secrets.runtime.yaml is
+  regenerated, then re-run this script."
+    fi
+fi
 
 # -----------------------------------------------------------------------------
-# Apply all manifests
+# Apply all manifests (including k8s/secrets.runtime.yaml)
 # -----------------------------------------------------------------------------
 log "Applying manifests from $K8S_DIR ..."
+kubectl apply -f "$K8S_DIR"
+log "Applying manifests from $K8S_DIR (includes k8s/secrets.runtime.yaml, gitignored)..."
 kubectl apply -f "$K8S_DIR"
 
 # -----------------------------------------------------------------------------

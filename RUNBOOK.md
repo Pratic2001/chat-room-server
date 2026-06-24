@@ -275,30 +275,42 @@ What it does, in order:
 
 1. Refuses if `kubectl` is missing or no context is active.
 2. Loads credentials from `app/.env.runtime` (refuses if missing —
-   "Run scripts/build_images.sh first").
+   "Run scripts/build_images.sh first"). It also refuses if
+   `k8s/secrets.runtime.yaml` is missing — that file is gitignored
+   and is produced by `build_images.sh` (or `write_runtime_env.sh`).
 3. Creates the `chatroom` namespace if it doesn't exist.
-4. Creates/updates the `chatroom-mysql` and `chatroom-app` Secrets
-   imperatively from `app/.env.runtime`. **The values never end up in a
-   committed manifest.** `chatroom-app` carries `MYSQL_PASSWORD`,
-   `SECRET_KEY`, `ROOM_SECRET_KEY`, and `MAIL_PASSWORD`.
-5. Creates/updates the `chatroom-app` ConfigMap imperatively from
-   `app/.env.runtime`. It carries the 11 non-secret runtime settings:
-   `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_DB`, `ALGORITHM`,
-   `ACCESS_TOKEN_EXPIRE_MINUTES`, `MAIL_HOST`, `MAIL_PORT`, `MAIL_USER`,
-   `MAIL_FROM`, `MAIL_USE_TLS`. The committed `k8s/30-app-config.yaml`
-   only has the 6 static values (host/port/user/db/algorithm/expiry);
-   the 5 MAIL_* keys are written imperatively so they don't sit in
-   git as blank placeholders.
-6. `kubectl apply -f k8s/` — applies all manifests in lexical order.
-7. Scales `chatroom-app` to one replica per cluster node (queries
+4. Sanity-checks the live cluster: if the `chatroom-app` Secret
+   already holds a `MYSQL_PASSWORD` that disagrees with
+   `app/.env.runtime`, it fails fast with a clear message. This
+   catches the case where the rendered manifest was regenerated
+   without re-applying — MySQL would 1045 every login otherwise.
+5. `kubectl apply -f k8s/` — applies all manifests in lexical order,
+   including `k8s/secrets.runtime.yaml`. That single file is the
+   source of truth for the `chatroom-mysql` and `chatroom-app`
+   Secrets and the `chatroom-app` ConfigMap.
+6. Scales `chatroom-app` to one replica per cluster node (queries
    `kubectl get nodes | wc -l`). The committed Deployment manifest has
    no `replicas:` field — see the comment in
    `k8s/40-app-deployment.yaml`. Defaults to 2 if the node count
    can't be determined.
-8. `kubectl rollout status` for both Deployments, with a 5-minute
+7. `kubectl rollout status` for both Deployments, with a 5-minute
    timeout each.
-9. Prints the Ingress address if one was assigned, or a `port-forward`
+8. Prints the Ingress address if one was assigned, or a `port-forward`
    hint if not.
+
+> **Why this changed:** prior to this revision the deploy script wrote
+> the Secrets + ConfigMap imperatively (`kubectl create secret ... |
+> kubectl apply`). That kept secrets off disk entirely but left the
+> committed `k8s/10-mysql-secret.yaml` and `k8s/31-app-secret.yaml`
+> as `REPLACE_AT_DEPLOY_TIME` placeholders that would silently apply
+> literal placeholders if anyone bypassed the script. The current
+> flow has `build_images.sh` render the real values into
+> `k8s/secrets.runtime.yaml` (gitignored + dockerignored), so a
+> bare `kubectl apply -f k8s/` from a fresh checkout also produces
+> a working cluster. The committed templates under `k8s/` are now
+> marked as templates and are intentionally invalid — see the
+> comments at the top of `k8s/10-mysql-secret.yaml` and
+> `k8s/31-app-secret.yaml`.
 
 A successful run ends with something like:
 
@@ -534,8 +546,11 @@ you want to preserve the data, take a `mysqldump` first (see §8.2).
 
 The room-invite flow uses SMTP to send the room secret phrase (and the
 join link) to invited users. The build script prompts for six values
-and persists them to `app/.env.runtime`; the deploy script writes them
-to the cluster as one Secret key and five ConfigMap keys.
+and persists them to `app/.env.runtime`; `build_images.sh` then renders
+them into `k8s/secrets.runtime.yaml` (gitignored + dockerignored),
+which `deploy_k8s.sh` applies as part of `kubectl apply -f k8s/`. One
+Secret key (`MAIL_PASSWORD`) and five ConfigMap keys
+(`MAIL_HOST`, `MAIL_PORT`, `MAIL_USER`, `MAIL_FROM`, `MAIL_USE_TLS`).
 
 | Variable | Source | Purpose | Blank OK? |
 | --- | --- | --- | --- |
@@ -607,9 +622,10 @@ MAIL_USE_TLS
 The values are validated as they're read (e.g. `MAIL_PORT` must be
 1–65535, `MAIL_USE_TLS` must be `y`/`n`/`true`/`false`). Empty
 `MAIL_HOST` disables invites; empty `MAIL_PASSWORD`/`MAIL_USER` are
-fine for relays that don't authenticate. Then re-run
-`./scripts/deploy_k8s.sh` to write the values to the cluster and roll
-the app pods.
+fine for relays that don't authenticate. The script also writes
+`k8s/secrets.runtime.yaml` (gitignored) so a bare
+`kubectl apply -f k8s/` from a fresh checkout is enough to push the
+values to the cluster.
 
 **Rotating `MAIL_PASSWORD` only.** Edit `app/.env.runtime` in place,
 then re-run `./scripts/deploy_k8s.sh` (it reads the file and rewrites
@@ -717,7 +733,9 @@ mount.
 
 ```
 ./scripts/build_images.sh --rebuild    # new MYSQL_PASSWORD, baked into MySQL image
+                                      # and rendered into k8s/secrets.runtime.yaml
 docker save chatroom-mysql:latest | <load into cluster>   # see §5
+./scripts/deploy_k8s.sh               # applies the rendered Secret, rolls the Deployments
 kubectl -n chatroom delete pod -l app.kubernetes.io/component=mysql   # restart with new image
 # the pod re-runs the schema on the existing PVC; if the password in
 # 99-grants.sql no longer matches the one used at first boot, MySQL
@@ -842,8 +860,8 @@ kubectl -n chatroom rollout status deploy/chatroom-app --timeout=3m
 ```
 
 For Secrets only (no code change), you can also use
-`scripts/deploy_k8s.sh` — it re-applies the imperative Secret and rolls
-the Deployment so the new values are read.
+`scripts/deploy_k8s.sh` — it re-applies `k8s/secrets.runtime.yaml`
+and rolls the Deployment so the new values are read.
 
 #### 8.6.3 A pod is wedged (CrashLoopBackOff, hung, OOM-killed)
 
@@ -1004,15 +1022,17 @@ password: NO" was a different bug, see §9.1.2). MySQL is rejecting it.
 This means the password the **app** has doesn't match the password the
 **MySQL** pod was initialised with. Most common cause: the
 `chatroom-app` k8s Secret and the `chatroom-mysql` image's
-`99-grants.sql` were last written from **different** `app/.env.runtime`
-values — typically because the image was rebuilt (or `--rebuild` was
-used) but `scripts/deploy_k8s.sh` was not re-run, or vice versa.
+`99-grants.sql` were last rendered from **different**
+`k8s/secrets.runtime.yaml` (or from the same rendered file with a
+stale cluster Secret — typically because `build_images.sh` was
+re-run with `--rebuild` but `scripts/deploy_k8s.sh` was not, or
+vice versa).
 
 The encoded form of the password is what both sides need to agree on
 (`url_encode_value` in `scripts/_random_password.sh` is what keeps
 them in lock-step — see §9.1.2 for why). If they ever disagree, the
 image and the Secret need to be regenerated from the same
-`app/.env.runtime` value.
+`app/.env.runtime` value, and the rendered manifest re-applied.
 
 **Step 1 — find the MySQL pod's IP and name.** You need both: the IP
 to know which pod is logging the rejection, and the name to `exec`
@@ -1046,8 +1066,10 @@ echo "Image baked password is: $IMG_PW"
 ```
 
 If `$APP_PW` and `$IMG_PW` print different values, that's the bug —
-the app's Secret was last written from a different `app/.env.runtime`
-than the MySQL image was built from. Both are URL-encoded forms
+the app's Secret was last rendered from a different
+`app/.env.runtime` than the MySQL image was built from. (Or the
+`k8s/secrets.runtime.yaml` was regenerated on the build host and
+the cluster Secret is stale.) Both are URL-encoded forms
 (both will look like base64-ish strings without URL-specials); the
 mismatch will be visible as different strings.
 
@@ -1076,9 +1098,11 @@ from the *same* `app/.env.runtime` the image was just baked from:
 
 `build_images.sh` is idempotent — it re-uses the existing
 `app/.env.runtime` if present, bakes that exact value into
-`99-grants.sql`, and the new `deploy_k8s.sh` writes the same value
-into both k8s Secrets. The app pods automatically pick up the new
-Secret and reconnect.
+`99-grants.sql`, and renders the matching `chatroom-app` Secret into
+`k8s/secrets.runtime.yaml`. `deploy_k8s.sh` then `kubectl apply -f
+k8s/` (which picks up the rendered manifest) and rolls the
+Deployments. The app pods automatically pick up the new Secret and
+reconnect.
 
 **Step 5 — verify the fix.** Re-run the failing query from the app
 (or watch the app's logs):
@@ -1100,8 +1124,9 @@ hand-edited, or if a previous `build_images.sh` was run with
 without the image being rebuilt. Force a full rotation:
 
 ```
-./scripts/build_images.sh --rebuild    # generates a new password, bakes it into a new image
-./scripts/deploy_k8s.sh                # writes the same new value into both Secrets
+./scripts/build_images.sh --rebuild    # generates a new password, bakes it into a new image,
+                                          # renders the matching Secret into k8s/secrets.runtime.yaml
+./scripts/deploy_k8s.sh                # applies the rendered manifest, rolls both Deployments
 kind load docker-image chatroom-mysql:latest   # or k3d / minikube equivalent
 kubectl -n chatroom delete pod -l app.kubernetes.io/component=mysql   # pick up the new image
 kubectl -n chatroom rollout status deploy/mysql --timeout=2m
@@ -1210,7 +1235,8 @@ If you want to bypass the script and build manually:
 # NOTE: pass the URL-encoded value as-is. The Dockerfile `sed`s it
 # straight into 99-grants.sql, so the literal there must match the
 # literal in app/.env.runtime (and in the k8s Secret that
-# deploy_k8s.sh creates). Don't URL-decode here — see §9.1.2.
+# build_images.sh renders into k8s/secrets.runtime.yaml).
+# Don't URL-decode here — see §9.1.2.
 docker build \
     --build-arg MYSQL_ROOT_PASSWORD="$(grep ^MYSQL_PASSWORD= app/.env.runtime | cut -d= -f2-)" \
     -f mysql/Dockerfile \
