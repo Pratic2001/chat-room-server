@@ -21,9 +21,16 @@ metadata:
     app.kubernetes.io/name: chatroom
     app.kubernetes.io/component: app
   annotations:
-    # WebSocket support: ingress-nginx's defaults already pass the
-    # `Upgrade` and `Connection` headers, but make the timeouts explicit
-    # so a long-lived chat connection isn't torn down by an idle LB.
+    # WebSocket support: pin the upstream protocol to HTTP/1.1 because
+    # HTTP/2 has no Upgrade hop-by-hop header — when this ingress fronts
+    # an HTTPS host, ingress-nginx will otherwise default the upstream
+    # connection to HTTP/2 and silently drop the WebSocket handshake
+    # (symptom: the chat page loads over HTTPS but the socket errors out
+    # on connect; HTTP works fine because the default upstream proto is
+    # already HTTP/1.1).
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    # Explicit long-poll timeouts so a chatty WebSocket isn't torn down
+    # by an idle LB.
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
     # Larger request bodies so image/file uploads up to the in-app
