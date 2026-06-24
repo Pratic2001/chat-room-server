@@ -26,6 +26,11 @@ spec:
         app.kubernetes.io/name: chatroom
         app.kubernetes.io/component: redis
     spec:
+      # 10s terminationGracePeriodSeconds keeps rollouts snappy — Redis
+      # has no in-flight state we need to drain (pub/sub messages are
+      # already persisted to MySQL by the time we publish), so SIGTERM
+      # -> exit is enough.
+      terminationGracePeriodSeconds: 10
       containers:
         - name: redis
           image: redis:7-alpine

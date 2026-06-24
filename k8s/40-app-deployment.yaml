@@ -30,6 +30,13 @@ spec:
       # No hostPath, no nodeSelector, no nodeName — works on every cluster.
       # Spread pods across nodes for a small amount of HA within a single
       # cluster. Soft constraint: best-effort, not required.
+      # 10s terminationGracePeriodSeconds is plenty for uvicorn: SIGTERM
+      # triggers a graceful drain of the WebSocket connections (each
+      # client gets a close frame before the process exits) and FastAPI
+      # returns cleanly from in-flight HTTP requests. WebSocket idle
+      # timeouts are configured at the Ingress, not here — see the
+      # WebSocket-timeout note in the runbook.
+      terminationGracePeriodSeconds: 10
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname

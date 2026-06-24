@@ -33,6 +33,14 @@
 #   8. Prints the Ingress address (or, if no Ingress is installed, the
 #      instructions to port-forward).
 #
+# Note on `terminationGracePeriodSeconds`: each Deployment manifest
+# (k8s/15-redis-deployment.yaml, k8s/21-mysql-deployment.yaml,
+# k8s/40-app-deployment.yaml) sets `terminationGracePeriodSeconds: 10`
+# on its pod spec. That keeps rollouts and `kubectl delete pod` fast.
+# The cluster-wide components in front of this stack (ingress-nginx
+# controller, MetalLB) have their own values — see RUNBOOK §2.3.1
+# for what to tune and why.
+#
 # Usage:
 #   ./scripts/deploy_k8s.sh                 # deploy / reconcile
 #   ./scripts/deploy_k8s.sh --uninstall     # delete the chatroom namespace

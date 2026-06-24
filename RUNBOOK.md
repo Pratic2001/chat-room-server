@@ -105,6 +105,60 @@ kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/cont
 
 For kind: https://kind.sigs.k8s.io/docs/user/ingress/
 
+#### 2.3.1 Tuning ingress-nginx and MetalLB for your cluster
+
+`scripts/deploy_k8s.sh` sets `terminationGracePeriodSeconds: 10` on
+every container in this stack (Redis, MySQL, chatroom-app) so rollouts
+and `kubectl delete pod` finishes in seconds rather than the k8s
+default of 30. **The cluster-wide components in front of this stack
+have their own values, and the shipped defaults are not always a good
+fit for every environment — review and tune them to match your
+cluster's size, traffic profile, and maintenance windows:**
+
+- **ingress-nginx controller** — installed from the URL above (or via
+  your distro's package). Two fields are commonly worth overriding,
+  usually via a `values.yaml` for the Helm chart or a `controller:` /
+  `controllerConfig:` block in the manifest:
+
+  - `replicaCount` (or `spec.replicas` in the manifest) — the
+    default is 1, which is a single point of failure for the data
+    plane. Set this to 2 or more for any non-toy cluster, and
+    spread the pods with a `topologySpreadConstraints` block on
+    nodes (the same pattern as `k8s/40-app-deployment.yaml`). For
+    a single-node dev cluster, 1 is fine.
+  - `terminationGracePeriodSeconds` on the controller pod — the
+    default is 300s, mostly so the controller has time to drain
+    WebSocket / long-poll connections. Match it to your longest
+    expected in-flight request: a chat workload (idle WS
+    connections + small HTTP) is happy with 30–60s; a workload
+    with large uploads or slow upstream calls needs more. Pick a
+    value that's *at least* as long as `proxy-read-timeout` and
+    `proxy-send-timeout` on the Ingress annotations in
+    `k8s/50-ingress.yaml` (currently 3600s) — otherwise the
+    controller gets SIGKILLed mid-response during a rolling
+    update.
+
+  After changing either value, roll the controller:
+  `kubectl -n ingress-nginx rollout restart deploy/ingress-nginx-controller`.
+
+- **MetalLB speaker / controller** (only relevant if you're using
+  MetalLB to give bare-metal clusters a `LoadBalancer` Service —
+  see the kind/k3d add-on guides). Both pods ship with
+  `terminationGracePeriodSeconds` of 300. That's appropriate for
+  production BGP speakers (BGP neighbors need time to withdraw
+  routes gracefully) but is a long wait on a single-node dev
+  cluster. For dev / kind / k3d, 30s is plenty; for production
+  BGP, keep the default or raise it. To change it, edit the
+  `MetalLB` / `MetalLBSpeaker` / `MetalLBController` CRs (Helm
+  chart values: `speaker.terminationGracePeriodSeconds`,
+  `controller.terminationGracePeriodSeconds`) and re-apply.
+
+The principle: this project's `terminationGracePeriodSeconds: 10` is
+deliberately tight because the pods hold no state worth draining
+slowly. Anything else in the request path (ingress controller, the
+LoadBalancer, BGP speakers) has different trade-offs and its own
+default — **read it, then decide**.
+
 ### 2.4 DNS (optional but recommended)
 
 The committed Ingress uses the placeholder host `chatroom.local`. To
