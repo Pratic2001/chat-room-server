@@ -217,8 +217,8 @@ write_runtime_env_file() {
 # String values are URL-encoded and wrapped in double quotes so
 # MAIL_FROM-style strings (Chat Room <no-reply@example.com>) and
 # values containing =, #, or spaces round-trip safely through
-# 'set -a; source'. Integer knobs (the two ports, the token expiry)
-# are bare.
+# 'set -a; source'. Bare knobs: the two ports, the token expiry,
+# and MAIL_USE_TLS (true/false).
 
 # --- MySQL connection (consumed by app/database.py) -----------------------
 MYSQL_USER="root"
@@ -246,7 +246,7 @@ MAIL_PORT=${mail_port_enc}
 MAIL_USER="${mail_user_enc}"
 MAIL_PASSWORD="${mail_password_enc}"
 MAIL_FROM="${mail_from_enc}"
-MAIL_USE_TLS="${mail_use_tls_enc}"
+MAIL_USE_TLS=${mail_use_tls_enc}
 EOF
 
     # Atomic rename. If mv fails the tmp file is left for the caller to
