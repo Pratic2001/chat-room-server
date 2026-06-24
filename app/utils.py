@@ -102,6 +102,10 @@ def send_invite_email(to_email: str, subject: str, html_body: str, text_body: st
     """
     host = os.getenv("MAIL_HOST")
     port = int(os.getenv("MAIL_PORT", "587"))
+    # MAIL_USER and MAIL_FROM are emitted verbatim by the build script
+    # (no URL encoding) because smtp.login() / the From: header consume
+    # them with no URL-decoding step. If encoding is ever reintroduced
+    # at the build layer for symmetry, url-unquote here too.
     user = os.getenv("MAIL_USER")
     password = os.getenv("MAIL_PASSWORD")
     sender = os.getenv("MAIL_FROM")

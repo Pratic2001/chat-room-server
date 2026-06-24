@@ -204,19 +204,27 @@ write_runtime_env_file() {
     mysql_port_enc="$(url_encode_value "$mysql_port")"
     mail_host_enc="$(url_encode_value "$mail_host")"
     mail_port_enc="$(url_encode_value "$mail_port")"
-    mail_user_enc="$(url_encode_value "$mail_user")"
+    # MAIL_USER and MAIL_FROM are emitted verbatim — they go to the
+    # SMTP server via smtp.login() / the From: header, with no
+    # URL-decoding step in the app. Encoding them turns the @ in
+    # 'user@gmail.com' into %40, which the server then rejects as
+    # an unknown account.
+    mail_user_enc="$mail_user"
     mail_password_enc="$(url_encode_value "$mail_password")"
-    mail_from_enc="$(url_encode_value "$mail_from")"
+    mail_from_enc="$mail_from"
     mail_use_tls_enc="$(url_encode_value "$mail_use_tls")"
 
     local tmp_env
     tmp_env="$(mktemp "${target_path}.XXXXXX")"
     # Every value is wrapped in double quotes except the two integer ports
     # and ACCESS_TOKEN_EXPIRE_MINUTES (so a stray digit, when edited by
-    # hand, is hard to fat-finger into a string). The values themselves
-    # are URL-encoded by url_encode_value above, so even values that
-    # would otherwise need shell-escaping (=, #, spaces) round-trip
-    # safely through 'set -a; source ...'.
+    # hand, is hard to fat-finger into a string). The URL-fed values
+    # (MYSQL_PASSWORD, SECRET_KEY, ROOM_SECRET_KEY, MYSQL_HOST,
+    # MYSQL_USER, MYSQL_DB) are also URL-encoded by url_encode_value
+    # above, so a future password containing @ : / ? # [ ] % = or spaces
+    # round-trips safely through 'set -a; source ...'. MAIL_USER and
+    # MAIL_FROM are emitted verbatim — see the block comment in the
+    # generated file below for why.
     # The heredoc marker below is unquoted on purpose: we need ${generator_label}
     # and $(date ...) to expand at write time. The body has no backticks or
     # other command-substitution chars, so the unquoted EOF is safe here.
@@ -233,11 +241,21 @@ write_runtime_env_file() {
 #     the chatroom-mysql + chatroom-app Secrets and the chatroom-app
 #     ConfigMap)
 #
-# String values are URL-encoded and wrapped in double quotes so
-# MAIL_FROM-style strings (Chat Room <no-reply@example.com>) and
-# values containing =, #, or spaces round-trip safely through
-# 'set -a; source'. Bare knobs: the two ports, the token expiry,
-# and MAIL_USE_TLS (true/false).
+# Values that feed a URL parser (MYSQL_PASSWORD, SECRET_KEY,
+# ROOM_SECRET_KEY, MYSQL_HOST, MYSQL_USER, MYSQL_DB) are URL-encoded
+# and wrapped in double quotes, so a future password containing
+# @ : / ? # [ ] % = or spaces round-trips safely through
+# 'set -a; source'. MYSQL_PASSWORD in particular needs the encoded
+# form: app/database.py builds mysql+pymysql://user:password@host/db
+# and PyMySQL URL-decodes the userinfo component on connect.
+#
+# SMTP values are emitted verbatim. MAIL_USER and MAIL_FROM go to
+# the SMTP server via smtp.login() / the From: header with no
+# URL-decoding step in the app — encoding the @ in 'user@gmail.com'
+# to %40 turns it into an unknown account on the server side.
+#
+# Bare knobs: the two ports, the token expiry, and MAIL_USE_TLS
+# (true/false).
 
 # --- MySQL connection (consumed by app/database.py) -----------------------
 MYSQL_USER="root"
@@ -359,11 +377,18 @@ render_k8s_secrets() {
     # name. Empty is a valid value to run the app in single-pod mode.
     local redis_url="${REDIS_URL:-redis://chatroom-redis:6379/0}"
 
-    # URL-encode every value that ends up in the file. The encoding is
-    # defensive (auto-generated passwords are already URL-safe) — but
-    # the runbook §9.1.2 documents that the values are encoded in the
-    # k8s Secret, and consistency with app/.env.runtime keeps the
-    # mental model simple: every secret in the repo is URL-encoded.
+    # URL-encode the values that feed a URL parser (MYSQL_PASSWORD,
+    # SECRET_KEY, ROOM_SECRET_KEY, MYSQL_HOST, MYSQL_USER, MYSQL_DB).
+    # The encoding is defensive (auto-generated values are already
+    # URL-safe) but load-bearing for MYSQL_PASSWORD specifically —
+    # runbook §9.1.2 documents that the encoded form is what both
+    # the chatroom-app Secret and the chatroom-mysql image's
+    # 99-grants.sql must agree on, since app/database.py builds
+    # mysql+pymysql://user:password@host/db and PyMySQL URL-decodes
+    # the userinfo component on connect.
+    #
+    # MAIL_USER and MAIL_FROM are emitted verbatim — see the block
+    # comment in the generated env file for the SMTP rationale.
     local mysql_pw_enc jwt_enc fernet_enc mail_password_enc
     local mysql_host_enc mysql_port_enc mysql_user_enc mysql_db_enc
     local algorithm_enc access_token_enc
@@ -380,8 +405,8 @@ render_k8s_secrets() {
     access_token_enc="$(url_encode_value "$access_token_expire_minutes")"
     mail_host_enc="$(url_encode_value "$mail_host")"
     mail_port_enc="$(url_encode_value "$mail_port")"
-    mail_user_enc="$(url_encode_value "$mail_user")"
-    mail_from_enc="$(url_encode_value "$mail_from")"
+    mail_user_enc="$mail_user"
+    mail_from_enc="$mail_from"
     mail_use_tls_enc="$(url_encode_value "$mail_use_tls")"
 
     local tmp_yaml
