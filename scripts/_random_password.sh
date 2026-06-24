@@ -177,11 +177,12 @@ write_runtime_env_file() {
     local mail_use_tls="${MAIL_USE_TLS-}"
     local mysql_port="${MYSQL_PORT-3306}"
 
-    local mysql_pw_enc jwt_enc fernet_enc
+    local mysql_pw_enc jwt_enc fernet_enc mysql_port_enc
     local mail_host_enc mail_port_enc mail_user_enc mail_password_enc mail_from_enc mail_use_tls_enc
     mysql_pw_enc="$(url_encode_value "$MYSQL_PASSWORD")"
     jwt_enc="$(url_encode_value "$SECRET_KEY")"
     fernet_enc="$(url_encode_value "$ROOM_SECRET_KEY")"
+    mysql_port_enc="$(url_encode_value "$mysql_port")"
     mail_host_enc="$(url_encode_value "$mail_host")"
     mail_port_enc="$(url_encode_value "$mail_port")"
     mail_user_enc="$(url_encode_value "$mail_user")"
