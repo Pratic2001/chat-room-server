@@ -11,14 +11,26 @@
 #   1. Refuses to run if `kubectl` is not on PATH or if the active context
 #      is empty (so it can't accidentally clobber some other cluster).
 #   2. Creates the `chatroom` namespace if it doesn't exist.
-#   3. Applies every manifest under k8s/ in lexical order. This includes
+#   3. Sanity-checks the cluster's chatroom-app Secret against
+#      app/.env.runtime — if MYSQL_PASSWORD disagrees, fails fast with
+#      a clear message (the MySQL image's 99-grants.sql is baked at
+#      build time, so a mismatch means app pods will 1045).
+#   4. Applies every manifest under k8s/ in lexical order. This includes
 #      `k8s/secrets.runtime.yaml` (gitignored), which holds the rendered
 #      chatroom-mysql + chatroom-app Secrets and the chatroom-app ConfigMap.
 #      The committed templates under k8s/ (10-mysql-secret.yaml,
 #      31-app-secret.yaml) are intentionally invalid (`REPLACE_AT_DEPLOY_TIME`
 #      placeholders); they are NOT applied.
-#   4. Waits for both Deployments to roll out.
-#   5. Prints the Ingress address (or, if no Ingress is installed, the
+#   5. `rollout restart` of the chatroom-app Deployment so every pod
+#      re-resolves the Secret at scheduling time. A Secret update alone
+#      does not replace running pods (envFrom is a reference, not a
+#      template field), so without this step a freshly applied Secret
+#      can be silently invisible to pods that were scheduled before
+#      it landed. The subsequent rollout status wait picks up the
+#      replacement pods.
+#   6. Scales chatroom-app to one replica per cluster node.
+#   7. Waits for both Deployments to roll out.
+#   8. Prints the Ingress address (or, if no Ingress is installed, the
 #      instructions to port-forward).
 #
 # Usage:
@@ -200,10 +212,30 @@ fi
 # -----------------------------------------------------------------------------
 # Apply all manifests (including k8s/secrets.runtime.yaml)
 # -----------------------------------------------------------------------------
-log "Applying manifests from $K8S_DIR ..."
-kubectl apply -f "$K8S_DIR"
+# Single apply — k8s/secrets.runtime.yaml is part of $K8S_DIR, so a
+# single `kubectl apply -f $K8S_DIR` already reconciles every manifest
+# (committed templates + the rendered Secret/ConfigMap).
 log "Applying manifests from $K8S_DIR (includes k8s/secrets.runtime.yaml, gitignored)..."
 kubectl apply -f "$K8S_DIR"
+
+# -----------------------------------------------------------------------------
+# Force a rolling restart of chatroom-app
+# -----------------------------------------------------------------------------
+# `envFrom: secretRef` references a Secret by name, so a Secret update
+# alone does not change the pod-template hash and Kubernetes has no
+# reason to replace the running pods. Without this step, a pod that was
+# scheduled before the new Secret landed keeps its old env (including
+# a stale MYSQL_PASSWORD), even though `kubectl get secret` shows the
+# new value. The round-robin Service will then route a fraction of
+# requests to that pod, and those requests 1045 against MySQL.
+#
+# `rollout restart` adds a `kubectl.kubernetes.io/restartedAt`
+# annotation, which bumps the pod-template generation and forces the
+# ReplicaSet to replace every pod. Each replacement pod re-resolves
+# the Secret at scheduling time and inherits the current values. The
+# `rollout status` further down then waits for the new pods to come up.
+log "Restarting chatroom-app pods so they pick up the current Secret/ConfigMap values..."
+kubectl -n "$NAMESPACE" rollout restart deployment/chatroom-app
 
 # -----------------------------------------------------------------------------
 # Scale chatroom-app to one replica per cluster node
