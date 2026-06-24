@@ -308,6 +308,36 @@ function hslToHex(h, s, l) {
 // Single shared instance used by every page.
 const theme = new Theme();
 
+// Normalize a FastAPI error response into a human-readable string.
+// FastAPI returns 422 with `detail: [{loc, msg, type, ...}, ...]` for
+// validation errors and `detail: "..."` (or `detail: {msg: "..."}`) for
+// HTTPException-raised errors. Naively passing `data.detail` to `new Error(...)`
+// turns the array form into "[object Object],[object Object]" — this helper
+// flattens every shape we know about into a single line of text.
+function extractErrorMessage(data, fallback) {
+    const detail = data && data.detail;
+    if (typeof detail === 'string' && detail) return detail;
+    if (Array.isArray(detail)) {
+        const parts = detail
+            .map((e) => {
+                if (!e) return '';
+                if (typeof e.msg === 'string') {
+                    // `loc` is ["body", "email"] etc. — drop the "body" prefix.
+                    const loc = Array.isArray(e.loc) ? e.loc.filter((p) => p !== 'body').join('.') : '';
+                    return loc ? `${loc}: ${e.msg}` : e.msg;
+                }
+                return '';
+            })
+            .filter(Boolean);
+        if (parts.length) return parts.join('; ');
+    }
+    if (detail && typeof detail === 'object') {
+        if (typeof detail.msg === 'string') return detail.msg;
+        if (typeof detail.message === 'string') return detail.message;
+    }
+    return fallback;
+}
+
 class ChatApp {
     constructor() {
         this.token = localStorage.getItem(STORAGE_TOKEN);
@@ -381,8 +411,8 @@ class ChatApp {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ username, password }),
             });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.detail || 'Login failed');
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(extractErrorMessage(data, 'Login failed'));
             this._storeAuth(data.access_token, { id: data.user_id, username, email: '' });
             window.location.href = '/';
         } catch (err) {
@@ -410,8 +440,8 @@ class ChatApp {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ username, email, password }),
             });
-            const data = await res.json();
-            if (!res.ok) throw new Error(data.detail || 'Signup failed');
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(extractErrorMessage(data, 'Signup failed'));
             this._storeAuth(data.access_token, { id: data.user_id, username, email });
             window.location.href = '/';
         } catch (err) {
@@ -586,7 +616,7 @@ class ChatApp {
             const res = await this._authFetch(`/rooms/${roomId}`, { method: 'DELETE' });
             if (res.status !== 204 && !res.ok) {
                 const data = await res.json().catch(() => ({}));
-                throw new Error(data.detail || 'Could not delete room');
+                throw new Error(extractErrorMessage(data, 'Could not delete room'));
             }
             this._toast('Room deleted.');
             if (this.currentRoomId === roomId) {
@@ -630,7 +660,7 @@ class ChatApp {
                 body: JSON.stringify({ name, secret_phrase: secret || null }),
             });
             const data = await res.json();
-            if (!res.ok) throw new Error(data.detail || 'Failed to create room');
+            if (!res.ok) throw new Error(extractErrorMessage(data, 'Failed to create room'));
             this._closeCreateModal();
             await this._loadRooms();
             // The owner is already a member (crud.create_room adds the creator).
@@ -679,7 +709,7 @@ class ChatApp {
                 body: JSON.stringify({ secret_phrase: secret || null }),
             });
             const data = await res.json();
-            if (!res.ok) throw new Error(data.detail || 'Could not join room');
+            if (!res.ok) throw new Error(extractErrorMessage(data, 'Could not join room'));
             this._closeJoinModal();
             this._enterRoom(roomId, data.name || roomName);
         } catch (err) {
@@ -723,7 +753,7 @@ class ChatApp {
                 }),
             });
             const data = await res.json();
-            if (!res.ok) throw new Error(data.detail || 'Could not join room');
+            if (!res.ok) throw new Error(extractErrorMessage(data, 'Could not join room'));
             this._closeJoinByNameModal();
             // Refresh sidebar so the new room row appears, then enter it.
             await this._loadRooms();
@@ -824,7 +854,7 @@ class ChatApp {
                 body: JSON.stringify({ email, message: message || null }),
             });
             const data = await res.json().catch(() => ({}));
-            if (!res.ok) throw new Error(data.detail || 'Could not send invite');
+            if (!res.ok) throw new Error(extractErrorMessage(data, 'Could not send invite'));
             this._closeInviteModal();
             this._toast(data.message || `Invite sent to ${email}.`);
         } catch (err) {
@@ -899,7 +929,7 @@ class ChatApp {
             });
             if (!res.ok) {
                 const data = await res.json().catch(() => ({}));
-                throw new Error(data.detail || 'Failed to send');
+                throw new Error(extractErrorMessage(data, 'Failed to send'));
             }
             // The HTTP response is a serialized message identical in shape to
             // what the WebSocket will echo. Render it now so the sender sees
@@ -943,7 +973,7 @@ class ChatApp {
             });
             if (!res.ok) {
                 const data = await res.json().catch(() => ({}));
-                throw new Error(data.detail || 'Failed to send file');
+                throw new Error(extractErrorMessage(data, 'Failed to send file'));
             }
             // Render the HTTP response locally so the sender sees their
             // own file/image immediately. The WebSocket echo will arrive
