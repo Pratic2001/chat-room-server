@@ -126,6 +126,18 @@ MYSQL_PASSWORD=CHANGE_ME_mysql_password
 MYSQL_HOST=localhost
 MYSQL_DB=chatroom_db
 
+# --- Redis pub/sub bus ------------------------------------------------------
+# Used by app/redis_bus.py to fan WebSocket broadcasts out to every
+# app pod. Defaults to localhost for `uvicorn`-style local dev; the
+# k8s manifest at k8s/40-app-deployment.yaml overrides this to the
+# in-cluster Redis Service via the chatroom-app ConfigMap.
+#
+# Leave this blank to run in single-pod mode (broadcasts stay
+# in-process — fine for development, broken on a multi-replica
+# deployment). The app logs a warning at startup if REDIS_URL is
+# unset, so it's easy to spot the misconfiguration.
+REDIS_URL=redis://localhost:6379/0
+
 # --- JWT Authentication -----------------------------------------------------
 # Used by app/utils.py for signing/verifying access tokens.
 # Generate a strong key with:

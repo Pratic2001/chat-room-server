@@ -945,6 +945,12 @@ class ChatApp {
                 const data = await res.json().catch(() => ({}));
                 throw new Error(data.detail || 'Failed to send file');
             }
+            // Render the HTTP response locally so the sender sees their
+            // own file/image immediately. The WebSocket echo will arrive
+            // a moment later; `_renderMessage` dedupes by id so the
+            // sender doesn't see the same message rendered twice.
+            const sent = await res.json().catch(() => null);
+            if (sent) this._renderMessage(sent);
         } catch (err) {
             this._toast(err.message, true);
         }

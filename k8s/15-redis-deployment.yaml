@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chatroom-redis
+  namespace: chatroom
+  labels:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: redis
+spec:
+  # Singleton. Redis pub/sub needs every publisher's subscribers to be
+  # on the same logical broker — running multiple Redis replicas
+  # behind this Service would silently drop messages a pod published
+  # before its subscriber reconnected. If you need Redis HA, swap in a
+  # Sentinel setup or move to Redis Streams on top of a managed
+  # Redis; for this project a single broker is fine.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chatroom
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chatroom
+        app.kubernetes.io/component: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          # Pub/sub broker — no persistence needed. Every chat message
+          # is already persisted in MySQL by the time we publish it,
+          # so a Redis restart only loses in-flight notifications.
+          # Subscribers reconnect automatically via redis-py's retry
+          # loop in app/redis_bus.py.
+          args:
+            - redis-server
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            - --maxmemory
+            - 128mb
+            - --maxmemory-policy
+            - allkeys-lru
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            # `redis-cli ping` returns "PONG" on success — exactly what
+            # the chatroom-app uses to verify the connection at
+            # startup, so this is a fair readiness signal too.
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3

@@ -2,12 +2,11 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPExce
 from sqlalchemy.orm import Session
 from app import crud, models, schemas
 from app.database import get_db
+from app.thumbnails import make_thumbnail
 from app.utils import SECRET_KEY, ALGORITHM
 from app.ws_manager import manager
 from jose import JWTError, jwt
 import json
-from PIL import Image, UnidentifiedImageError
-import io
 import base64
 
 # Allowed file types for upload
@@ -141,21 +140,14 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
                         continue
 
                 thumbnail_data = None
-                try:
-                    if msg.message_type == "image":
-                        # Generate thumbnail for images
-                        image = Image.open(io.BytesIO(binary_data))
-                        image.thumbnail((200, 200))
-                        thumb_io = io.BytesIO()
-                        image.save(thumb_io, format=image.format if image.format else 'PNG')
-                        thumbnail_data = thumb_io.getvalue()
-                    # For files and videos, we don't generate thumbnails
-                except UnidentifiedImageError:
-                    await websocket.send_text(json.dumps({"error": "Invalid image data"}))
-                    continue
-                except Exception as e:
-                    await websocket.send_text(json.dumps({"error": f"Failed to process image: {str(e)}"}))
-                    continue
+                if msg.message_type == "image":
+                    # Delegate to the shared helper so the REST upload
+                    # path produces identical records.
+                    thumbnail_data = make_thumbnail(binary_data)
+                    if thumbnail_data is None:
+                        await websocket.send_text(json.dumps({"error": "Invalid image data"}))
+                        continue
+                # For files and videos, we don't generate thumbnails
 
                 db_msg = crud.create_message(
                     db=db,

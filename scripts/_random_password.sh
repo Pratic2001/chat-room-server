@@ -111,6 +111,11 @@ load_or_generate_runtime_secrets() {
             printf '%s\n' "${MAIL_PASSWORD-}"    > /tmp/_crs_mail_password
             printf '%s\n' "${MAIL_FROM-Chat Room <no-reply@example.com>}" > /tmp/_crs_mail_from
             printf '%s\n' "${MAIL_USE_TLS-true}" > /tmp/_crs_mail_use_tls
+            # REDIS_URL: written by an earlier build, but treat it as
+            # optional so older .env.runtime files still load. The default
+            # matches the in-cluster Redis Service defined in
+            # k8s/16-redis-service.yaml.
+            printf '%s\n' "${REDIS_URL-redis://chatroom-redis:6379/0}" > /tmp/_crs_redis_url
         )
         mysql_pw="$(cat /tmp/_crs_mysql_pw)";          rm -f /tmp/_crs_mysql_pw
         jwt="$(cat /tmp/_crs_jwt)";                    rm -f /tmp/_crs_jwt
@@ -122,6 +127,7 @@ load_or_generate_runtime_secrets() {
         mail_password="$(cat /tmp/_crs_mail_password)"; rm -f /tmp/_crs_mail_password
         mail_from="$(cat /tmp/_crs_mail_from)";        rm -f /tmp/_crs_mail_from
         mail_use_tls="$(cat /tmp/_crs_mail_use_tls)";  rm -f /tmp/_crs_mail_use_tls
+        redis_url="$(cat /tmp/_crs_redis_url)";        rm -f /tmp/_crs_redis_url
     else
         # Generate. Same algorithms as change_db_password.sh.
         mysql_pw="$(generate_url_safe_password)"
@@ -136,6 +142,10 @@ load_or_generate_runtime_secrets() {
         mail_password=""
         mail_from="Chat Room <no-reply@example.com>"
         mail_use_tls="true"
+        # Default to the in-cluster Redis Service. Users running
+        # `uvicorn` locally can override by editing app/.env.runtime
+        # or by exporting REDIS_URL before the build.
+        redis_url="redis://chatroom-redis:6379/0"
     fi
 
     printf "MYSQL_PASSWORD=%q\n"   "$mysql_pw"
@@ -148,6 +158,7 @@ load_or_generate_runtime_secrets() {
     printf "MAIL_PASSWORD=%q\n"    "$mail_password"
     printf "MAIL_FROM=%q\n"        "$mail_from"
     printf "MAIL_USE_TLS=%q\n"     "$mail_use_tls"
+    printf "REDIS_URL=%q\n"        "$redis_url"
 }
 
 # Atomically write app/.env.runtime with the three secrets + the rest of
@@ -176,6 +187,14 @@ write_runtime_env_file() {
     local mail_from="${MAIL_FROM-}"
     local mail_use_tls="${MAIL_USE_TLS-}"
     local mysql_port="${MYSQL_PORT-3306}"
+    # REDIS_URL is the pub/sub broker for cross-pod WebSocket
+    # broadcasts. Empty is a valid value (single-pod mode) but we
+    # default to the in-cluster Redis Service for k8s deployments.
+    # Note: this value is itself a URL — we deliberately don't
+    # URL-encode it the way passwords are, because the redis-py
+    # client parses the value as a URL and needs to see the literal
+    # `redis://host:port/db` form.
+    local redis_url="${REDIS_URL-redis://chatroom-redis:6379/0}"
 
     local mysql_pw_enc jwt_enc fernet_enc mysql_port_enc
     local mail_host_enc mail_port_enc mail_user_enc mail_password_enc mail_from_enc mail_use_tls_enc
@@ -247,6 +266,18 @@ MAIL_USER="${mail_user_enc}"
 MAIL_PASSWORD="${mail_password_enc}"
 MAIL_FROM="${mail_from_enc}"
 MAIL_USE_TLS=${mail_use_tls_enc}
+
+# --- Redis pub/sub bus (consumed by app/redis_bus.py) ---------------------
+# Default points at the in-cluster chatroom-redis Service from
+# k8s/16-redis-service.yaml. Override here for local dev
+# (redis://localhost:6379/0) or to disable pub/sub fan-out entirely
+# (leave blank — the app logs a warning and runs in single-pod mode).
+#
+# Note: this is a URL, not a secret, so the k8s ConfigMap entry below
+# is the literal value (no URL-encoding). .env files are read by
+# python-dotenv which preserves the raw string, so the value is
+# usable on both deployment paths.
+REDIS_URL="${redis_url}"
 EOF
 
     # Atomic rename. If mv fails the tmp file is left for the caller to
@@ -281,6 +312,7 @@ EOF
 #   ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES              — chatroom-app ConfigMap
 #   MAIL_HOST, MAIL_PORT, MAIL_USER, MAIL_FROM,
 #   MAIL_USE_TLS                                        — chatroom-app ConfigMap
+#   REDIS_URL                                           — chatroom-app ConfigMap
 #   MYSQL_PASSWORD (also)                               — chatroom-mysql Secret
 #                                                        (chatroom-mysql uses
 #                                                        MYSQL_ROOT_PASSWORD;
@@ -322,6 +354,10 @@ render_k8s_secrets() {
     local mail_password="${MAIL_PASSWORD:-}"
     local mail_from="${MAIL_FROM:-Chat Room <no-reply@example.com>}"
     local mail_use_tls="${MAIL_USE_TLS:-true}"
+    # REDIS_URL lands in the chatroom-app ConfigMap (not a Secret —
+    # it's not a credential). Defaults to the in-cluster Redis Service
+    # name. Empty is a valid value to run the app in single-pod mode.
+    local redis_url="${REDIS_URL:-redis://chatroom-redis:6379/0}"
 
     # URL-encode every value that ends up in the file. The encoding is
     # defensive (auto-generated passwords are already URL-safe) — but
@@ -417,6 +453,10 @@ data:
   MAIL_USER: "${mail_user_enc}"
   MAIL_FROM: "${mail_from_enc}"
   MAIL_USE_TLS: "${mail_use_tls_enc}"
+  # REDIS_URL is itself a URL; emit it verbatim so the redis-py
+  # client can parse it directly. URL-encoding it (the way passwords
+  # are) would break the redis:// scheme parsing.
+  REDIS_URL: "${redis_url}"
 EOF
 
     # Atomic rename. Same error-handling choice as write_runtime_env_file.

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app import crud, models, schemas
 from app.database import get_db
 from app.routers.auth import get_current_user
+from app.thumbnails import make_thumbnail
 from app.ws_manager import manager
 
 router = APIRouter()
@@ -96,6 +97,16 @@ async def create_message(
             if body.message_type == "file" and body.mime_type not in ALLOWED_FILE_TYPES:
                 raise HTTPException(status_code=400, detail="Invalid file type")
 
+        # Generate a thumbnail for image uploads so receivers on any pod
+        # see the same shape as a WS-originated image. The WS path in
+        # `app/routers/chats.py` does the same; we keep the helper in
+        # `app/thumbnails.py` so the two paths can't drift.
+        if body.message_type == "image":
+            thumb = make_thumbnail(binary_data)
+            if thumb is None:
+                raise HTTPException(status_code=400, detail="Invalid image data")
+            thumbnail_data = thumb
+
     db_msg = crud.create_message(
         db=db,
         message=schemas.MessageCreate(
@@ -107,6 +118,7 @@ async def create_message(
         room_id=room_id,
         user_id=current_user.id,
         data=binary_data,
+        thumbnail=thumbnail_data,
         file_name=body.file_name,
         mime_type=body.mime_type,
     )

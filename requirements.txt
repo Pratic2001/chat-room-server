@@ -9,3 +9,7 @@ SQLAlchemy>=1.4.0
 python-dotenv>=0.19.0
 Pillow>=8.0.0
 pydantic[email]
+# Redis pub/sub fan-out so cross-pod WebSocket broadcasts land on every
+# pod's locally-tracked WS connections. The official `redis` package
+# ships an asyncio client (`redis.asyncio`).
+redis>=5.0

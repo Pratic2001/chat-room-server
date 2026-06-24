@@ -1,15 +1,36 @@
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+import logging
+from contextlib import asynccontextmanager
+
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
-from app.routers import auth, rooms, chats, messages
-import uvicorn
 
-app = FastAPI(title="Chat Room API")
+from app import redis_bus
+from app.routers import auth, rooms, chats, messages
+from app.ws_manager import manager
+
+log = logging.getLogger("uvicorn.error")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # The bus's local-dispatch callback is the manager's per-pod fan-out
+    # helper. Wiring it here (instead of at import time) keeps `ws_manager`
+    # importable from contexts where the bus hasn't been initialised
+    # yet (e.g. some test setups).
+    await redis_bus.init_bus(manager.local_dispatch)
+    try:
+        yield
+    finally:
+        await redis_bus.shutdown_bus()
+
+
+app = FastAPI(title="Chat Room API", lifespan=lifespan)
 
 # CORS middleware to allow frontend to connect
 app.add_middleware(
