@@ -30,13 +30,24 @@ spec:
       # No hostPath, no nodeSelector, no nodeName — works on every cluster.
       # Spread pods across nodes for a small amount of HA within a single
       # cluster. Soft constraint: best-effort, not required.
-      # 10s terminationGracePeriodSeconds is plenty for uvicorn: SIGTERM
-      # triggers a graceful drain of the WebSocket connections (each
-      # client gets a close frame before the process exits) and FastAPI
-      # returns cleanly from in-flight HTTP requests. WebSocket idle
-      # timeouts are configured at the Ingress, not here — see the
-      # WebSocket-timeout note in the runbook.
-      terminationGracePeriodSeconds: 10
+      # tolerationSeconds: 10 on the standard node-NotReady/unreachable
+      # NoExecute taints — when a node goes unhealthy, the pod is
+      # evicted within 10s rather than waiting the k8s default of
+      # 300s. The k8s default terminationGracePeriodSeconds (30s) is
+      # left in place; that's plenty for uvicorn to drain WebSocket
+      # connections (SIGTERM -> each client gets a close frame) and
+      # for FastAPI to return cleanly from in-flight HTTP requests.
+      # WebSocket idle timeouts are configured at the Ingress, not
+      # here — see the WebSocket-timeout note in the runbook.
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname

@@ -25,12 +25,21 @@ spec:
     spec:
       # No hostPath, no nodeSelector, no nodeName — this pod can land on
       # any node that the scheduler chooses. Works on every cluster.
-      # 10s terminationGracePeriodSeconds is enough for the MySQL
-      # shutdown sequence (SIGTERM -> InnoDB redo log flush -> exit) on
-      # this workload. If you raise this, also raise it on the chatroom-app
-      # Deployment so the app's in-flight queries can complete before
-      # the app pod goes away.
-      terminationGracePeriodSeconds: 10
+      # tolerationSeconds: 10 on the standard node-NotReady/unreachable
+      # NoExecute taints — when a node goes unhealthy, the pod is
+      # evicted within 10s rather than waiting the k8s default of
+      # 300s. The k8s default terminationGracePeriodSeconds (30s) is
+      # left in place; that's enough for the MySQL shutdown sequence
+      # (SIGTERM -> InnoDB redo log flush -> exit).
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
       containers:
         - name: mysql
           image: chatroom-mysql:latest

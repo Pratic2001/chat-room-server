@@ -33,13 +33,16 @@
 #   8. Prints the Ingress address (or, if no Ingress is installed, the
 #      instructions to port-forward).
 #
-# Note on `terminationGracePeriodSeconds`: each Deployment manifest
+# Note on `tolerationSeconds`: each Deployment manifest
 # (k8s/15-redis-deployment.yaml, k8s/21-mysql-deployment.yaml,
-# k8s/40-app-deployment.yaml) sets `terminationGracePeriodSeconds: 10`
-# on its pod spec. That keeps rollouts and `kubectl delete pod` fast.
-# The cluster-wide components in front of this stack (ingress-nginx
-# controller, MetalLB) have their own values — see RUNBOOK §2.3.1
-# for what to tune and why.
+# k8s/40-app-deployment.yaml) sets `tolerationSeconds: 10` on the
+# standard node-NotReady/unreachable NoExecute taints. When a node
+# goes unhealthy the pod is evicted within 10s rather than waiting
+# the k8s default of 300s — these pods hold no state worth keeping
+# bound to a dead node, and the rescheduled replica comes back up
+# quickly. The cluster-wide components in front of this stack
+# (ingress-nginx controller, MetalLB) have their own `terminationGracePeriodSeconds`
+# values — see RUNBOOK §2.3.1 for what to tune and why.
 #
 # Usage:
 #   ./scripts/deploy_k8s.sh                 # deploy / reconcile

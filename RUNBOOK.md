@@ -107,13 +107,15 @@ For kind: https://kind.sigs.k8s.io/docs/user/ingress/
 
 #### 2.3.1 Tuning ingress-nginx and MetalLB for your cluster
 
-`scripts/deploy_k8s.sh` sets `terminationGracePeriodSeconds: 10` on
-every container in this stack (Redis, MySQL, chatroom-app) so rollouts
-and `kubectl delete pod` finishes in seconds rather than the k8s
-default of 30. **The cluster-wide components in front of this stack
-have their own values, and the shipped defaults are not always a good
-fit for every environment — review and tune them to match your
-cluster's size, traffic profile, and maintenance windows:**
+`scripts/deploy_k8s.sh` sets `tolerationSeconds: 10` on every pod in
+this stack (Redis, MySQL, chatroom-app) on the standard
+`node.kubernetes.io/unreachable` and `node.kubernetes.io/not-ready`
+NoExecute taints, so when a node goes unhealthy the pods are evicted
+within 10s rather than waiting the k8s default of 300s. **The
+cluster-wide components in front of this stack have their own values,
+and the shipped defaults are not always a good fit for every
+environment — review and tune them to match your cluster's size,
+traffic profile, and maintenance windows:**
 
 - **ingress-nginx controller** — installed from the URL above (or via
   your distro's package). Two fields are commonly worth overriding,
@@ -126,7 +128,7 @@ cluster's size, traffic profile, and maintenance windows:**
     spread the pods with a `topologySpreadConstraints` block on
     nodes (the same pattern as `k8s/40-app-deployment.yaml`). For
     a single-node dev cluster, 1 is fine.
-  - `terminationGracePeriodSeconds` on the controller pod — the
+  - `tolerationSeconds` on the controller pod — the
     default is 300s, mostly so the controller has time to drain
     WebSocket / long-poll connections. Match it to your longest
     expected in-flight request: a chat workload (idle WS
@@ -144,20 +146,21 @@ cluster's size, traffic profile, and maintenance windows:**
 - **MetalLB speaker / controller** (only relevant if you're using
   MetalLB to give bare-metal clusters a `LoadBalancer` Service —
   see the kind/k3d add-on guides). Both pods ship with
-  `terminationGracePeriodSeconds` of 300. That's appropriate for
+  `tolerationSeconds` of 300. That's appropriate for
   production BGP speakers (BGP neighbors need time to withdraw
   routes gracefully) but is a long wait on a single-node dev
   cluster. For dev / kind / k3d, 30s is plenty; for production
   BGP, keep the default or raise it. To change it, edit the
   `MetalLB` / `MetalLBSpeaker` / `MetalLBController` CRs (Helm
-  chart values: `speaker.terminationGracePeriodSeconds`,
-  `controller.terminationGracePeriodSeconds`) and re-apply.
+  chart values: `speaker.tolerationSeconds`,
+  `controller.tolerationSeconds`) and re-apply.
 
-The principle: this project's `terminationGracePeriodSeconds: 10` is
-deliberately tight because the pods hold no state worth draining
-slowly. Anything else in the request path (ingress controller, the
-LoadBalancer, BGP speakers) has different trade-offs and its own
-default — **read it, then decide**.
+The principle: this project's `tolerationSeconds: 10` is deliberately
+tight because the pods hold no state worth keeping bound to a dead
+node — when a node goes NotReady, evict fast and let the rescheduled
+replica come back up cleanly. Anything else in the request path
+(ingress controller, the LoadBalancer, BGP speakers) has different
+trade-offs and its own default — **read it, then decide**.
 
 ### 2.4 DNS (optional but recommended)
 

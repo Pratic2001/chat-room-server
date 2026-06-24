@@ -26,11 +26,22 @@ spec:
         app.kubernetes.io/name: chatroom
         app.kubernetes.io/component: redis
     spec:
-      # 10s terminationGracePeriodSeconds keeps rollouts snappy — Redis
-      # has no in-flight state we need to drain (pub/sub messages are
-      # already persisted to MySQL by the time we publish), so SIGTERM
-      # -> exit is enough.
-      terminationGracePeriodSeconds: 10
+      # tolerationSeconds: 10 on the standard node-NotReady/unreachable
+      # NoExecute taints — when a node goes unhealthy, the pod is
+      # evicted within 10s rather than waiting the k8s default of
+      # 300s. Redis has no state worth preserving across a node loss
+      # (every chat message is already in MySQL), so a quick relocate
+      # is preferable to a 5-minute wait on a dead node. The k8s
+      # default terminationGracePeriodSeconds (30s) is fine.
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
       containers:
         - name: redis
           image: redis:7-alpine
