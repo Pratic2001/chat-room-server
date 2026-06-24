@@ -7,7 +7,11 @@ metadata:
     app.kubernetes.io/name: chatroom
     app.kubernetes.io/component: app
 spec:
-  replicas: 2
+  # Replicas are NOT set here. scripts/deploy_k8s.sh scales this
+  # Deployment to one replica per cluster node at deploy time (see
+  # `kubectl get nodes | wc -l` in that script), so the same manifest
+  # works on any cluster size. The `topologySpreadConstraints` block
+  # below is what does the actual cross-node spread scheduling.
   strategy:
     type: RollingUpdate
     rollingUpdate:

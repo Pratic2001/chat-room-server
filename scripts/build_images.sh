@@ -96,6 +96,68 @@ fi
 # introduce a URL-special char. The MYSQL_PASSWORD value gets read verbatim
 # by the Python app (no URL decoding happens there) — see app/database.py,
 # which builds the URL from the env vars directly.
+#
+# MAIL_* values (loaded by load_or_generate_runtime_secrets above) are
+# in scope here. If we're not in --rebuild mode, the values from the
+# existing app/.env.runtime are in env; we prompt only the fields the
+# user might want to change. On --rebuild or first run, we prompt for
+# every field (or accept the default by hitting Enter).
+prompt_default() {
+    # $1 = prompt, $2 = default, $3 = secret flag (1 = read -s)
+    local prompt="$1" default="$2" secret="${3:-0}"
+    local ans
+    if [[ "$secret" -eq 1 ]]; then
+        # Read silently. Empty input = accept the default (which itself
+        # may be empty for MAIL_PASSWORD).
+        printf '%s [%s]: ' "$prompt" "$default" >&2
+        IFS= read -rs ans
+        printf '\n' >&2
+    else
+        printf '%s [%s]: ' "$prompt" "$default" >&2
+        IFS= read -r ans
+    fi
+    printf '%s' "${ans:-$default}"
+}
+
+log "SMTP configuration (leave blank to disable invite emails)..."
+MAIL_HOST="$(prompt_default '  MAIL_HOST' "$MAIL_HOST")"
+# MAIL_PORT: must be an integer 1-65535 or blank (→ 587). Re-prompt on
+# garbage input rather than failing the whole build.
+while :; do
+    MAIL_PORT_INPUT="$(prompt_default '  MAIL_PORT' "$MAIL_PORT")"
+    if [[ -z "$MAIL_PORT_INPUT" ]]; then
+        MAIL_PORT="587"
+        break
+    fi
+    if [[ "$MAIL_PORT_INPUT" =~ ^[0-9]+$ ]] && (( MAIL_PORT_INPUT >= 1 && MAIL_PORT_INPUT <= 65535 )); then
+        MAIL_PORT="$MAIL_PORT_INPUT"
+        break
+    fi
+    warn "MAIL_PORT must be an integer 1-65535 (or blank for 587); got '$MAIL_PORT_INPUT'."
+done
+MAIL_USER="$(prompt_default '  MAIL_USER' "$MAIL_USER")"
+MAIL_PASSWORD="$(prompt_default '  MAIL_PASSWORD (input hidden)' "$MAIL_PASSWORD" 1)"
+# MAIL_FROM: don't allow blank — the app needs a sender header.
+while :; do
+    MAIL_FROM_INPUT="$(prompt_default '  MAIL_FROM' "$MAIL_FROM")"
+    if [[ -n "$MAIL_FROM_INPUT" ]]; then
+        MAIL_FROM="$MAIL_FROM_INPUT"
+        break
+    fi
+    warn "MAIL_FROM cannot be blank."
+done
+# MAIL_USE_TLS: accept y/yes/1/true (→ true), n/no/0/false (→ false),
+# blank (→ default).
+while :; do
+    MAIL_USE_TLS_INPUT="$(prompt_default '  MAIL_USE_TLS (y/n)' "$MAIL_USE_TLS")"
+    case "${MAIL_USE_TLS_INPUT,,}" in
+        y|yes|1|true)  MAIL_USE_TLS="true";  break ;;
+        n|no|0|false)  MAIL_USE_TLS="false"; break ;;
+        "")            MAIL_USE_TLS="$MAIL_USE_TLS"; break ;;  # default kept
+        *) warn "MAIL_USE_TLS must be y/n/yes/no/true/false (or blank); got '$MAIL_USE_TLS_INPUT'." ;;
+    esac
+done
+
 write_runtime_env_file "$RUNTIME_ENV" "scripts/build_images.sh"
 log "Wrote $RUNTIME_ENV (chmod 600)"
 

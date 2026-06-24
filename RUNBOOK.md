@@ -14,8 +14,8 @@ can hand it to anyone and they can follow it from a clean clone.
 >
 > **If you built the images elsewhere** (CI, a teammate, or in a
 > registry): run `./scripts/write_runtime_env.sh --from-stdin` and paste
-> `MYSQL_PASSWORD`, `SECRET_KEY`, and `ROOM_SECRET_KEY` — one per line,
-> in that order — then run `./scripts/deploy_k8s.sh`. See §6.5.
+> the 9 values from `app/.env.runtime` — one per line, in the order
+> documented in §6.5 — then run `./scripts/deploy_k8s.sh`. See §6.5.
 
 ---
 
@@ -23,7 +23,7 @@ can hand it to anyone and they can follow it from a clean clone.
 
 | Component | Image | Replicas | Storage | Exposed via |
 | --- | --- | --- | --- | --- |
-| `chatroom-app` (FastAPI + static frontend) | `chat-room-server:latest` | 2 | none | ClusterIP Service `:80` → Ingress |
+| `chatroom-app` (FastAPI + static frontend) | `chat-room-server:latest` | 1 per cluster node (set by `deploy_k8s.sh`) | none | ClusterIP Service `:80` → Ingress |
 | `mysql` (database, schema pre-baked) | `chatroom-mysql:latest` | 1 | 5Gi PVC | ClusterIP Service `:3306` (cluster-internal only) |
 | `chatroom` Ingress | — | — | — | routes `chatroom.local/` to the app Service |
 
@@ -127,7 +127,8 @@ That's it. There is no `pip install`, no `.env` to fill in, no
 
 > **One thing to know:** the scripts write a file called
 > `app/.env.runtime` in the repo. It contains the MySQL root password,
-> the JWT signing key, and the Fernet room-secret key. It is gitignored.
+> the JWT signing key, the Fernet room-secret key, and (if supplied)
+> the SMTP relay credentials. It is gitignored.
 > **Do not commit it.** Treat it like any other credential.
 
 ---
@@ -147,11 +148,18 @@ What this does, in order:
    `secrets` and `cryptography.fernet` respectively).
 4. Writes those three values, plus the algorithm and token-expiry
    settings, into `app/.env.runtime` with `chmod 600`.
-5. Runs `docker build` for the MySQL image, passing the password as a
+5. Prompts for six SMTP settings — `MAIL_HOST`, `MAIL_PORT`, `MAIL_USER`,
+   `MAIL_PASSWORD`, `MAIL_FROM`, `MAIL_USE_TLS` — and writes them to
+   `app/.env.runtime` next to the secrets. `MAIL_PASSWORD` is read
+   silently (so it doesn't echo). Leave `MAIL_HOST` blank to disable
+   invite emails entirely. On a re-run, the previous values are used
+   as defaults — pass `--rebuild` to start fresh. See §6.5 for the
+   full layout and the local debug-sink path.
+6. Runs `docker build` for the MySQL image, passing the password as a
    build-arg. The MySQL Dockerfile `sed`s the value into
    `mysql/init/99-grants.sql`, so on first boot the container pins the
    root password to that exact value.
-6. Runs `docker build` for the app image. **No `.env` is baked in** —
+7. Runs `docker build` for the app image. **No `.env` is baked in** —
    the app reads config from env at runtime.
 
 Output: two images in the local Docker daemon, tagged `:latest`:
@@ -271,12 +279,25 @@ What it does, in order:
 3. Creates the `chatroom` namespace if it doesn't exist.
 4. Creates/updates the `chatroom-mysql` and `chatroom-app` Secrets
    imperatively from `app/.env.runtime`. **The values never end up in a
-   committed manifest.**
-5. `kubectl apply -f k8s/` — applies all nine manifests in lexical
-   order.
-6. `kubectl rollout status` for both Deployments, with a 5-minute
+   committed manifest.** `chatroom-app` carries `MYSQL_PASSWORD`,
+   `SECRET_KEY`, `ROOM_SECRET_KEY`, and `MAIL_PASSWORD`.
+5. Creates/updates the `chatroom-app` ConfigMap imperatively from
+   `app/.env.runtime`. It carries the 11 non-secret runtime settings:
+   `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_DB`, `ALGORITHM`,
+   `ACCESS_TOKEN_EXPIRE_MINUTES`, `MAIL_HOST`, `MAIL_PORT`, `MAIL_USER`,
+   `MAIL_FROM`, `MAIL_USE_TLS`. The committed `k8s/30-app-config.yaml`
+   only has the 6 static values (host/port/user/db/algorithm/expiry);
+   the 5 MAIL_* keys are written imperatively so they don't sit in
+   git as blank placeholders.
+6. `kubectl apply -f k8s/` — applies all manifests in lexical order.
+7. Scales `chatroom-app` to one replica per cluster node (queries
+   `kubectl get nodes | wc -l`). The committed Deployment manifest has
+   no `replicas:` field — see the comment in
+   `k8s/40-app-deployment.yaml`. Defaults to 2 if the node count
+   can't be determined.
+8. `kubectl rollout status` for both Deployments, with a 5-minute
    timeout each.
-7. Prints the Ingress address if one was assigned, or a `port-forward`
+9. Prints the Ingress address if one was assigned, or a `port-forward`
    hint if not.
 
 A successful run ends with something like:
@@ -292,6 +313,10 @@ chatroom-app-7f9c...          1/1     Running   0          30s
 chatroom-app-b8a1...          1/1     Running   0          30s
 mysql-7d5e...                 1/1     Running   0          45s
 ```
+
+(The two `chatroom-app` pods above are a 2-node cluster. On a
+3-node cluster you'd see three app pods; on kind's default
+1-node cluster, just one. See §6.2 step 7.)
 
 ### 6.3 Pushing to a registry (managed clusters / multi-node)
 
@@ -505,6 +530,96 @@ Deletes the `chatroom` namespace and every resource in it, **including
 the PVC and all its data**. There is no `--uninstall --keep-data`; if
 you want to preserve the data, take a `mysqldump` first (see §8.2).
 
+### 6.5 Configuring SMTP
+
+The room-invite flow uses SMTP to send the room secret phrase (and the
+join link) to invited users. The build script prompts for six values
+and persists them to `app/.env.runtime`; the deploy script writes them
+to the cluster as one Secret key and five ConfigMap keys.
+
+| Variable | Source | Purpose | Blank OK? |
+| --- | --- | --- | --- |
+| `MAIL_HOST` | ConfigMap `chatroom-app` | SMTP relay hostname. | **No — blank disables invite emails entirely.** The Invite button in the UI will return a clear 502. |
+| `MAIL_PORT` | ConfigMap `chatroom-app` | SMTP relay port. Default 587. Integer 1–65535. | Yes (defaults to 587). |
+| `MAIL_USER` | ConfigMap `chatroom-app` | SMTP auth username, if your relay requires it. | Yes. |
+| `MAIL_PASSWORD` | Secret `chatroom-app` | SMTP auth password, if your relay requires it. | Yes. |
+| `MAIL_FROM` | ConfigMap `chatroom-app` | `From:` header. Must be a `Display Name <addr@host>` string. | **No — required for any invite to work.** |
+| `MAIL_USE_TLS` | ConfigMap `chatroom-app` | `true` (default) uses STARTTLS on the chosen port; `false` is needed for unauthenticated local debug relays. | Yes (defaults to `true`). |
+
+`MAIL_PASSWORD` is read with `read -rs` in the build script so the
+value doesn't echo to the terminal. All six are accepted blank.
+
+**Quick reference: the values land here in k8s.**
+
+```
+# Values that must stay secret
+kubectl -n chatroom get secret chatroom-app \
+  -o jsonpath='{.data.MAIL_PASSWORD}' | base64 --decode
+
+# Everything else
+kubectl -n chatroom get configmap chatroom-app -o yaml
+```
+
+**Local debug sink — no real relay needed.** Python ships a debugging
+SMTP server in the stdlib that just prints the email it receives:
+
+```
+# on the build host
+python -m smtpd -n -c DebuggingServer localhost:1025 &
+
+# then rebuild with the matching values:
+./scripts/build_images.sh --rebuild    # prompts for MAIL_*
+#   MAIL_HOST=localhost
+#   MAIL_PORT=1025
+#   MAIL_USE_TLS=false
+#   MAIL_USER=     (blank)
+#   MAIL_PASSWORD= (blank)
+#   MAIL_FROM=Chat Room <no-reply@example.com>
+
+./scripts/deploy_k8s.sh
+```
+
+Sign in via the UI, create a room, click **Invite** with a real email
+address — the message appears in the `smtpd` stdout. **Port 465 = SMTPS
+(implicit TLS); all other ports use opportunistic STARTTLS when
+`MAIL_USE_TLS=true`.** So if you switch to port 465 you'll want
+`MAIL_USE_TLS=false` (the `app/utils.py` SMTP layer treats port 465
+specially — implicit TLS — and ignores `MAIL_USE_TLS` for it).
+
+**If you built the images elsewhere** (CI, a teammate, a registry) and
+the deployment is missing the SMTP values: run
+`./scripts/write_runtime_env.sh --from-stdin` (or `--from-file`) and
+paste the 9 lines from the build host's `app/.env.runtime`, in this
+order:
+
+```
+MYSQL_PASSWORD
+SECRET_KEY
+ROOM_SECRET_KEY
+MAIL_PASSWORD
+MAIL_HOST
+MAIL_USER
+MAIL_PORT
+MAIL_FROM
+MAIL_USE_TLS
+```
+
+The values are validated as they're read (e.g. `MAIL_PORT` must be
+1–65535, `MAIL_USE_TLS` must be `y`/`n`/`true`/`false`). Empty
+`MAIL_HOST` disables invites; empty `MAIL_PASSWORD`/`MAIL_USER` are
+fine for relays that don't authenticate. Then re-run
+`./scripts/deploy_k8s.sh` to write the values to the cluster and roll
+the app pods.
+
+**Rotating `MAIL_PASSWORD` only.** Edit `app/.env.runtime` in place,
+then re-run `./scripts/deploy_k8s.sh` (it reads the file and rewrites
+the Secret imperatively) and
+`kubectl -n chatroom rollout restart deploy/chatroom-app`. No rebuild
+needed — the app reads env at start. There's no separate
+`change_mail_password.sh`; if you'd rather script the rotation,
+`scripts/write_runtime_env.sh --from-file <file>` is the canonical
+write path.
+
 ---
 
 ## 7. Verify the deployment
@@ -698,10 +813,11 @@ kubectl -n chatroom rollout status deploy/chatroom-app --timeout=3m
 ```
 
 `rollout restart` issues a rolling update — the app Deployment has
-`replicas: 2` + `maxUnavailable: 0` + `maxSurge: 1`, so traffic stays
-served throughout (old pod only stops accepting connections once the
-new pod is `Ready`). The MySQL Deployment is single-replica so expect a
-brief gap of a few seconds while it comes back up.
+replicas set to one per cluster node (configured by `deploy_k8s.sh`,
+see §6.2) + `maxUnavailable: 0` + `maxSurge: 1`, so traffic stays served
+throughout (old pod only stops accepting connections once the new pod
+is `Ready`). The MySQL Deployment is single-replica so expect a brief
+gap of a few seconds while it comes back up.
 
 For the MySQL pod specifically, an equivalent (and slightly cheaper)
 form is just to delete the pod — the ReplicaSet controller re-creates

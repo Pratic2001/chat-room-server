@@ -30,6 +30,15 @@
 #   MYSQL_PASSWORD
 #   SECRET_KEY
 #   ROOM_SECRET_KEY
+#   MAIL_PASSWORD
+#   MAIL_HOST
+#   MAIL_USER
+#   MAIL_PORT
+#   MAIL_FROM
+#   MAIL_USE_TLS
+# (The order after the three secrets matches the prompt order in
+# scripts/build_images.sh, so a piped-from-build invocation lines up
+# row-for-row.)
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -86,18 +95,30 @@ fi
 # Acquire the three values
 # -----------------------------------------------------------------------------
 if [[ "$FROM_STDIN" -eq 1 ]]; then
-    log "Reading MYSQL_PASSWORD, SECRET_KEY, ROOM_SECRET_KEY from stdin..."
-    # Read exactly three lines, in order. Trailing newline tolerated.
+    log "Reading 9 values from stdin (3 secrets + 6 MAIL_*)..."
+    # Read exactly nine lines, in order. Trailing newline tolerated.
     IFS= read -r MYSQL_PASSWORD  || fail "stdin closed before MYSQL_PASSWORD."
     IFS= read -r SECRET_KEY      || fail "stdin closed before SECRET_KEY."
     IFS= read -r ROOM_SECRET_KEY || fail "stdin closed before ROOM_SECRET_KEY."
+    IFS= read -r MAIL_PASSWORD   || fail "stdin closed before MAIL_PASSWORD."
+    IFS= read -r MAIL_HOST       || fail "stdin closed before MAIL_HOST."
+    IFS= read -r MAIL_USER       || fail "stdin closed before MAIL_USER."
+    IFS= read -r MAIL_PORT       || fail "stdin closed before MAIL_PORT."
+    IFS= read -r MAIL_FROM       || fail "stdin closed before MAIL_FROM."
+    IFS= read -r MAIL_USE_TLS    || fail "stdin closed before MAIL_USE_TLS."
 elif [[ -n "$FROM_FILE" ]]; then
     [[ -f "$FROM_FILE" ]] || fail "--from-file: $FROM_FILE not found."
-    log "Reading MYSQL_PASSWORD, SECRET_KEY, ROOM_SECRET_KEY from $FROM_FILE..."
+    log "Reading 9 values from $FROM_FILE (3 secrets + 6 MAIL_*)..."
     {
         IFS= read -r MYSQL_PASSWORD  || fail "$FROM_FILE: missing MYSQL_PASSWORD on line 1."
         IFS= read -r SECRET_KEY      || fail "$FROM_FILE: missing SECRET_KEY on line 2."
         IFS= read -r ROOM_SECRET_KEY || fail "$FROM_FILE: missing ROOM_SECRET_KEY on line 3."
+        IFS= read -r MAIL_PASSWORD   || fail "$FROM_FILE: missing MAIL_PASSWORD on line 4."
+        IFS= read -r MAIL_HOST       || fail "$FROM_FILE: missing MAIL_HOST on line 5."
+        IFS= read -r MAIL_USER       || fail "$FROM_FILE: missing MAIL_USER on line 6."
+        IFS= read -r MAIL_PORT       || fail "$FROM_FILE: missing MAIL_PORT on line 7."
+        IFS= read -r MAIL_FROM       || fail "$FROM_FILE: missing MAIL_FROM on line 8."
+        IFS= read -r MAIL_USE_TLS    || fail "$FROM_FILE: missing MAIL_USE_TLS on line 9."
     } < "$FROM_FILE"
 else
     log "Generating fresh credentials..."
@@ -125,6 +146,27 @@ fi
 # JWT secret should be long enough to be useful.
 if [[ "${#SECRET_KEY}" -lt 32 ]]; then
     fail "SECRET_KEY is suspiciously short (${#SECRET_KEY} chars). HS256 wants at least 32."
+fi
+
+# MAIL_* validation. Empty is allowed for MAIL_HOST, MAIL_USER, MAIL_PASSWORD
+# (blank host disables invite emails; user/pass are sometimes blank for
+# relays like the local python smtpd debugging server).
+[[ -n "${MAIL_FROM:-}" ]] || fail "MAIL_FROM is empty (provide a 'Display Name <addr@host>' string)."
+# MAIL_PORT must be a positive integer 1-65535, or empty (the build script
+# defaults to 587 in that case).
+if [[ -n "${MAIL_PORT:-}" ]]; then
+    if ! [[ "$MAIL_PORT" =~ ^[0-9]+$ ]] || (( MAIL_PORT < 1 || MAIL_PORT > 65535 )); then
+        fail "MAIL_PORT must be an integer 1-65535 (or blank for 587). Got: '$MAIL_PORT'."
+    fi
+fi
+# MAIL_USE_TLS must be true or false (case-insensitive; we normalize
+# to lowercase in the env file).
+if [[ -n "${MAIL_USE_TLS:-}" ]]; then
+    case "${MAIL_USE_TLS,,}" in
+        y|yes|1|true)  MAIL_USE_TLS="true"  ;;
+        n|no|0|false)  MAIL_USE_TLS="false" ;;
+        *) fail "MAIL_USE_TLS must be y/n/yes/no/true/false (or blank). Got: '$MAIL_USE_TLS'." ;;
+    esac
 fi
 
 # -----------------------------------------------------------------------------

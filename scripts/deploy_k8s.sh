@@ -86,8 +86,9 @@ fi
     1. Build the images locally:   ./scripts/build_images.sh
     2. Images were built elsewhere (CI / a teammate / registry):
          ./scripts/write_runtime_env.sh --from-stdin
-       then paste MYSQL_PASSWORD, SECRET_KEY, and ROOM_SECRET_KEY
-       (one per line, in that order).
+       then paste 9 values (MYSQL_PASSWORD, SECRET_KEY, ROOM_SECRET_KEY,
+       MAIL_PASSWORD, MAIL_HOST, MAIL_USER, MAIL_PORT, MAIL_FROM,
+       MAIL_USE_TLS), one per line, in that order.
 
   The MySQL image's 99-grants.sql was baked with a specific
   MYSQL_PASSWORD at build time, so the value you supply must match
@@ -108,14 +109,46 @@ fi
     : "${MYSQL_PASSWORD:?MYSQL_PASSWORD missing from $RUNTIME_ENV}"
     : "${SECRET_KEY:?SECRET_KEY missing from $RUNTIME_ENV}"
     : "${ROOM_SECRET_KEY:?ROOM_SECRET_KEY missing from $RUNTIME_ENV}"
+    # The MAIL_* values are optional in the strict sense — the app
+    # treats MAIL_HOST="" as "invites disabled" and MAIL_PASSWORD=""
+    # as "no SMTP auth". Default MYSQL_PORT to 3306 if missing (older
+    # .env.runtime files might not have it).
     printf '%s\n' "$MYSQL_PASSWORD"  > /tmp/_crs_mysql_pw
     printf '%s\n' "$SECRET_KEY"      > /tmp/_crs_jwt
     printf '%s\n' "$ROOM_SECRET_KEY" > /tmp/_crs_fernet
+    printf '%s\n' "${MYSQL_HOST-mysql}"                 > /tmp/_crs_mysql_host
+    printf '%s\n' "${MYSQL_PORT-3306}"                  > /tmp/_crs_mysql_port
+    printf '%s\n' "${MYSQL_USER-root}"                  > /tmp/_crs_mysql_user
+    printf '%s\n' "${MYSQL_DB-chatroom_db}"             > /tmp/_crs_mysql_db
+    printf '%s\n' "${ALGORITHM-HS256}"                  > /tmp/_crs_alg
+    printf '%s\n' "${ACCESS_TOKEN_EXPIRE_MINUTES-60}"   > /tmp/_crs_exp
+    printf '%s\n' "${MAIL_HOST-}"        > /tmp/_crs_mail_host
+    printf '%s\n' "${MAIL_PORT-587}"     > /tmp/_crs_mail_port
+    printf '%s\n' "${MAIL_USER-}"        > /tmp/_crs_mail_user
+    printf '%s\n' "${MAIL_PASSWORD-}"    > /tmp/_crs_mail_password
+    printf '%s\n' "${MAIL_FROM-Chat Room <no-reply@example.com>}" > /tmp/_crs_mail_from
+    printf '%s\n' "${MAIL_USE_TLS-true}" > /tmp/_crs_mail_use_tls
 )
-trap 'rm -f /tmp/_crs_mysql_pw /tmp/_crs_jwt /tmp/_crs_fernet' EXIT
+trap 'rm -f /tmp/_crs_mysql_pw /tmp/_crs_jwt /tmp/_crs_fernet \
+        /tmp/_crs_mysql_host /tmp/_crs_mysql_port /tmp/_crs_mysql_user /tmp/_crs_mysql_db \
+        /tmp/_crs_alg /tmp/_crs_exp \
+        /tmp/_crs_mail_host /tmp/_crs_mail_port /tmp/_crs_mail_user /tmp/_crs_mail_password \
+        /tmp/_crs_mail_from /tmp/_crs_mail_use_tls' EXIT
 MYSQL_PASSWORD="$(cat /tmp/_crs_mysql_pw)"
 SECRET_KEY="$(cat /tmp/_crs_jwt)"
 ROOM_SECRET_KEY="$(cat /tmp/_crs_fernet)"
+MYSQL_HOST="$(cat /tmp/_crs_mysql_host)"
+MYSQL_PORT="$(cat /tmp/_crs_mysql_port)"
+MYSQL_USER="$(cat /tmp/_crs_mysql_user)"
+MYSQL_DB="$(cat /tmp/_crs_mysql_db)"
+ALGORITHM="$(cat /tmp/_crs_alg)"
+ACCESS_TOKEN_EXPIRE_MINUTES="$(cat /tmp/_crs_exp)"
+MAIL_HOST="$(cat /tmp/_crs_mail_host)"
+MAIL_PORT="$(cat /tmp/_crs_mail_port)"
+MAIL_USER="$(cat /tmp/_crs_mail_user)"
+MAIL_PASSWORD="$(cat /tmp/_crs_mail_password)"
+MAIL_FROM="$(cat /tmp/_crs_mail_from)"
+MAIL_USE_TLS="$(cat /tmp/_crs_mail_use_tls)"
 
 # -----------------------------------------------------------------------------
 # Create namespace and Secrets
@@ -143,7 +176,27 @@ kubectl create secret generic chatroom-app \
     --from-literal=MYSQL_PASSWORD="$MYSQL_PASSWORD" \
     --from-literal=SECRET_KEY="$SECRET_KEY" \
     --from-literal=ROOM_SECRET_KEY="$ROOM_SECRET_KEY" \
-    --from-literal=MAIL_PASSWORD="" \
+    --from-literal=MAIL_PASSWORD="$MAIL_PASSWORD" \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+# Write the chatroom-app ConfigMap imperatively too — the committed
+# k8s/30-app-config.yaml is a placeholder, just like the Secret manifest.
+# This is the path that gets MAIL_HOST / MAIL_USER / MAIL_PORT / MAIL_FROM
+# / MAIL_USE_TLS from app/.env.runtime into the running cluster.
+log "Writing chatroom-app ConfigMap..."
+kubectl create configmap chatroom-app \
+    --namespace "$NAMESPACE" \
+    --from-literal=MYSQL_HOST="$MYSQL_HOST" \
+    --from-literal=MYSQL_PORT="$MYSQL_PORT" \
+    --from-literal=MYSQL_USER="$MYSQL_USER" \
+    --from-literal=MYSQL_DB="$MYSQL_DB" \
+    --from-literal=ALGORITHM="$ALGORITHM" \
+    --from-literal=ACCESS_TOKEN_EXPIRE_MINUTES="$ACCESS_TOKEN_EXPIRE_MINUTES" \
+    --from-literal=MAIL_HOST="$MAIL_HOST" \
+    --from-literal=MAIL_PORT="$MAIL_PORT" \
+    --from-literal=MAIL_USER="$MAIL_USER" \
+    --from-literal=MAIL_FROM="$MAIL_FROM" \
+    --from-literal=MAIL_USE_TLS="$MAIL_USE_TLS" \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 # -----------------------------------------------------------------------------
@@ -151,6 +204,28 @@ kubectl create secret generic chatroom-app \
 # -----------------------------------------------------------------------------
 log "Applying manifests from $K8S_DIR ..."
 kubectl apply -f "$K8S_DIR"
+
+# -----------------------------------------------------------------------------
+# Scale chatroom-app to one replica per cluster node
+# -----------------------------------------------------------------------------
+# The committed manifest in k8s/40-app-deployment.yaml has no `replicas:`
+# field (the previous hard-coded `replicas: 2` was removed — see the
+# comment in that file). This step is the source of truth for the replica
+# count, and it matches the cluster's node count so the app spreads
+# across the cluster. The `topologySpreadConstraints` block in the
+# manifest does the actual scheduling work; this step just sets the
+# desired count.
+#
+# We default to 2 if we can't determine the node count (e.g. the user
+# pointed kubectl at an empty context — defensive, but the pre-flight
+# check above already catches that case before we get here).
+NODE_COUNT="$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+if [[ -z "$NODE_COUNT" || "$NODE_COUNT" -lt 1 ]]; then
+    warn "Could not determine node count; defaulting replicas to 2."
+    NODE_COUNT=2
+fi
+log "Scaling chatroom-app to $NODE_COUNT replicas (cluster node count)..."
+kubectl scale deployment/chatroom-app --namespace "$NAMESPACE" --replicas="$NODE_COUNT"
 
 # -----------------------------------------------------------------------------
 # Rollout status

@@ -15,12 +15,12 @@ data:
   MYSQL_DB: "chatroom_db"
   ALGORITHM: "HS256"
   ACCESS_TOKEN_EXPIRE_MINUTES: "60"
-  # SMTP is optional. If left blank, the Invite flow will raise a 502 with
-  # a clear message. Fill in your own SMTP relay to enable invites.
-  MAIL_HOST: ""
-  MAIL_PORT: "587"
-  MAIL_USER: ""
-  MAIL_FROM: "Chat Room <no-reply@example.com>"
-  MAIL_USE_TLS: "true"
+  # The five MAIL_* keys (MAIL_HOST, MAIL_PORT, MAIL_USER, MAIL_FROM,
+  # MAIL_USE_TLS) are NOT set here. scripts/deploy_k8s.sh writes them
+  # imperatively into the chatroom-app ConfigMap at deploy time, sourced
+  # from app/.env.runtime. This manifest is just the static values; the
+  # imperative write is the source of truth at runtime. The MAIL_PASSWORD
+  # key lives in the chatroom-app Secret (also written imperatively).
+  #
   # The values that must stay secret (MYSQL_PASSWORD, SECRET_KEY,
   # ROOM_SECRET_KEY) live in the chatroom-app Secret, not here.
