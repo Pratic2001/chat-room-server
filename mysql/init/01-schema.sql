@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS room_members (
     joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    UNIQUE KEY unique_room_user (room_id, user_id)
+    UNIQUE KEY unique_room_user (room_id, user_id),
+    KEY idx_room_members_room_id (room_id),
+    KEY idx_room_members_user_id (user_id)
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -48,10 +50,18 @@ CREATE TABLE IF NOT EXISTS messages (
     mime_type VARCHAR(100),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    KEY idx_messages_room_id (room_id),
+    KEY idx_messages_user_id (user_id)
 );
-
-CREATE INDEX idx_messages_room_id ON messages(room_id);
-CREATE INDEX idx_messages_user_id ON messages(user_id);
-CREATE INDEX idx_room_members_room_id ON room_members(room_id);
-CREATE INDEX idx_room_members_user_id ON room_members(user_id);
+-- The four KEY clauses above replace the previous standalone CREATE INDEX
+-- statements. Defining indexes inline (as part of CREATE TABLE) keeps the
+-- binlog event for the table self-contained — the master's
+-- `CREATE TABLE IF NOT EXISTS …` becomes a single event that the replica
+-- can apply idempotently even after a dump-load has already populated the
+-- table. Standalone `CREATE INDEX` events were ending up in the master's
+-- binlog (from the init scripts) and being replayed on the replica's
+-- already-indexed tables, where they failed with
+-- `ERROR 1061 (HY-001) Duplicate key name` and stopped the SQL thread —
+-- which manifested in the UI as "Failed to load messages" when a read
+-- round-robined onto a stuck replica.

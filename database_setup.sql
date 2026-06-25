@@ -51,7 +51,9 @@ CREATE TABLE IF NOT EXISTS room_members (
     joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-    UNIQUE KEY unique_room_user (room_id, user_id)
+    UNIQUE KEY unique_room_user (room_id, user_id),
+    KEY idx_room_members_room_id (room_id),
+    KEY idx_room_members_user_id (user_id)
 );
 
 -- Messages table
@@ -67,11 +69,13 @@ CREATE TABLE IF NOT EXISTS messages (
     mime_type VARCHAR(100),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    KEY idx_messages_room_id (room_id),
+    KEY idx_messages_user_id (messages.user_id)
 );
-
--- Optional: Add indexes for better query performance
-CREATE INDEX idx_messages_room_id ON messages(room_id);
-CREATE INDEX idx_messages_user_id ON messages(user_id);
-CREATE INDEX idx_room_members_room_id ON room_members(room_id);
-CREATE INDEX idx_room_members_user_id ON room_members(user_id);
+-- The KEY clauses above replace the previous standalone CREATE INDEX
+-- statements. Defining indexes inline (as part of CREATE TABLE) keeps the
+-- binlog event for the table self-contained — for the k8s deployment,
+-- this prevents the master's `CREATE INDEX` (logged from init scripts)
+-- from failing on replicas that already received the same indexes via
+-- mysqldump. See mysql/init/01-schema.sql for the full rationale.

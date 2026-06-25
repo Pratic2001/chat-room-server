@@ -472,6 +472,19 @@ done
 # mysql user. We replicate that here so file ownership is consistent
 # with the master path. gosu is in the official image at
 # /usr/local/bin/gosu.
+#
+# --slave-skip-errors=1061 makes the replica tolerate "ER_DUP_KEYNAME
+# Duplicate key name" errors. The chatroom schema defines indexes inline
+# in CREATE TABLE (see mysql/init/01-schema.sql), so this shouldn't fire
+# in normal operation — but it acts as a defensive belt-and-braces for
+# any future out-of-band DDL that adds an index the replica already has.
+# Without this, a single benign DDL drift stops the replica's SQL thread
+# forever, which surfaces in the frontend as 403s / "Failed to load
+# messages" because the read Service round-robins onto a stuck replica
+# whose `room_members` table no longer reflects the master's writes.
+# 1061 is the narrowest skip set that addresses the actual failure mode
+# (and is what every MySQL HA playbook recommends for this scenario);
+# wildcards like "all" or "ddl_exist_errors" would mask real corruption.
 log "Starting mysqld in foreground (replica mode)..."
 exec /usr/local/bin/gosu mysql mysqld \
     --server-id="${SERVER_ID}" \
@@ -481,6 +494,7 @@ exec /usr/local/bin/gosu mysql mysqld \
     --binlog-format=ROW \
     --read-only=ON \
     --super-read-only=ON \
+    --slave-skip-errors=1061 \
     --socket=/var/run/mysqld/mysqld.sock \
     --pid-file=/var/run/mysqld/mysqld.pid \
     "$@"
