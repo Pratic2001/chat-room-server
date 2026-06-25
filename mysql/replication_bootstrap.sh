@@ -360,31 +360,44 @@ mysqladmin_local() {
 #
 # Why this step exists: the dump-load above captures the master's
 # `mysql.user` table at whatever state it happens to be in at the moment.
-# On a freshly-built image the master's own /docker-entrypoint-initdb.d/
-# scripts may not have run yet (specifically 99-grants.sql, which issues
-# `ALTER USER 'root'@'%' IDENTIFIED BY ...`). When the dump runs in
-# that window, the replica ends up with only `root@localhost` and no
-# `root@%`. The chatroom-app's read engine connects as root from a k8s
-# pod IP, so it needs `root@%` — without it, every read request that
-# round-robins onto this replica via the `mysql-replica` Service gets
-# 1045 "Access denied". That's the intermittent "Failed to load room"
-# the frontend reports.
+# If the dump didn't include root@% (e.g. the master's own
+# /docker-entrypoint-initdb.d/ scripts hadn't run yet — specifically
+# 99-grants.sql, which issues `ALTER USER 'root'@'%' IDENTIFIED BY ...` —
+# or the dump is empty for any other reason), the replica ends up with
+# only `root@localhost` and no `root@%`. The chatroom-app's read engine
+# connects as root from a k8s pod IP, so it needs `root@%` — without
+# it, every read request that round-robins onto this replica via the
+# `mysql-replica` Service gets 1045 "Access denied". That's the
+# intermittent "Failed to load room" the frontend reports.
 #
-# Issuing the ALTER USER locally on the replica is safe under all the
-# constraint surfaces we care about:
+# This used to assume root@% already existed from the dump and only
+# issued `ALTER USER`. That assumption broke in production when the
+# 'repl' user was missing the SELECT (and friends) privileges mysqldump
+# needs — the dump was structurally empty, root@% never landed, and
+# `ALTER USER 'root'@'%'` failed with ERROR 1396 ("operation failed
+# for", the code MySQL returns when an ALTER USER target doesn't exist).
+# The fix is belt-and-braces: CREATE USER IF NOT EXISTS first, then
+# ALTER USER. CREATE USER IF NOT EXISTS is a no-op when the user
+# already exists, so the dump-succeeded path is unchanged; on the
+# dump-failed path it creates the row with the right hash and ALTER
+# USER is then a no-op write of the same hash.
+#
+# Issuing these statements locally on the replica is safe under all
+# the constraint surfaces we care about:
 #   - --read-only / --super-read-only on the replica don't apply to the
 #     local unix-socket root connection (they're session-level flags
 #     the SQL bypasses the same way the official mysql entrypoint does).
 #   - caching_sha2_password hashes MYSQL_ROOT_PASSWORD to the same
 #     value as the master, so the grant converges cluster-wide even
 #     though we're running it independently on every replica.
-#   - The statement is idempotent: re-running it on a replica that
-#     already has the correct grant writes the same hash and is a
-#     no-op for the user-facing auth path.
+#   - Both statements are idempotent: re-running on a replica that
+#     already has the correct grant is a no-op for the user-facing
+#     auth path.
 #   - Replicated ALTER USER statements on `mysql.user` flow through the
 #     row-binlog applier, so any subsequent rebuild that recreates this
 #     divergence will replay the same statement on every replica.
 mysql_local <<SQL
+CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
 ALTER USER 'root'@'%' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
 FLUSH PRIVILEGES;
 SQL

@@ -23,18 +23,40 @@
 -- because REPLICATION SLAVE on root is a privilege-escalation risk
 -- if any app-side code path is ever tricked into connecting as root.
 --
--- RELOAD is needed alongside REPLICATION SLAVE because mysqldump
--- --single-transaction issues `FLUSH TABLES` to get a consistent
--- snapshot. Without RELOAD, the dump fails with
---   mysqldump: Couldn't execute 'FLUSH TABLES': Access denied;
---     you need (at least one of) the RELOAD or FLUSH_TABLES
---     privilege(s) for this operation (1227)
--- Replicas will then log "Initial dump-load failed; check that the
--- master is healthy and credentials match." (this is a credentials
--- problem only in the sense that the 'repl' user is missing a
--- privilege the dump needs). RELOAD is the safer of the two grants
--- — it's a common replication-tooling requirement, and 'repl' is
--- already trusted with the binlog stream.
+-- The grant set below is the minimum mysqldump needs for the replica
+-- bootstrap's `mysqldump --all-databases --single-transaction
+-- --triggers --routines --events --no-tablespaces` step (see
+-- mysql/replication_bootstrap.sh, the "Dump-load" block). Each
+-- privilege has a reason — without them, mysqldump silently produces
+-- an empty dump, the replica ends up with no `chatroom_db` and no
+-- `root@%`, and the next ALTER USER in the bootstrap fails with
+-- ERROR 1396. That bug surfaced as a CrashLoopBackOff on every
+-- replica pod of the StatefulSet — every retry hit the same 1396
+-- because the dump was structurally empty, not because of a timing
+-- race. Verified by running the same mysqldump against the master
+-- with the unprivileged repl user: 39 lines of header/footer and
+-- zero tables.
+--
+--   SELECT          read table rows (the load-bearing one — without it,
+--                   mysqldump skips every table silently)
+--   RELOAD          `FLUSH TABLES` during --single-transaction; the
+--                   official entrypoint also uses this internally
+--   LOCK TABLES     held briefly during the snapshot
+--   SHOW VIEW       definitions of views in the schema dump
+--   TRIGGER         trigger definitions in the schema dump
+--   EVENT           scheduled-event definitions in the schema dump
+--   REPLICATION SLAVE the change-master credential (CHANGE MASTER TO
+--                   ... MASTER_USER='repl' on every replica)
+--
+-- Deliberately omitted (would be redundant or unnecessary here):
+--   PROCESS        only needed for the tablespaces branch of
+--                  mysqldump, which the bootstrap's `--no-tablespaces`
+--                  flag skips
+--   BACKUP_ADMIN   only needed for `LOCK INSTANCE FOR BACKUP` and
+--                  the clone-plugin transport; not used here
+--   SUPER          intentionally never granted to a non-root account
 CREATE USER 'repl'@'%' IDENTIFIED BY '__REPLICATION_PASSWORD__';
-GRANT REPLICATION SLAVE, RELOAD ON *.* TO 'repl'@'%';
+GRANT SELECT, RELOAD, LOCK TABLES,
+      SHOW VIEW, TRIGGER, EVENT,
+      REPLICATION SLAVE ON *.* TO 'repl'@'%';
 FLUSH PRIVILEGES;
