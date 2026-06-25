@@ -1904,6 +1904,182 @@ On a multi-node cluster, the Service has endpoints only when the
 replica pods are `1/1 Ready`. If a replica is stuck at `0/1`, see
 §9.10.
 
+### 9.14 MySQL replica SQL thread aborted (`Error_code: MY-001396`)
+
+Symptom: the replica pod (`mysql-1` etc.) is `1/1 Running`, but its
+log shows the applier thread has stopped:
+
+```
+2026-06-25T20:53:18.669317Z 10 [ERROR] [MY-010584] [Repl] Replica SQL for channel '':
+  Worker 1 failed executing transaction
+  'b11692f4-70d7-11f1-8f40-ceedec70d9b7:20' at source log mysql-bin.000002,
+  end_log_pos 2961994; Error 'Operation ALTER USER failed for 'root'@'%'' on query.
+  Default database: 'chatroom_db'. Query: 'ALTER USER 'root'@'%' IDENTIFIED WITH
+  'caching_sha2_password' AS '$A$005$...'', Error_code: MY-001396
+2026-06-25T20:53:18.669414Z 6 [ERROR] [MY-010586] [Repl] Error running query,
+  replica SQL thread aborted. Fix the problem, and restart the replica SQL
+  thread with "START REPLICA". We stopped at log 'mysql-bin.000002' position 2958981
+```
+
+`Seconds_Behind_Master` on the replica climbs without bound and stays
+non-zero even though the IO thread is still pulling events. The root
+cause is almost always a single binlog event the replica can't replay
+against its current state — most often an `ALTER USER` line that was
+replayed from the master (the `99-grants.sql` template the master ran
+on first boot also lives in the binlog and gets re-applied to
+replicas). Other common triggers: a duplicate-key `CREATE USER`, a
+`GRANT` for a user that doesn't exist, a `DROP` of a row that already
+moved on, etc.
+
+**This is different from §9.10 / §9.10.1** — those cover the replica
+*pod* being stuck (`0/1 Ready`, CrashLoopBackOff) because the
+bootstrap dump-load itself failed. Here the pod is fine; only the
+applier thread is stuck. No PVC drop is needed.
+
+#### 9.14.1 Diagnose
+
+Pick the offending replica and read its status:
+
+```
+./scripts/fix_mysql_repl.sh --pod mysql-1 status
+```
+
+The relevant fields:
+
+- `Replica_SQL_Running: No` (or `Slave_SQL_Running: No` on MySQL
+  < 8.0.22) — the applier is stopped.
+- `Last_SQL_Error` — the human-readable form of the failure
+  (`Operation ALTER USER failed for 'root'@'%'`).
+- `Exec_Master_Log_Pos` (or `Exec_Source_Log_Pos`) — where the
+  replica stopped. The error message above shows
+  `We stopped at log 'mysql-bin.000002' position 2958981`, which
+  matches.
+- `Relay_Master_Log_File` / `Relay_Source_Log_File` — the relay log
+  the stopped transaction lives in.
+
+The GTID of the failing transaction is the `:20` part of the error
+message (`b11692f4-70d7-11f1-8f40-ceedec70d9b7:20` in the example).
+You'll need it for the GTID-aware skip below.
+
+#### 9.14.2 Fix it
+
+Three options, in order of escalation. The bundled script wraps each
+one with version detection (REPLICA keyword on 8.0.22+, SLAVE on
+older), pre-flight checks (refuses to run on `mysql-0`, refuses to
+operate on a not-Ready pod), and `--dry-run` so you can see the SQL
+before it executes.
+
+**Option A — single-event skip (`sql_replica_skip_counter`).**
+Right for the most common case: the failing transaction is one
+idempotent DDL statement (`ALTER USER`, `CREATE USER`, `GRANT`,
+`DROP`). The replica advances past it without losing any data, then
+resumes streaming from the next event.
+
+```
+./scripts/fix_mysql_repl.sh --pod mysql-1 skip --dry-run   # read first
+./scripts/fix_mysql_repl.sh --pod mysql-1 skip --yes
+```
+
+Under the hood:
+
+```sql
+STOP REPLICA;
+SET GLOBAL sql_replica_skip_counter = 1;
+START REPLICA;
+```
+
+If the failing event is part of a multi-statement transaction and
+`sql_replica_skip_counter = 1` skips too much, use option B.
+
+**Option B — GTID-aware skip.** Inject one empty transaction at the
+offending GTID so the replica's `Executed_Gtid_Set` advances past
+it. Use this when the failing transaction is grouped with other
+statements that should still be applied.
+
+```
+./scripts/fix_mysql_repl.sh --pod mysql-1 skip-gtid \
+    b11692f4-70d7-11f1-8f40-ceedec70d9b7:20 --dry-run
+./scripts/fix_mysql_repl.sh --pod mysql-1 skip-gtid \
+    b11692f4-70d7-11f1-8f40-ceedec70d9b7:20 --yes
+```
+
+Under the hood:
+
+```sql
+STOP REPLICA;
+SET GTID_NEXT='b11692f4-70d7-11f1-8f40-ceedec70d9b7:20';
+BEGIN;
+COMMIT;
+SET GTID_NEXT='AUTOMATIC';
+START REPLICA;
+```
+
+This is the documented "Skipping Transactions With GTIDs" procedure
+in the MySQL refman.
+
+**Option C — reset the channel.** Stop and re-establish the
+replication channel from scratch using the credentials baked into
+the `chatroom-mysql` Secret. The replica keeps its existing datadir
+and replays any binlog events between the last-applied GTID and the
+master's current position. Faster than a full re-clone (no dump-load,
+no PVC drop) — slower than a skip, but bulletproof.
+
+```
+./scripts/fix_mysql_repl.sh --pod mysql-1 reset --dry-run
+./scripts/fix_mysql_repl.sh --pod mysql-1 reset --yes
+```
+
+Use this when skip / skip-gtid loop on the same transaction, or when
+the relay log has been corrupted by repeated partial applies.
+
+#### 9.14.3 Verify
+
+After any of the above, re-run `status` and confirm:
+
+- `Replica_SQL_Running: Yes`
+- `Seconds_Behind_Master: 0` (give it a few seconds — the IO thread
+  has to catch up first; sub-second in steady state)
+- `Last_SQL_Error:` is empty
+
+Then spot-check a row count matches the master:
+
+```
+kubectl -n chatroom exec mysql-0 -- mysql -uroot chatroom_db \
+    -e 'SELECT COUNT(*) AS messages FROM messages'
+kubectl -n chatroom exec mysql-1 -- mysql -uroot chatroom_db \
+    -e 'SELECT COUNT(*) AS messages FROM messages'
+```
+
+#### 9.14.4 If the same transaction keeps failing
+
+If `skip` advances the position but the *next* event is also a
+problem (you'll see a new `Last_SQL_Error` referencing a different
+GTID), the underlying state on the replica is genuinely diverged
+from the master. Common causes:
+
+- A manual `mysql>` session on the replica wrote to a
+  non-`--read-only` table — replicas in this StatefulSet set
+  `--super-read-only=ON`, but that only catches writes via the
+  standard client; `SET sql_log_bin=0` followed by a write still
+  bypasses it. Identify the divergent rows with `pt-table-checksum`
+  or `mysqlcheck` and reconcile by hand, then run `skip` again.
+- The replica's `REPLICATION_PASSWORD` does not match the master —
+  re-render `k8s/secrets.runtime.yaml` (run
+  `./scripts/build_images.sh` so both sides come from the same
+  `app/.env.runtime`) and reset the channel with option C.
+- The replica was bootstrapped from an older snapshot and is missing
+  a schema migration the master has applied. Drop the PVC and let
+  the bootstrap re-clone, per §9.10.1.
+
+#### 9.14.5 Don't confuse with §9.10
+
+§9.10 covers a replica that won't *start* (stuck at `0/1 Ready`,
+CrashLoopBackOff from a bootstrap-time failure, `mysqldump`
+permission errors, etc.) — that flow needs a pod + PVC drop and a
+re-bootstrap. §9.14 here covers a replica that *is* running but the
+applier thread inside mysqld has stopped on a bad binlog event. No
+PVC drop is needed for §9.14.
+
 ---
 
 ## 10. Quick reference
@@ -1925,6 +2101,7 @@ replica pods are `1/1 Ready`. If a replica is stuck at `0/1`, see
 | Tail MySQL master logs | `kubectl -n chatroom logs -f mysql-0` |
 | Tail MySQL replica logs | `kubectl -n chatroom logs -f mysql-1` |
 | Check MySQL replication | `kubectl -n chatroom exec mysql-1 -- mysql -uroot -p"$PW" -e 'SHOW SLAVE STATUS\G'` |
+| Repair a stuck replica SQL thread | `./scripts/fix_mysql_repl.sh --pod mysql-1 status` (then `skip` / `skip-gtid <uuid:tag>` / `reset` — see §9.14) |
 | Tail Redis logs | `kubectl -n chatroom logs -f redis-0` |
 | Check Redis replication | `kubectl -n chatroom exec redis-1 -- redis-cli INFO replication` |
 | List Sentinel masters | `kubectl -n chatroom exec redis-sentinel-0 -- redis-cli -p 26379 sentinel master chatroom-redis` |
