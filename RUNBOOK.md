@@ -14,7 +14,7 @@ can hand it to anyone and they can follow it from a clean clone.
 >
 > **If you built the images elsewhere** (CI, a teammate, or in a
 > registry): run `./scripts/write_runtime_env.sh --from-stdin` and paste
-> the 9 values from `app/.env.runtime` — one per line, in the order
+> the 10 values from `app/.env.runtime` — one per line, in the order
 > documented in §6.5 — then run `./scripts/deploy_k8s.sh`. See §6.5.
 
 ---
@@ -24,12 +24,34 @@ can hand it to anyone and they can follow it from a clean clone.
 | Component | Image | Replicas | Storage | Exposed via |
 | --- | --- | --- | --- | --- |
 | `chatroom-app` (FastAPI + static frontend) | `chat-room-server:latest` | 1 per cluster node (set by `deploy_k8s.sh`) | none | ClusterIP Service `:80` → Ingress |
-| `mysql` (database, schema pre-baked) | `chatroom-mysql:latest` | 1 | 5Gi PVC | ClusterIP Service `:3306` (cluster-internal only) |
+| `mysql` (database, master + read-replicas) | `chatroom-mysql:latest` | 1 per cluster node: 1 master (`mysql-0`) + N-1 read-replicas (`mysql-1..N-1`), joined via GTID-based async replication on first boot | 5Gi RWO PVC per pod | `mysql` ClusterIP Service `:3306` (master only) + `mysql-replica` ClusterIP Service (read-replicas); cluster-internal |
+| `redis` (cache + cross-pod WebSocket fan-out) | `redis:7-alpine` | 1 per cluster node: 1 master (`redis-0`) + N-1 replicas (`redis-1..N-1`), joined via `replicaof` on first boot | 1Gi RWO PVC per pod (AOF) | `chatroom-redis` ClusterIP Service (master only); the app talks to it via Sentinel |
+| `redis-sentinel` (Sentinel monitors the Redis master) | `redis:7-alpine` | `min(3, NODE_COUNT)` — odd quorum | none | `chatroom-redis-sentinel` headless Service (pod DNS); app discovers the master through it |
 | `chatroom` Ingress | — | — | — | routes `chatroom.local/` to the app Service |
 
-The MySQL Service is `ClusterIP` and has no Ingress route, so it is not
-reachable from outside the cluster. The only entry point is the app, via
-the Ingress.
+The MySQL and Redis Services are `ClusterIP` and have no Ingress route, so
+they are not reachable from outside the cluster. The only entry point is
+the app, via the Ingress.
+
+### 1.1 Single-node behavior
+
+On a 1-node cluster (`kind`, `k3d`, `minikube`, dev/CI), the topology
+collapses back to single-pod behavior automatically:
+
+- **MySQL** — one master pod, no replicas. `MYSQL_READ_HOST` defaults
+  to `MYSQL_HOST` in the app, so `app/database.py` uses the same engine
+  for reads and writes. The `mysql-replica` Service has zero endpoints,
+  which is harmless because nothing points at it.
+- **Redis** — one master pod, no replicas, one Sentinel (`quorum=1`).
+  Streams still back the cross-pod broadcast (there is only one pod,
+  so fan-out is a no-op but the durable backlog survives a restart).
+- **Sentinel** — one pod. `sentinel monitor chatroom-redis 1` makes
+  quorum = majority-of-1, so failover works (with no redundancy, but
+  the single Sentinel still detects failure and promotes).
+
+Every gate in the scripts is conditioned on `NODE_COUNT`, so the
+behavior change happens at `NODE_COUNT > 1` without you doing anything
+special.
 
 ---
 
@@ -64,9 +86,16 @@ The scripts work on any conformant k8s cluster that has:
   kubectl get storageclass
   # look for one marked (default)
   ```
-- **A node that can run both images** with the resources requested in
-  `k8s/21-mysql-deployment.yaml` and `k8s/40-app-deployment.yaml` (256Mi
-  memory requested, 1Gi memory limit; 100m–1000m CPU).
+- **A node that can run all four images** with the resources requested
+  in the StatefulSet and Deployment manifests
+  (`k8s/23-mysql-statefulset.yaml`, `k8s/26-redis-statefulset.yaml`,
+  `k8s/28-redis-sentinel-statefulset.yaml`,
+  `k8s/40-app-deployment.yaml`) — 64Mi–128Mi memory on the Sentinels,
+  256Mi memory requested / 1Gi memory limit on MySQL and the app,
+  100m–1000m CPU. On multi-node clusters, StatefulSet PVCs
+  (`ReadWriteOnce`) bind to one node and ride along when the pod
+  reschedules — your cluster must be able to honor RWO volume
+  affinity (the default on every StorageClass).
 - **Network access from the build host to the cluster's API server**
   (typically `https://<api-server>:6443`).
 
@@ -108,7 +137,7 @@ For kind: https://kind.sigs.k8s.io/docs/user/ingress/
 #### 2.3.1 Tuning ingress-nginx and MetalLB for your cluster
 
 `scripts/deploy_k8s.sh` sets `tolerationSeconds: 10` on every pod in
-this stack (Redis, MySQL, chatroom-app) on the standard
+this stack (MySQL, Redis, Redis-Sentinels, chatroom-app) on the standard
 `node.kubernetes.io/unreachable` and `node.kubernetes.io/not-ready`
 NoExecute taints, so when a node goes unhealthy the pods are evicted
 within 10s rather than waiting the k8s default of 300s. **The
@@ -201,10 +230,14 @@ What this does, in order:
 1. Refuses to run if `docker` isn't on `PATH`.
 2. Generates a random URL-safe MySQL root password (no `@:/?#[]%`
    characters, so the value is safe to embed in a SQLAlchemy URL).
-3. Generates a JWT `SECRET_KEY` and a Fernet `ROOM_SECRET_KEY` (Python
-   `secrets` and `cryptography.fernet` respectively).
-4. Writes those three values, plus the algorithm and token-expiry
-   settings, into `app/.env.runtime` with `chmod 600`.
+3. Generates a JWT `SECRET_KEY`, a Fernet `ROOM_SECRET_KEY`, and a
+   `REPLICATION_PASSWORD` (used by MySQL read-replicas to authenticate
+   `CHANGE MASTER TO` against the master) — Python `secrets` and
+   `cryptography.fernet` respectively.
+4. Writes those values, plus the algorithm and token-expiry settings
+   and the read-replica hostname (`MYSQL_READ_HOST=mysql-replica`) and
+   the Redis Sentinel list (`REDIS_SENTINELS`), into
+   `app/.env.runtime` with `chmod 600`.
 5. Prompts for six SMTP settings — `MAIL_HOST`, `MAIL_PORT`, `MAIL_USER`,
    `MAIL_PASSWORD`, `MAIL_FROM`, `MAIL_USE_TLS` — and writes them to
    `app/.env.runtime` next to the secrets. `MAIL_PASSWORD` is read
@@ -212,10 +245,15 @@ What this does, in order:
    invite emails entirely. On a re-run, the previous values are used
    as defaults — pass `--rebuild` to start fresh. See §6.5 for the
    full layout and the local debug-sink path.
-6. Runs `docker build` for the MySQL image, passing the password as a
-   build-arg. The MySQL Dockerfile `sed`s the value into
-   `mysql/init/99-grants.sql`, so on first boot the container pins the
-   root password to that exact value.
+6. Runs `docker build` for the MySQL image, passing `MYSQL_ROOT_PASSWORD`
+   and `REPLICATION_PASSWORD` as build-args. The MySQL Dockerfile
+   `sed`s both values into the init SQL files (root's password into
+   `99-grants.sql`; the `repl`@'%' user's password into
+   `02-replication-user.sql.template`), so on first boot the container
+   pins both credentials to those exact values. The
+   `replication_bootstrap.sh` entrypoint then uses
+   `REPLICATION_PASSWORD` to authenticate `mysqldump` /
+   `CHANGE MASTER TO` on every replica pod.
 7. Runs `docker build` for the app image. **No `.env` is baked in** —
    the app reads config from env at runtime.
 
@@ -350,10 +388,31 @@ What it does, in order:
    no `replicas:` field — see the comment in
    `k8s/40-app-deployment.yaml`. Defaults to 2 if the node count
    can't be determined.
-7. `kubectl rollout status` for both Deployments, with a 5-minute
-   timeout each.
-8. Prints the Ingress address if one was assigned, or a `port-forward`
+7. Scales the three StatefulSets: `statefulset/mysql` and
+   `statefulset/redis` to `NODE_COUNT`, and `statefulset/redis-sentinel`
+   to `min(3, NODE_COUNT)`. Sentinel needs an odd quorum — capping at
+   3 means a 1-node cluster gets one Sentinel with `quorum=1` (works,
+   no failover redundancy) and a 2-node cluster gets two Sentinels
+   (also `quorum=1`, since 2-of-2 is not a majority over 2 nodes).
+   With 3+ nodes the Sentinel count saturates at 3 and the quorum
+   defaults to 2-of-3, which tolerates one Sentinel crash.
+8. `kubectl rollout status` for the three StatefulSets and the
+   Deployment, with a 5-minute timeout each, in this order:
+   MySQL → Redis → Sentinels → app. The order matters because the
+   app's readiness probe will fail on cold start if it can't reach
+   the DB or a Redis master, so the data plane needs to be settled
+   before the app readiness wait starts.
+9. Prints the Ingress address if one was assigned, or a `port-forward`
    hint if not.
+
+> **MySQL replica bootstrap takes a few minutes per replica.** On a
+> cold start, `mysql-1..N-1` run a `mysqldump` of the master followed
+> by `CHANGE MASTER TO ... MASTER_AUTO_POSITION=1; START SLAVE;`. The
+> mysqldump on an empty schema takes ~10 seconds; on a populated one,
+> longer. The 5-minute rollout timeout is generous for a fresh DB
+> and tight enough to surface a stuck replica within a single deploy
+> cycle. If you see `mysql-1` stuck at `0/1 Ready` past that window,
+> see §9.10.
 
 > **Why this changed:** prior to this revision the deploy script wrote
 > the Secrets + ConfigMap imperatively (`kubectl create secret ... |
@@ -369,7 +428,7 @@ What it does, in order:
 > comments at the top of `k8s/10-mysql-secret.yaml` and
 > `k8s/31-app-secret.yaml`.
 
-A successful run ends with something like:
+A successful run on a 3-node cluster ends with something like:
 
 ```
 ============================================================
@@ -380,12 +439,23 @@ Pods:
 NAME                          READY   STATUS    RESTARTS   AGE
 chatroom-app-7f9c...          1/1     Running   0          30s
 chatroom-app-b8a1...          1/1     Running   0          30s
-mysql-7d5e...                 1/1     Running   0          45s
+chatroom-app-c2d4...          1/1     Running   0          30s
+mysql-0                       1/1     Running   0          45s
+mysql-1                       1/1     Running   0          90s
+mysql-2                       1/1     Running   0          120s
+redis-0                       1/1     Running   0          20s
+redis-1                       1/1     Running   0          25s
+redis-2                       1/1     Running   0          25s
+redis-sentinel-0              1/1     Running   0          20s
+redis-sentinel-1              1/1     Running   0          20s
+redis-sentinel-2              1/1     Running   0          20s
 ```
 
-(The two `chatroom-app` pods above are a 2-node cluster. On a
-3-node cluster you'd see three app pods; on kind's default
-1-node cluster, just one. See §6.2 step 7.)
+(The three `chatroom-app` pods above are a 3-node cluster; on a
+2-node cluster you'd see two app pods, two Redis pods, two Sentinels,
+two MySQL pods (1 master + 1 replica); on kind's default 1-node
+cluster, you'd see one of each, one Sentinel, and no MySQL replica.
+See §1.1.)
 
 ### 6.3 Pushing to a registry (managed clusters / multi-node)
 
@@ -470,7 +540,7 @@ them so kubelet actually fetches from Docker Hub.
           imagePullPolicy: IfNotPresent                                     # was: Never
 ```
 
-**`k8s/21-mysql-deployment.yaml`** — same shape:
+**`k8s/23-mysql-statefulset.yaml`** — same shape:
 
 ```
         - name: mysql
@@ -496,7 +566,7 @@ sed -i.bak \
 sed -i.bak \
   -e "s|image: chatroom-mysql:latest|image: docker.io/$DOCKERHUB_USER/chatroom-mysql:$TAG|" \
   -e 's|imagePullPolicy: Never|imagePullPolicy: IfNotPresent|' \
-  k8s/21-mysql-deployment.yaml
+  k8s/23-mysql-statefulset.yaml
 ```
 
 Re-run `./scripts/deploy_k8s.sh` after the edit. The `.bak` files are
@@ -528,7 +598,7 @@ kubectl create secret docker-registry dockerhub-pull \
 ```
 
 Then add to **both** `k8s/40-app-deployment.yaml` and
-`k8s/21-mysql-deployment.yaml`, at the same indentation level as
+`k8s/23-mysql-statefulset.yaml`, at the same indentation level as
 `containers:`:
 
 ```
@@ -586,7 +656,7 @@ The flow is identical — only the hostname and login change. Examples:
   for `docker login`.
 
 In every case, the `image:` line in `k8s/40-app-deployment.yaml` and
-`k8s/21-mysql-deployment.yaml` is the only thing that needs to change
+`k8s/23-mysql-statefulset.yaml` is the only thing that needs to change
 in the k8s manifests.
 
 ### 6.4 `--uninstall`
@@ -661,13 +731,14 @@ specially — implicit TLS — and ignores `MAIL_USE_TLS` for it).
 **If you built the images elsewhere** (CI, a teammate, a registry) and
 the deployment is missing the SMTP values: run
 `./scripts/write_runtime_env.sh --from-stdin` (or `--from-file`) and
-paste the 9 lines from the build host's `app/.env.runtime`, in this
+paste the 10 lines from the build host's `app/.env.runtime`, in this
 order:
 
 ```
 MYSQL_PASSWORD
 SECRET_KEY
 ROOM_SECRET_KEY
+REPLICATION_PASSWORD
 MAIL_PASSWORD
 MAIL_HOST
 MAIL_USER
@@ -677,9 +748,14 @@ MAIL_USE_TLS
 ```
 
 The values are validated as they're read (e.g. `MAIL_PORT` must be
-1–65535, `MAIL_USE_TLS` must be `y`/`n`/`true`/`false`). Empty
-`MAIL_HOST` disables invites; empty `MAIL_PASSWORD`/`MAIL_USER` are
-fine for relays that don't authenticate. The script also writes
+1–65535, `MAIL_USE_TLS` must be `y`/`n`/`true`/`false`, `ROOM_SECRET_KEY`
+must look like a Fernet key, `SECRET_KEY` must be at least 32 chars).
+Empty `MAIL_HOST` disables invites; empty `MAIL_PASSWORD`/`MAIL_USER`
+are fine for relays that don't authenticate. `REPLICATION_PASSWORD` is
+the credential the replica pods use for `mysqldump` / `CHANGE MASTER TO`
+against the master — it's baked into the MySQL image at build time,
+so the value you paste must match what the image was built with, or
+every replica will fail to start (see §9.10). The script also writes
 `k8s/secrets.runtime.yaml` (gitignored) so a bare
 `kubectl apply -f k8s/` from a fresh checkout is enough to push the
 values to the cluster.
@@ -701,13 +777,42 @@ write path.
 
 ```
 kubectl -n chatroom get pods
-# both app pods: Running, 1/1 Ready
-# mysql-0:      Running, 1/1 Ready
+# both app pods:                Running, 1/1 Ready
+# mysql-0 (master):             Running, 1/1 Ready
+# mysql-1..N-1 (replicas):      Running, 1/1 Ready   (multi-node only)
+# redis-0 (master):             Running, 1/1 Ready
+# redis-1..N-1 (replicas):      Running, 1/1 Ready   (multi-node only)
+# redis-sentinel-0..2:          Running, 1/1 Ready   (1 pod on 1-node)
 ```
 
-The MySQL pod takes longer to become Ready than the app pods because it
-runs the schema migrations on first boot. If `mysql-0` stays at `0/1`
-for more than a few minutes, see §9.1.
+The MySQL master pod takes longer to become Ready than the app pods
+because it runs the schema migrations on first boot. The replica pods
+take longer still because each one runs a `mysqldump` of the master
+followed by `CHANGE MASTER TO ... START SLAVE`. If any pod stays at
+`0/1` for more than 5 minutes, see §9.1 (master) or §9.10 (replica).
+
+### 7.1.1 Replication is healthy
+
+On a multi-node cluster, also check that the data tier is actually
+replicating, not just running:
+
+```
+# MySQL: every replica's Seconds_Behind_Master should be 0
+kubectl -n chatroom exec mysql-1 -- mysql -uroot \
+  -p"$(python3 -c 'import urllib.parse; print(urllib.parse.unquote(open(\"app/.env.runtime\").read().split(\"MYSQL_PASSWORD=\",1)[1].split(\"\\n\",1)[0]))')" \
+  -e "SHOW SLAVE STATUS\G" | grep -E 'Slave_IO_Running|Slave_SQL_Running|Seconds_Behind'
+
+# Redis: every replica should show role:slave and master_link_status:up
+kubectl -n chatroom exec redis-1 -- redis-cli INFO replication | \
+    grep -E 'role|master_link_status|master_last_io_seconds_ago'
+
+# Sentinels: master recognized by every Sentinel
+for s in 0 1 2; do
+  kubectl -n chatroom exec redis-sentinel-$s -- \
+    redis-cli -p 26379 sentinel master chatroom-redis
+done
+# look for "ip" matching redis-0's pod IP, "port" 6379, "flags" containing "master"
+```
 
 ### 7.2 `/healthz` works
 
@@ -789,26 +894,46 @@ mount.
 ### 8.1 Rotating the MySQL password
 
 ```
-./scripts/build_images.sh --rebuild    # new MYSQL_PASSWORD, baked into MySQL image
-                                      # and rendered into k8s/secrets.runtime.yaml
+./scripts/build_images.sh --rebuild    # new MYSQL_PASSWORD (and a new
+                                      # REPLICATION_PASSWORD), baked
+                                      # into the MySQL image and rendered
+                                      # into k8s/secrets.runtime.yaml
 docker save chatroom-mysql:latest | <load into cluster>   # see §5
-./scripts/deploy_k8s.sh               # applies the rendered Secret, rolls the Deployments
+./scripts/deploy_k8s.sh               # applies the rendered Secret, rolls
+                                      # the StatefulSets + Deployment
 kubectl -n chatroom delete pod -l app.kubernetes.io/component=mysql   # restart with new image
 # the pod re-runs the schema on the existing PVC; if the password in
 # 99-grants.sql no longer matches the one used at first boot, MySQL
 # may refuse to start. In that case, drop the PVC and re-create it.
 ```
 
-The "drop the PVC" path is destructive — it loses all chat history. To
-keep the data, do a `mysqldump` first, drop the PVC, let MySQL
+`--rebuild` also rotates `REPLICATION_PASSWORD` (the credential the
+read-replica pods use to authenticate `CHANGE MASTER TO`). On a
+multi-node cluster, this means after the rebuild every replica has to
+re-clone from the master — expect the replica rollout to take the
+full 5 minutes per replica on a populated DB.
+
+The "drop the PVC" path is destructive — it loses all chat history
+and resets the cluster back to a single master with no replication.
+To keep the data, do a `mysqldump` first, drop the PVC, let MySQL
 re-initialise, then restore. See §8.2 for the dump.
+
+**Rotating `REPLICATION_PASSWORD` only** (no root-password change) is
+not a one-flag operation today. Because the password is baked into
+the MySQL image at build time, you need a full rebuild + redeploy;
+otherwise the running replicas keep using the old credential and
+new replicas will fail `CHANGE MASTER TO` with an access-denied
+error. Track this as a manual admin task, not a routine operation.
 
 ### 8.2 Backing up the database
 
 From a build host that has the `mysql` client and can reach the cluster:
 
 ```
-# Start a port-forward to the MySQL Service
+# Start a port-forward to the MySQL master Service (port-forwards
+# always land on mysql-0 — the Service selector narrows to that pod
+# specifically, so reads-then-writes to the same port-forward are
+# guaranteed to hit the master, never a replica).
 kubectl -n chatroom port-forward svc/mysql 3306:3306 &
 # Read the password (URL-decoded — see §9.1.2 for why)
 MYSQL_PASSWORD="$(python3 -c "from urllib.parse import unquote; \
@@ -816,11 +941,21 @@ MYSQL_PASSWORD="$(python3 -c "from urllib.parse import unquote; \
 # Dump
 mysqldump -h 127.0.0.1 -P 3306 -u root -p"$MYSQL_PASSWORD" \
     --single-transaction --routines --triggers \
+    --set-gtid-purged=COMMENTED \
     chatroom_db > chatroom-$(date +%Y%m%d).sql
 ```
 
-To restore, point a `mysql` client at the same port-forward and pipe the
-dump in.
+`--set-gtid-purged=COMMENTED` matches what
+`mysql/replication_bootstrap.sh` uses during replica clone — it
+preserves the GTID coordinates in the dump's metadata without writing
+a `SET @@GLOBAL.GTID_PURGED=...` statement that would conflict with
+the master's GTID set on restore. The dumped file is safe to load
+into a fresh master or a replica.
+
+To restore, point a `mysql` client at the same port-forward and pipe
+the dump in. To restore into a specific replica for verification
+(use the `mysql-replica` Service), point at
+`svc/mysql-replica:3306` instead.
 
 ### 8.3 Updating the app after a code change
 
@@ -853,7 +988,11 @@ kubectl -n chatroom exec -i mysql-0 -- mysql -uroot -p"$MYSQL_PASSWORD" chatroom
 ```
 
 (`-i` instead of `-it` so stdin isn't a TTY and the heredoc pipes in
-cleanly. The password is URL-decoded — see §9.1.2.)
+cleanly. The password is URL-decoded — see §9.1.2. Always run schema
+migrations against `mysql-0` (the master) — every replica picks up the
+change via replication, so a single command reaches the whole cluster.
+Running DDL on a replica is a no-op for the master's binlog and will
+silently drift the replica from the master.)
 
 (Or use Alembic / a proper migration tool — out of scope for this
 project.)
@@ -873,6 +1012,17 @@ There are four common reasons to want a restart, and they have different
 "right answers" — picking the wrong one either causes downtime or leaves
 the cluster in the same state as before.
 
+> **StatefulSet nuance:** MySQL, Redis, and Redis-Sentinels are
+> StatefulSets, not Deployments. `rollout restart statefulset/...`
+> works the same way (rolling update by ordinal, with the StatefulSet's
+> `updateStrategy.rollingUpdate.partition: 0` for full replacement),
+> but the order matters more: each pod restarts serially, and the
+> replica pods re-clone from the master on cold start (see §9.10), so a
+> `rollout restart` on a populated DB takes several minutes.
+> `kubectl delete pod <name>` is the cheaper form for a single pod —
+> the StatefulSet controller re-creates it on the same node with the
+> same PVC, and the replica's `CHANGE MASTER TO` reconnects in seconds.
+
 #### 8.6.1 Pick a new image (you rebuilt `build_images.sh`)
 
 After `./scripts/build_images.sh`, the cluster's local Docker daemon has
@@ -881,25 +1031,32 @@ the new image, but the running pods are still running the old one
 the new image is picked up:
 
 ```
-kubectl -n chatroom rollout restart deploy/mysql
-kubectl -n chatroom rollout restart deploy/chatroom-app
-kubectl -n chatroom rollout status deploy/mysql --timeout=2m
-kubectl -n chatroom rollout status deploy/chatroom-app --timeout=3m
+kubectl -n chatroom rollout restart statefulset/mysql
+kubectl -n chatroom rollout restart statefulset/redis
+kubectl -n chatroom rollout restart statefulset/redis-sentinel
+kubectl -n chatroom rollout restart deployment/chatroom-app
+kubectl -n chatroom rollout status statefulset/mysql --timeout=10m
+kubectl -n chatroom rollout status statefulset/redis --timeout=3m
+kubectl -n chatroom rollout status statefulset/redis-sentinel --timeout=3m
+kubectl -n chatroom rollout status deployment/chatroom-app --timeout=3m
 ```
 
 `rollout restart` issues a rolling update — the app Deployment has
 replicas set to one per cluster node (configured by `deploy_k8s.sh`,
 see §6.2) + `maxUnavailable: 0` + `maxSurge: 1`, so traffic stays served
 throughout (old pod only stops accepting connections once the new pod
-is `Ready`). The MySQL Deployment is single-replica so expect a brief
-gap of a few seconds while it comes back up.
+is `Ready`). The MySQL and Redis StatefulSets update one pod at a time
+in ordinal order (master first, then replicas), so the master is
+already on the new image before any replica re-clones. The timeout
+on the MySQL rollout is bumped to 10m because every replica re-runs
+`mysqldump` against the new master; on a populated DB this is the slow
+step.
 
-For the MySQL pod specifically, an equivalent (and slightly cheaper)
-form is just to delete the pod — the ReplicaSet controller re-creates
-it immediately, picking up the new image:
+For a single-pod restart (cheaper):
 
 ```
-kubectl -n chatroom delete pod -l app.kubernetes.io/component=mysql
+kubectl -n chatroom delete pod mysql-0    # StatefulSet recreates it on the same node
+kubectl -n chatroom delete pod redis-0
 ```
 
 Either form is fine. Use whichever you can type faster.
@@ -909,16 +1066,20 @@ Either form is fine. Use whichever you can type faster.
 ConfigMaps and Secrets are mounted into the pod at start; changing the
 resource does **not** restart the pod automatically. The app pod
 mounts the chatroom-app Secret as env vars (`envFrom: secretRef`), so
-env changes also need a restart to take effect. Same commands as 8.6.1:
+env changes also need a restart to take effect. The MySQL pod reads
+`MYSQL_ROOT_PASSWORD` and `REPLICATION_PASSWORD` from the Secret at
+start, so a Secret rotation also needs a restart. Same commands as 8.6.1:
 
 ```
-kubectl -n chatroom rollout restart deploy/chatroom-app
-kubectl -n chatroom rollout status deploy/chatroom-app --timeout=3m
+kubectl -n chatroom rollout restart statefulset/mysql
+kubectl -n chatroom rollout restart deployment/chatroom-app
+kubectl -n chatroom rollout status statefulset/mysql --timeout=10m
+kubectl -n chatroom rollout status deployment/chatroom-app --timeout=3m
 ```
 
 For Secrets only (no code change), you can also use
 `scripts/deploy_k8s.sh` — it re-applies `k8s/secrets.runtime.yaml`
-and rolls the Deployment so the new values are read.
+and rolls the StatefulSet + Deployment so the new values are read.
 
 #### 8.6.3 A pod is wedged (CrashLoopBackOff, hung, OOM-killed)
 
@@ -936,22 +1097,33 @@ clearly a transient runtime state issue), restart just that component:
 
 ```
 kubectl -n chatroom delete pod -l app.kubernetes.io/component=app
-# ReplicaSet creates a new one. Both replicas are replaced, but with
+# ReplicaSet creates a new one. All replicas are replaced, but with
 # maxUnavailable=0 the Service keeps serving throughout.
+```
+
+For a single StatefulSet pod (cheaper than a full rollout):
+
+```
+kubectl -n chatroom delete pod mysql-0
+# StatefulSet recreates it on the same node with the same PVC
+# attached. The pod's datadir is preserved.
 ```
 
 #### 8.6.4 Quick "bounce everything"
 
 ```
-kubectl -n chatroom rollout restart deploy/mysql
-kubectl -n chatroom rollout restart deploy/chatroom-app
+kubectl -n chatroom rollout restart statefulset/mysql
+kubectl -n chatroom rollout restart statefulset/redis
+kubectl -n chatroom rollout restart statefulset/redis-sentinel
+kubectl -n chatroom rollout restart deployment/chatroom-app
 ```
 
 Use this when you've changed cluster-wide infra (e.g. updated the
 Ingress controller, rotated the MySQL root password via 8.1 and want
-both pods to come up cleanly with the new Secret). Order matters:
-restart MySQL first so the app pods can reconnect to it once they
-come back up.
+the pods to come up cleanly with the new Secret). Order matters:
+restart MySQL first, then Redis and Sentinels (Sentinels reconnect
+to the new master automatically), then the app — the app pods can
+only reconnect to MySQL and Redis once both are up.
 
 #### 8.6.5 What's safe to skip
 
@@ -959,9 +1131,13 @@ come back up.
   the Deployment and (without `--cascade=orphan`) the ReplicaSet and
   Pods, leaving the cluster without the app until you re-apply the
   manifests. Use only for §8.5 teardown.
+- `kubectl delete statefulset/...` is even worse — it tears down
+  every pod **and** its PVC, which loses the database contents.
+  Always restart via `rollout restart` or `kubectl delete pod <name>`.
 - `kubectl drain` / `kubectl cordon` are for node maintenance, not
   pod restart. They evict pods to a different node, which is the
-  wrong tool here.
+  wrong tool here (a drained StatefulSet pod's PVC has to be
+  re-attached to the new node, which works but is slow).
 
 ---
 
@@ -983,22 +1159,25 @@ Common causes, in order of likelihood:
   the current `99-grants.sql` is trying to set. The fastest fix is to
   drop the PVC and let MySQL re-initialise (loses data):
   ```
-  kubectl -n chatroom delete pvc chatroom-mysql-data
-  kubectl -n chatroom delete pod -l app.kubernetes.io/component=mysql
+  kubectl -n chatroom delete pvc chatroom-mysql-data-mysql-0
+  kubectl -n chatroom delete pod mysql-0
   ```
+  Note the PVC name has the StatefulSet pod suffix (`-mysql-0`); the
+  old `chatroom-mysql-data` name from the singleton Deployment is
+  no longer used.
 - **The image on the node is stale.** Re-load it (§5) and restart the
   pod:
   ```
-  kubectl -n chatroom delete pod -l app.kubernetes.io/component=mysql
+  kubectl -n chatroom delete pod mysql-0
   ```
 - **No default StorageClass.** `kubectl get storageclass` shows none
   marked `(default)`. Either mark one as default or set
-  `storageClassName:` in `k8s/20-mysql-pvc.yaml`.
+  `storageClassName:` in `k8s/23-mysql-statefulset.yaml`.
 
 ### 9.1.1 `kubectl exec ... -- mysql` fails: `exec: " ": executable file not found in $PATH`
 
 ```
-kubectl -n chatroom exec -it deploy/mysql -- \
+kubectl -n chatroom exec -it mysql-0 -- \
     mysql -u root -p$(awk '/^MYSQL_ROOT_PASSWORD=/{print $2}' app/.env.runtime)
 # error: ... exec failed: ... exec: " ": executable file not found in $PATH
 # Command 'mysql' not found, but can be installed with:
@@ -1057,7 +1236,7 @@ Service name as the host so you don't need a port-forward):
 PW=$(python3 -c "from urllib.parse import unquote; \
   print(unquote([l.split('=',1)[1].strip() for l in open('app/.env.runtime') \
                  if l.startswith('MYSQL_PASSWORD=')][0]))")
-kubectl -n chatroom exec -it deploy/mysql -- mysql -u root -p"$PW" chatroom_db
+kubectl -n chatroom exec -it mysql-0 -- mysql -u root -p"$PW" chatroom_db
 ```
 
 Or use the same port-forward pattern as §8.2, but URL-decode the
@@ -1140,7 +1319,7 @@ APP_PW_DECODED=$(printf '%s' "$APP_PW" | python3 -c 'import sys, urllib.parse; p
 # Try logging in. If THIS works, MySQL accepts the app's password —
 # the problem is the wrong app replica pointing at the wrong pod (rare;
 # skip to step 4). If this fails too, the password is genuinely wrong.
-kubectl -n chatroom exec -it deploy/mysql -- \
+kubectl -n chatroom exec -it mysql-0 -- \
     mysql -u root -p"$APP_PW_DECODED" chatroom_db -e "SELECT 1;"
 ```
 
@@ -1183,10 +1362,10 @@ without the image being rebuilt. Force a full rotation:
 ```
 ./scripts/build_images.sh --rebuild    # generates a new password, bakes it into a new image,
                                           # renders the matching Secret into k8s/secrets.runtime.yaml
-./scripts/deploy_k8s.sh                # applies the rendered manifest, rolls both Deployments
+./scripts/deploy_k8s.sh                # applies the rendered manifest, rolls both StatefulSets
 kind load docker-image chatroom-mysql:latest   # or k3d / minikube equivalent
-kubectl -n chatroom delete pod -l app.kubernetes.io/component=mysql   # pick up the new image
-kubectl -n chatroom rollout status deploy/mysql --timeout=2m
+kubectl -n chatroom delete pod mysql-0   # pick up the new image
+kubectl -n chatroom rollout status statefulset/mysql --timeout=10m
 ```
 
 **Why "update the MySQL pod's password" is the wrong instinct.** You
@@ -1329,6 +1508,149 @@ If the Secret exists but the pull still fails with `unauthorized`, the
 stored token has expired — re-run the `kubectl create secret
 docker-registry` command with a fresh personal-access token.
 
+### 9.10 MySQL replica pods stuck at `0/1 Ready`
+
+Symptoms: on a multi-node cluster, `mysql-0` (the master) is `1/1 Ready`
+but `mysql-1..N-1` (the replicas) sit at `0/1` past the 5-minute
+rollout timeout. Logs:
+
+```
+kubectl -n chatroom logs mysql-1
+```
+
+Common causes:
+
+- **`ERROR 1045 (28000): Access denied for user 'repl'@'...'` during
+  `mysqldump`.** The replica's `REPLICATION_PASSWORD` (in the
+  `chatroom-mysql` Secret) does not match the `repl`@'%' user's
+  password baked into the master's `02-replication-user.sql`. The
+  most common cause: a previous `build_images.sh --rebuild` on a
+  different machine, or the rendered `k8s/secrets.runtime.yaml` is
+  stale relative to the running MySQL image. Fix by re-running
+  build + deploy together so both come from the same
+  `app/.env.runtime`:
+
+  ```
+  ./scripts/build_images.sh
+  ./scripts/deploy_k8s.sh
+  kind load docker-image chatroom-mysql:latest   # or k3d / minikube equivalent
+  kubectl -n chatroom rollout restart statefulset/mysql --timeout=10m
+  ```
+
+  Compare the values the same way you would for §9.1.3 — extract
+  `REPLICATION_PASSWORD` from the cluster Secret and from
+  `app/.env.runtime`, both should be identical URL-encoded forms.
+
+- **Replica bootstrap hangs on `mysqldump` past 5 minutes.** On a
+  populated master the dump can take longer than the rollout timeout.
+  Check whether the dump is making progress:
+
+  ```
+  kubectl -n chatroom logs -f mysql-1 | grep -E 'mysqldump|CHANGE MASTER|START SLAVE'
+  ```
+
+  If the dump is still running, wait it out; if it's stuck on a
+  particular table, the master may be under load — try again when
+  the cluster is idle.
+
+- **`Slave_IO_Running: Connecting` after a clean start.** Replicas
+  log this transiently when the master is still initializing. It
+  should resolve within a few seconds. If it persists, the
+  `MASTER_HOST` (the master's headless-service DNS name) may not be
+  resolvable from inside the pod — `kubectl -n chatroom exec mysql-1
+  -- nslookup mysql-0.mysql-headless` should return the master's
+  pod IP.
+
+- **`Seconds_Behind_Master: NULL`.** This is normal during the first
+  few seconds of a fresh replica (no events to apply yet). It should
+  resolve to `0` once the dump is loaded and replication catches up.
+  If it stays `NULL` for more than a minute, the replica's I/O thread
+  is not making progress — check `Last_IO_Error` in `SHOW SLAVE
+  STATUS\G` for the underlying error.
+
+### 9.11 `redis-1` shows `role:master` instead of `role:slave`
+
+Symptom: every Redis pod thinks it's the master. The wrapper
+entrypoint in `k8s/26-redis-statefulset.yaml` decides master vs.
+replica from the pod's hostname (`redis-0` → master, anything else
+→ `replicaof redis-0.redis-headless 6379`). If the pod's name does
+not match the StatefulSet's ordinal, the script falls through to
+the master path.
+
+Check:
+
+```
+kubectl -n chatroom get pods -l app.kubernetes.io/component=redis -o name
+# should be pod/redis-0, pod/redis-1, ..., pod/redis-N
+```
+
+If the names are not in the `redis-N` shape, the StatefulSet's
+`serviceName: redis-headless` is not matching — verify
+`k8s/27-redis-headless-service.yaml` is applied and that the
+StatefulSet's `spec.serviceName` still references it.
+
+### 9.12 `chatroom-app` can't reach Redis through Sentinel
+
+Symptom: app pod logs show `redis.exceptions.ConnectionError` or
+`MasterNotFoundError` from `app/redis_bus.py` and falls back to
+single-pod mode (cross-pod WS broadcasts are lost, but local
+broadcasts still work).
+
+```
+kubectl -n chatroom logs -f chatroom-app-xxx | grep -E 'Sentinel|chatroom-redis'
+```
+
+Common causes:
+
+- **`No sentinels available` from the app.** The app's
+  `REDIS_SENTINELS` env (in the chatroom-app ConfigMap) is empty or
+  points at the wrong hostnames. Verify:
+
+  ```
+  kubectl -n chatroom get configmap chatroom-app -o yaml | grep REDIS_SENTINELS
+  # should list all three redis-sentinel pods at port 26379,
+  # comma-separated, e.g. "redis-sentinel-0.chatroom-redis-sentinel:26379,..."
+  ```
+
+  If empty, re-run `./scripts/build_images.sh` to re-render the
+  ConfigMap — the value is generated from the StatefulSet's pod DNS
+  names.
+
+- **All Sentinels log `+sdown master chatroom-redis`.** Sentinel
+  itself is up but cannot see the master. Verify `redis-0` is
+  `1/1 Ready` and that the `chatroom-redis` Service has endpoints:
+
+  ```
+  kubectl -n chatroom get endpoints chatroom-redis
+  # should list redis-0's pod IP at port 6379
+  ```
+
+  If empty, the `role=master` label on `redis-0` is missing or the
+  Service selector is wrong — see `k8s/29-redis-service.yaml`.
+
+- **Failover happened and the app didn't reconnect.** Sentinel
+  promotes a new master and updates its config; the
+  `redis.asyncio.sentinel.Sentinel` client in the app should pick
+  up the new master on its next call. If it doesn't, restart the
+  app pods:
+
+  ```
+  kubectl -n chatroom rollout restart deployment/chatroom-app
+  ```
+
+### 9.13 `mysql-replica` Service has no endpoints
+
+Symptom: `kubectl -n chatroom get endpoints mysql-replica` returns
+`<none>`. This is **expected on 1-node clusters** — there are no
+replicas, so the Service has no backing pods. The app detects this
+via `MYSQL_READ_HOST` defaulting to `MYSQL_HOST` when the values
+are equal, and uses the same engine for reads and writes. No
+action needed.
+
+On a multi-node cluster, the Service has endpoints only when the
+replica pods are `1/1 Ready`. If a replica is stuck at `0/1`, see
+§9.10.
+
 ---
 
 ## 10. Quick reference
@@ -1336,7 +1658,7 @@ docker-registry` command with a fresh personal-access token.
 | Task | Command |
 | --- | --- |
 | Build images | `./scripts/build_images.sh` |
-| Rebuild with fresh MySQL password | `./scripts/build_images.sh --rebuild` |
+| Rebuild with fresh MySQL + replication password | `./scripts/build_images.sh --rebuild` |
 | Build without cache | `./scripts/build_images.sh --no-cache` |
 | Load into kind | `kind load docker-image chat-room-server:latest chatroom-mysql:latest` |
 | Load into k3d | `k3d image import chat-room-server:latest chatroom-mysql:latest -c <cluster>` |
@@ -1347,8 +1669,15 @@ docker-registry` command with a fresh personal-access token.
 | Deploy | `./scripts/deploy_k8s.sh` |
 | Check pod status | `kubectl -n chatroom get pods` |
 | Tail app logs | `kubectl -n chatroom logs -f -l app.kubernetes.io/component=app` |
-| Tail MySQL logs | `kubectl -n chatroom logs -f mysql-0` |
+| Tail MySQL master logs | `kubectl -n chatroom logs -f mysql-0` |
+| Tail MySQL replica logs | `kubectl -n chatroom logs -f mysql-1` |
+| Check MySQL replication | `kubectl -n chatroom exec mysql-1 -- mysql -uroot -p"$PW" -e 'SHOW SLAVE STATUS\G'` |
+| Tail Redis logs | `kubectl -n chatroom logs -f redis-0` |
+| Check Redis replication | `kubectl -n chatroom exec redis-1 -- redis-cli INFO replication` |
+| List Sentinel masters | `kubectl -n chatroom exec redis-sentinel-0 -- redis-cli -p 26379 sentinel master chatroom-redis` |
 | Port-forward to app | `kubectl -n chatroom port-forward svc/chatroom-app 8000:80` |
+| Port-forward to MySQL master | `kubectl -n chatroom port-forward svc/mysql 3306:3306` |
 | Health check | `curl -s http://localhost:8000/healthz` |
 | Roll out a new app image | `kubectl -n chatroom rollout restart deployment/chatroom-app` |
+| Roll out a new MySQL image | `kubectl -n chatroom rollout restart statefulset/mysql` |
 | Uninstall (data-loss) | `./scripts/deploy_k8s.sh --uninstall` |
