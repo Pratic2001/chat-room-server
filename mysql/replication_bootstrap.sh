@@ -244,6 +244,34 @@ if ! mysqldump \
 fi
 log "Dump-load complete."
 
+# Register the auth_socket plugin if it isn't loaded yet. The
+# /usr/lib/mysql/plugin/auth_socket.so shared object is bundled in the
+# mysql:8.0-debian base image but is NOT registered in the mysql.plugin
+# table by --initialize-insecure — so on a freshly-initialized replica
+# the plugin is unknown to the server and a direct
+# `ALTER USER ... IDENTIFIED WITH auth_socket` fails with
+# `ERROR 1524 (HY000): Plugin 'auth_socket' is not loaded`.
+#
+# INSTALL PLUGIN has no IF NOT EXISTS form (a re-INSTALL errors with
+# ERROR 1968), and this script is meant to be re-runnable on rescheduled
+# replicas, so guard the install with a SELECT against
+# INFORMATION_SCHEMA.PLUGINS — the same table the server itself reads
+# when resolving `IDENTIFIED WITH <plugin>` lookups.
+#
+# After the dump-load above, the local mysql.plugin was overwritten by
+# the master's row, which registers auth_socket as ACTIVE (the master
+# runs the same plugin via its own 99-grants.sql path / app connections).
+# So on a normal clone the guard short-circuits and we skip the install.
+# On a fresh `--initialize-insecure` without a dump (defensive only —
+# shouldn't happen with the current topology) the guard fires.
+if ! mysql --user=root --socket=/var/run/mysqld/mysqld.sock -Nse \
+        "SELECT 1 FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='auth_socket' AND PLUGIN_STATUS='ACTIVE'" \
+        | grep -q '^1$'; then
+    log "Installing auth_socket plugin (not registered on this server)..."
+    mysql --user=root --socket=/var/run/mysqld/mysqld.sock \
+        -e "INSTALL PLUGIN auth_socket SONAME 'auth_socket.so'"
+fi
+
 # After the dump, root@localhost on this replica has been overwritten by
 # the master's `mysql.user` rows — which use `caching_sha2_password` (the
 # MySQL 8 default) with a hash of the master's MYSQL_ROOT_PASSWORD. That
@@ -259,6 +287,11 @@ log "Dump-load complete."
 # init. This script runs as root throughout (gosu drops to the mysql user
 # only for the mysqld processes, never for the mysql client), so
 # auth_socket is correct here.
+#
+# Prerequisite: the plugin must be registered before this ALTER USER runs
+# — see the INFORMATION_SCHEMA.PLUGINS guard immediately above. On the
+# mysql:8.0-debian base the .so is at /usr/lib/mysql/plugin/, so the
+# install always succeeds; the guard just makes the step idempotent.
 #
 # We use the same dump-time mysql --user=root --socket=… (no password)
 # connection that the dump-load just used, so no password roundtrip is
