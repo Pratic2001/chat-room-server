@@ -51,7 +51,8 @@ collapses back to single-pod behavior automatically:
 
 Every gate in the scripts is conditioned on `NODE_COUNT`, so the
 behavior change happens at `NODE_COUNT > 1` without you doing anything
-special.
+special. To enable replica reads on a multi-node cluster (offload
+`SELECT` traffic from the master), see §6.6.
 
 ---
 
@@ -763,11 +764,132 @@ values to the cluster.
 **Rotating `MAIL_PASSWORD` only.** Edit `app/.env.runtime` in place,
 then re-run `./scripts/deploy_k8s.sh` (it reads the file and rewrites
 the Secret imperatively) and
-`kubectl -n chatroom rollout restart deploy/chatroom-app`. No rebuild
+`kubectl -n chatroom rollout restart deployment/chatroom-app`. No rebuild
 needed — the app reads env at start. There's no separate
 `change_mail_password.sh`; if you'd rather script the rotation,
 `scripts/write_runtime_env.sh --from-file <file>` is the canonical
 write path.
+
+### 6.6 Enabling MySQL read-replicas (multi-node clusters)
+
+The MySQL StatefulSet runs 1 master (`mysql-0`) + N-1 read-replicas
+(`mysql-1..N-1`), and the read-only endpoints (`GET /messages/{room_id}/messages`,
+`GET /rooms/my`) can route to the replicas instead of the master. This
+offloads `SELECT` traffic from the master and gives you horizontal
+read scaling. **It's only worth doing on a multi-node cluster** — on a
+1-node cluster there are no replicas, so the `mysql-replica` Service
+has zero endpoints and the app falls back to the master anyway.
+
+**Default behavior.** On a fresh build, `app/.env.runtime` has
+`MYSQL_READ_HOST=` (empty), and `app/database.py` falls back to
+`MYSQL_HOST=mysql` for reads. That works — it's just a single endpoint.
+To enable replica reads, set `MYSQL_READ_HOST=mysql-replica` (the name
+of the ClusterIP Service in `k8s/24-mysql-replica-service.yaml`, which
+selects on the `role=replica` label).
+
+#### 6.6.1 Set it on a fresh cluster
+
+```
+# Either export it in your shell before running build_images.sh:
+export MYSQL_READ_HOST=mysql-replica
+./scripts/build_images.sh    # picks it up, persists it into app/.env.runtime
+
+# ...or edit app/.env.runtime after the first build, before deploy:
+echo 'MYSQL_READ_HOST=mysql-replica' >> app/.env.runtime
+./scripts/deploy_k8s.sh      # re-renders k8s/secrets.runtime.yaml
+```
+
+Both paths land the value in `chatroom-app`'s ConfigMap as
+`MYSQL_READ_HOST`, which `app/database.py` reads at startup. The
+`get_read_db()` dependency then issues `SELECT` queries against
+`mysql-replica`, which load-balances across every `1/1 Ready` replica.
+
+#### 6.6.2 Set it on an existing cluster (no rebuild)
+
+You don't need to rebuild the image just to flip this — the value is
+in the ConfigMap, not baked into the image. Edit `app/.env.runtime`
+to add or change the line, re-run `build_images.sh` (which is
+idempotent and re-renders the ConfigMap), then deploy:
+
+```
+# 1. Edit in place
+echo 'MYSQL_READ_HOST=mysql-replica' >> app/.env.runtime
+
+# 2. Re-render the rendered manifest (no rebuild, no image changes)
+./scripts/build_images.sh    # idempotent: reuses existing passwords
+#   ↑ this rewrites k8s/secrets.runtime.yaml with the new MYSQL_READ_HOST
+
+# 3. Apply and roll the app pods so they pick up the new ConfigMap
+./scripts/deploy_k8s.sh
+```
+
+`deploy_k8s.sh` always calls `kubectl rollout restart deployment/chatroom-app`
+after applying manifests, so the change is picked up within a few seconds.
+
+#### 6.6.3 Verify replica reads are landing on the replicas
+
+The simplest end-to-end check: watch MySQL's processlist on the master
+and replicas while you hit the read endpoints.
+
+```
+# On the master: count SELECTs originating from the app's connections
+kubectl -n chatroom exec mysql-0 -- mysql -uroot \
+  -p"$(python3 -c 'import urllib.parse; print(urllib.parse.unquote(open("app/.env.runtime").read().split("MYSQL_PASSWORD=",1)[1].split(chr(10),1)[0]))')" \
+  -e "SHOW PROCESSLIST" | grep -c SELECT
+# (this is non-zero because the master itself runs occasional SELECTs
+# for change-master checks; the important comparison is across time)
+
+# On a replica: the same query should now also be non-zero
+kubectl -n chatroom exec mysql-1 -- mysql -uroot \
+  -p"$(python3 -c 'import urllib.parse; print(urllib.parse.unquote(open("app/.env.runtime").read().split("MYSQL_PASSWORD=",1)[1].split(chr(10),1)[0]))')" \
+  -e "SHOW PROCESSLIST" | grep -c SELECT
+```
+
+Then in another terminal, hit the read endpoint:
+
+```
+curl -s http://localhost:8000/messages/1/messages -H "Authorization: Bearer $TOKEN"
+# ↑ if MYSQL_READ_HOST is wired correctly, the SELECT appears in
+#   mysql-1..N-1's processlist, not in mysql-0's
+```
+
+You should also see the replica's `Questions` counter rise
+(`SHOW GLOBAL STATUS LIKE 'Questions';`), which it does not when reads
+are routed to the master.
+
+#### 6.6.4 What does NOT need to change
+
+- **`MYSQL_HOST`** stays `mysql` (the master-only Service in
+  `k8s/22-mysql-service.yaml`). Writes, schema migrations, and the
+  replication handshake all flow through the master Service and
+  must not be re-pointed at the replicas.
+- **The `REPLICATION_PASSWORD` Secret** stays unchanged — that's the
+  credential the replicas use to authenticate `CHANGE MASTER TO`
+  against the master, baked into the MySQL image at build time.
+- **The app's connection pool** doesn't need tuning. Each app pod
+  has two engines (write + read); the read engine's pool fills on
+  first use and stays warm. With 3 replicas and 3 app pods, expect
+  ~9 active connections per replica (the SQLAlchemy default pool size
+  is 5 plus an overflow buffer).
+
+#### 6.6.5 Caveats
+
+- **Read-after-write lag.** A `POST /messages` writes to the master;
+  the replica picks it up via replication within a few hundred ms.
+  An immediate `GET /messages/{room_id}/messages` from the same user
+  may not see the new message yet. The chat UI already dedupes WS
+  broadcasts against HTTP responses by message id (see CLAUDE.md), so
+  users don't see their own messages "lost", but two browsers on
+  different pods may briefly disagree about the latest message in a
+  fast-moving conversation. If you need strict read-after-write,
+  set `MYSQL_READ_HOST=mysql` (the master) — or wait for replication
+  to catch up before serving reads.
+- **Empty `mysql-replica` Service on 1-node clusters.** If you set
+  `MYSQL_READ_HOST=mysql-replica` on a 1-node cluster (where there
+  are no replicas), the read engine fails to connect and the app
+  crashes on startup. Always check that `kubectl -n chatroom get
+  endpoints mysql-replica` returns at least one IP before setting
+  this. See §9.13.
 
 ---
 
@@ -1677,6 +1799,7 @@ replica pods are `1/1 Ready`. If a replica is stuck at `0/1`, see
 | List Sentinel masters | `kubectl -n chatroom exec redis-sentinel-0 -- redis-cli -p 26379 sentinel master chatroom-redis` |
 | Port-forward to app | `kubectl -n chatroom port-forward svc/chatroom-app 8000:80` |
 | Port-forward to MySQL master | `kubectl -n chatroom port-forward svc/mysql 3306:3306` |
+| Enable replica reads (multi-node) | `echo 'MYSQL_READ_HOST=mysql-replica' >> app/.env.runtime && ./scripts/build_images.sh && ./scripts/deploy_k8s.sh` |
 | Health check | `curl -s http://localhost:8000/healthz` |
 | Roll out a new app image | `kubectl -n chatroom rollout restart deployment/chatroom-app` |
 | Roll out a new MySQL image | `kubectl -n chatroom rollout restart statefulset/mysql` |

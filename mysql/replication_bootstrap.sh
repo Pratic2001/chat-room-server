@@ -87,6 +87,8 @@ if [[ -z "$POD_NAME_VALUE" ]]; then
 fi
 if [[ "$POD_NAME_VALUE" == "mysql-0" ]]; then
     MYSQL_ROLE="master"
+    DERIVED_SERVER_ID="$((100 + 0))"
+    SERVER_ID="${MYSQL_SERVER_ID:-$DERIVED_SERVER_ID}"
 elif [[ "$POD_NAME_VALUE" =~ ^mysql-([0-9]+)$ ]]; then
     MYSQL_ROLE="replica"
     DERIVED_SERVER_ID="$((100 + ${BASH_REMATCH[1]}))"
@@ -95,6 +97,7 @@ else
     # Standalone `docker run` (no StatefulSet hostname). Treat as master
     # with the default server-id — useful for local debugging.
     MYSQL_ROLE="${MYSQL_ROLE:-master}"
+    SERVER_ID="${MYSQL_SERVER_ID:-1}"
 fi
 log "Derived MYSQL_ROLE=${MYSQL_ROLE}, SERVER_ID=${SERVER_ID} from POD_NAME=${POD_NAME_VALUE}"
 export MYSQL_ROLE SERVER_ID
@@ -106,10 +109,6 @@ MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD env var is requi
 # Datadir inside the container — must match the official image's default
 # and the volumeMount in the StatefulSet pod template.
 DATADIR="${MYSQL_DATADIR:-/var/lib/mysql}"
-# Server-id for this pod. The role-derivation block above may have set
-# it from the pod ordinal (100 + ordinal); if not, default to 1 for a
-# standalone `docker run` (no StatefulSet hostname).
-: "${SERVER_ID:=${MYSQL_SERVER_ID:-1}}"
 
 # Master path: delegate to the official entrypoint with --server-id
 # prepended so the master's server-id is unique in the cluster. The
