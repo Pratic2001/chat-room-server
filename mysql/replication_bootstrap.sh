@@ -225,6 +225,13 @@ done
 # below restores that same auth_socket shortcut for every subsequent
 # local mysql call in this script.
 log "Cloning master via mysqldump..."
+# --no-tablespaces: skip tablespace metadata. The 'repl'@'%' user only
+# has REPLICATION SLAVE — mysqldump's tablespaces branch additionally
+# requires the PROCESS privilege and aborts with
+# "Access denied; you need (at least one of) the PROCESS privilege(s)
+# for this operation" when it's missing. We don't need the tablespace
+# info for logical replication (it's only used by the offline
+# `--clone` transport), so dropping the flag is the right fix.
 if ! mysqldump \
     --host="${MYSQL_MASTER_HOST}" \
     --port="${MYSQL_MASTER_PORT}" \
@@ -239,6 +246,7 @@ if ! mysqldump \
     --hex-blob \
     --default-character-set=utf8mb4 \
     --column-statistics=0 \
+    --no-tablespaces \
     | mysql --user=root --socket=/var/run/mysqld/mysqld.sock; then
     fail "Initial dump-load failed; check that the master is healthy and credentials match."
 fi

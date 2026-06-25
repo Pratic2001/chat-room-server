@@ -108,8 +108,14 @@ load_or_generate_runtime_secrets() {
             # NOT abort the build — the MySQL image's 02-replication-user
             # sql needs this, so it's effectively required, but we
             # generate instead of failing so existing deploys keep working.
+            #
+            # MySQL 8 rejects CREATE USER with a password longer than 32
+            # bytes (ERROR 3056). generate_url_safe_password can produce
+            # ~43 chars after the URL-special strip, so cap the replica
+            # password here. The other secrets (MySQL root, JWT, Fernet)
+            # have no such limit and keep their full length.
             if [[ -z "${REPLICATION_PASSWORD-}" ]]; then
-                REPLICATION_PASSWORD="$(generate_url_safe_password)"
+                REPLICATION_PASSWORD="$(generate_url_safe_password | cut -c1-32)"
             fi
             printf '%s\n' "$MYSQL_PASSWORD"      > /tmp/_crs_mysql_pw
             printf '%s\n' "$SECRET_KEY"          > /tmp/_crs_jwt
@@ -166,7 +172,10 @@ load_or_generate_runtime_secrets() {
         # the MySQL master uses for CHANGE MASTER TO from replicas.
         # Generated alongside the other secrets so the MySQL image's
         # 02-replication-user.sql template has it on first build.
-        repl_pw="$(generate_url_safe_password)"
+        # Capped at 32 bytes because MySQL 8 rejects CREATE USER with a
+        # longer password (ERROR 3056); the other secrets have no such
+        # limit and keep their full entropy.
+        repl_pw="$(generate_url_safe_password | cut -c1-32)"
         # MAIL_* defaults for first-time use — the build script will
         # prompt the user, who can accept the defaults by hitting Enter.
         mysql_port="3306"
