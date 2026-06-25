@@ -87,15 +87,24 @@ if [[ -z "$POD_NAME_VALUE" ]]; then
 fi
 if [[ "$POD_NAME_VALUE" == "mysql-0" ]]; then
     MYSQL_ROLE="master"
+    # Always derive server-id from the pod ordinal on StatefulSet pods.
+    # We deliberately do NOT honor MYSQL_SERVER_ID here even if it's
+    # set in the environment — a frozen value would collide with another
+    # pod in the StatefulSet and break replication with "source and
+    # replica have equal MySQL server ids". A previous version of the
+    # Dockerfile baked `ENV MYSQL_SERVER_ID=1` into the image, which
+    # pinned every pod (master and replica alike) to server-id 1 and
+    # surfaced exactly that error.
     DERIVED_SERVER_ID="$((100 + 0))"
-    SERVER_ID="${MYSQL_SERVER_ID:-$DERIVED_SERVER_ID}"
+    SERVER_ID="${DERIVED_SERVER_ID}"
 elif [[ "$POD_NAME_VALUE" =~ ^mysql-([0-9]+)$ ]]; then
     MYSQL_ROLE="replica"
     DERIVED_SERVER_ID="$((100 + ${BASH_REMATCH[1]}))"
-    SERVER_ID="${MYSQL_SERVER_ID:-$DERIVED_SERVER_ID}"
+    SERVER_ID="${DERIVED_SERVER_ID}"
 else
     # Standalone `docker run` (no StatefulSet hostname). Treat as master
-    # with the default server-id — useful for local debugging.
+    # and let MYSQL_SERVER_ID override the default — useful for local
+    # debugging where the operator wants a specific server-id.
     MYSQL_ROLE="${MYSQL_ROLE:-master}"
     SERVER_ID="${MYSQL_SERVER_ID:-1}"
 fi

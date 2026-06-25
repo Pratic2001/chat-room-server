@@ -125,9 +125,19 @@ ENTRYPOINT ["/usr/local/bin/replication_bootstrap.sh"]
 # cluster-wide per the MySQL replication requirements).
 #
 #   --server-id                 : required for replication; unique per
-#                                 server. Default 1 is fine for a single-
-#                                 pod docker run; the StatefulSet
-#                                 overrides it via env on each pod.
+#                                 server. The bootstrap script derives
+#                                 it from the pod's hostname
+#                                 (100 + ordinal) so master and replicas
+#                                 never collide. We deliberately do NOT
+#                                 `ENV MYSQL_SERVER_ID=...` here — that
+#                                 would freeze the value into every pod,
+#                                 making master and replica server-ids
+#                                 match and `CHANGE MASTER TO` fail with
+#                                 "source and replica have equal MySQL
+#                                 server ids". A standalone `docker run`
+#                                 of the image falls through to the
+#                                 script's `else` branch which defaults
+#                                 to server-id=1.
 #   --log-bin                   : turn on the binary log. Required for
 #                                 master (replication source) and harmless
 #                                 on replicas (a replica's binlog is empty
@@ -155,4 +165,3 @@ ENTRYPOINT ["/usr/local/bin/replication_bootstrap.sh"]
 # still gives a working single-node server. The k8s manifests append the
 # pod-specific bits via env or via the `--args` form (see the StatefulSet
 # pod template for the exact args list).
-ENV MYSQL_SERVER_ID=1
