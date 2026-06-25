@@ -372,12 +372,32 @@ SQL
 # Verify replication is actually running before we hand off — fail loud
 # here is much better than a silently-stuck replica at runtime.
 log "Verifying SHOW SLAVE STATUS..."
-SLAVE_STATUS="$(mysql_local -Nse 'SHOW SLAVE STATUS\G' 2>&1)"
-if ! grep -q "Slave_IO_Running: Yes" <<<"$SLAVE_STATUS"; then
-    fail "Slave_IO_Running is not Yes. SHOW SLAVE STATUS:\n${SLAVE_STATUS}"
-fi
-if ! grep -q "Slave_SQL_Running: Yes" <<<"$SLAVE_STATUS"; then
-    fail "Slave_SQL_Running is not Yes. SHOW SLAVE STATUS:\n${SLAVE_STATUS}"
+# Don't pass -N (--skip-column-names): SHOW SLAVE STATUS\G produces one
+# field per line in "Label: value" form, and the grep checks below need the
+# label text. With -N, the labels are stripped and the grep always fails
+# even on a healthy replica — that surfaced as a CrashLoopBackOff where
+# every retry showed `Slave_IO_Running: Yes` and `Slave_SQL_Running: Yes`
+# in the captured values, but no labels anywhere in the output.
+#
+# The IO thread can take a moment to connect to the master (DNS, TCP,
+# auth handshake, GTID exchange) right after START SLAVE. Poll for up to
+# ~10s before giving up — fast enough not to mask real failures, slow
+# enough to absorb the cold-start handshake. Each iteration captures a
+# fresh SHOW SLAVE STATUS so we can include the final state in the
+# failure message.
+SLAVE_STATUS=""
+REPLICATION_OK=0
+for attempt in $(seq 1 20); do
+    SLAVE_STATUS="$(mysql_local -e 'SHOW SLAVE STATUS\G' 2>&1)"
+    if grep -q "Slave_IO_Running: Yes" <<<"$SLAVE_STATUS" \
+        && grep -q "Slave_SQL_Running: Yes" <<<"$SLAVE_STATUS"; then
+        REPLICATION_OK=1
+        break
+    fi
+    sleep 0.5
+done
+if [[ "$REPLICATION_OK" -ne 1 ]]; then
+    fail "Slave_IO_Running/Slave_SQL_Running did not both reach Yes within 10s. SHOW SLAVE STATUS:\n${SLAVE_STATUS}"
 fi
 log "Replication started successfully."
 
