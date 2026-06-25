@@ -80,13 +80,17 @@ url_encode_value() {
 #   ROOM_SECRET_KEY='...'
 load_or_generate_runtime_secrets() {
     local existing_env="$1"
-    local mysql_pw jwt fernet
+    local mysql_pw jwt fernet repl_pw
     # MAIL_* values: if the existing file has them, reuse; otherwise leave
     # blank (the caller — build_images.sh — will then prompt for them).
     # We do NOT generate defaults here; the build-time prompts are the
     # right place to collect SMTP credentials, since they can be blank
     # (disabled) or supplied by a human who knows the relay.
     local mail_host mail_port mail_user mail_password mail_from mail_use_tls
+    # Redis topology values. Empty REDIS_SENTINELS means "single-pod
+    # mode — connect directly to REDIS_URL". The defaults here match
+    # the in-cluster chatroom-redis / chatroom-redis-sentinel Services.
+    local redis_url mysql_read_host redis_sentinels redis_master_name
 
     if [[ -n "$existing_env" && -f "$existing_env" ]]; then
         # Reuse — exact same values the previous build/deploy used.
@@ -98,9 +102,19 @@ load_or_generate_runtime_secrets() {
             : "${MYSQL_PASSWORD:?MYSQL_PASSWORD missing from $existing_env}"
             : "${SECRET_KEY:?SECRET_KEY missing from $existing_env}"
             : "${ROOM_SECRET_KEY:?ROOM_SECRET_KEY missing from $existing_env}"
-            printf '%s\n' "$MYSQL_PASSWORD"  > /tmp/_crs_mysql_pw
-            printf '%s\n' "$SECRET_KEY"      > /tmp/_crs_jwt
-            printf '%s\n' "$ROOM_SECRET_KEY" > /tmp/_crs_fernet
+            # REPLICATION_PASSWORD may be missing from older .env.runtime
+            # files (it was added with the MySQL StatefulSet topology).
+            # In that case generate a fresh one and persist it. We do
+            # NOT abort the build — the MySQL image's 02-replication-user
+            # sql needs this, so it's effectively required, but we
+            # generate instead of failing so existing deploys keep working.
+            if [[ -z "${REPLICATION_PASSWORD-}" ]]; then
+                REPLICATION_PASSWORD="$(generate_url_safe_password)"
+            fi
+            printf '%s\n' "$MYSQL_PASSWORD"      > /tmp/_crs_mysql_pw
+            printf '%s\n' "$SECRET_KEY"          > /tmp/_crs_jwt
+            printf '%s\n' "$ROOM_SECRET_KEY"     > /tmp/_crs_fernet
+            printf '%s\n' "$REPLICATION_PASSWORD" > /tmp/_crs_repl_pw
             # MAIL_* may be missing from older .env.runtime files; in that
             # case the build script will re-prompt and write fresh values.
             # We use ${VAR-} so unset is treated as empty.
@@ -113,13 +127,25 @@ load_or_generate_runtime_secrets() {
             printf '%s\n' "${MAIL_USE_TLS-true}" > /tmp/_crs_mail_use_tls
             # REDIS_URL: written by an earlier build, but treat it as
             # optional so older .env.runtime files still load. The default
-            # matches the in-cluster Redis Service defined in
-            # k8s/16-redis-service.yaml.
+            # matches the in-cluster chatroom-redis Service.
             printf '%s\n' "${REDIS_URL-redis://chatroom-redis:6379/0}" > /tmp/_crs_redis_url
+            # MYSQL_READ_HOST: where read-only endpoints (messages, room
+            # list) connect. Empty falls back to MYSQL_HOST in
+            # app/database.py; on multi-node clusters it's set to the
+            # mysql-replica Service.
+            printf '%s\n' "${MYSQL_READ_HOST-}" > /tmp/_crs_mysql_read_host
+            # REDIS_SENTINELS: comma-separated host:port list. Empty
+            # means "use REDIS_URL directly" (single-pod mode).
+            printf '%s\n' "${REDIS_SENTINELS-}" > /tmp/_crs_redis_sentinels
+            # REDIS_MASTER_NAME: Sentinel's logical name for the master
+            # group. Must match the `sentinel monitor` line in
+            # k8s/28-redis-sentinel-statefulset.yaml.
+            printf '%s\n' "${REDIS_MASTER_NAME-chatroom-redis}" > /tmp/_crs_redis_master_name
         )
         mysql_pw="$(cat /tmp/_crs_mysql_pw)";          rm -f /tmp/_crs_mysql_pw
         jwt="$(cat /tmp/_crs_jwt)";                    rm -f /tmp/_crs_jwt
         fernet="$(cat /tmp/_crs_fernet)";              rm -f /tmp/_crs_fernet
+        repl_pw="$(cat /tmp/_crs_repl_pw)";            rm -f /tmp/_crs_repl_pw
         mysql_port="$(cat /tmp/_crs_mysql_port)";      rm -f /tmp/_crs_mysql_port
         mail_host="$(cat /tmp/_crs_mail_host)";        rm -f /tmp/_crs_mail_host
         mail_port="$(cat /tmp/_crs_mail_port)";        rm -f /tmp/_crs_mail_port
@@ -128,11 +154,19 @@ load_or_generate_runtime_secrets() {
         mail_from="$(cat /tmp/_crs_mail_from)";        rm -f /tmp/_crs_mail_from
         mail_use_tls="$(cat /tmp/_crs_mail_use_tls)";  rm -f /tmp/_crs_mail_use_tls
         redis_url="$(cat /tmp/_crs_redis_url)";        rm -f /tmp/_crs_redis_url
+        mysql_read_host="$(cat /tmp/_crs_mysql_read_host)"; rm -f /tmp/_crs_mysql_read_host
+        redis_sentinels="$(cat /tmp/_crs_redis_sentinels)"; rm -f /tmp/_crs_redis_sentinels
+        redis_master_name="$(cat /tmp/_crs_redis_master_name)"; rm -f /tmp/_crs_redis_master_name
     else
         # Generate. Same algorithms as change_db_password.sh.
         mysql_pw="$(generate_url_safe_password)"
         jwt="$(python3 -c 'import secrets; print(secrets.token_urlsafe(64))')"
         fernet="$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+        # REPLICATION_PASSWORD: the credential the 'repl'@'%' user on
+        # the MySQL master uses for CHANGE MASTER TO from replicas.
+        # Generated alongside the other secrets so the MySQL image's
+        # 02-replication-user.sql template has it on first build.
+        repl_pw="$(generate_url_safe_password)"
         # MAIL_* defaults for first-time use — the build script will
         # prompt the user, who can accept the defaults by hitting Enter.
         mysql_port="3306"
@@ -142,15 +176,28 @@ load_or_generate_runtime_secrets() {
         mail_password=""
         mail_from="Chat Room <no-reply@example.com>"
         mail_use_tls="true"
-        # Default to the in-cluster Redis Service. Users running
-        # `uvicorn` locally can override by editing app/.env.runtime
-        # or by exporting REDIS_URL before the build.
+        # Redis topology. REDIS_URL points at the in-cluster
+        # chatroom-redis Service for direct (single-broker) mode.
+        # REDIS_SENTINELS is a comma-separated list of host:port pairs
+        # that the app uses to discover the master via Sentinel. The
+        # default matches the in-cluster chatroom-redis-sentinel
+        # headless Service. REDIS_MASTER_NAME is Sentinel's logical
+        # name for the master group (matches `sentinel monitor` in
+        # k8s/28-redis-sentinel-statefulset.yaml).
+        #
+        # Users running uvicorn locally can override REDIS_URL (e.g.
+        # redis://localhost:6379/0) or clear REDIS_SENTINELS to skip
+        # the Sentinel path entirely.
         redis_url="redis://chatroom-redis:6379/0"
+        mysql_read_host=""
+        redis_sentinels="chatroom-redis-sentinel:26379"
+        redis_master_name="chatroom-redis"
     fi
 
     printf "MYSQL_PASSWORD=%q\n"   "$mysql_pw"
     printf "SECRET_KEY=%q\n"       "$jwt"
     printf "ROOM_SECRET_KEY=%q\n"  "$fernet"
+    printf "REPLICATION_PASSWORD=%q\n" "$repl_pw"
     printf "MYSQL_PORT=%q\n"       "$mysql_port"
     printf "MAIL_HOST=%q\n"        "$mail_host"
     printf "MAIL_PORT=%q\n"        "$mail_port"
@@ -159,6 +206,9 @@ load_or_generate_runtime_secrets() {
     printf "MAIL_FROM=%q\n"        "$mail_from"
     printf "MAIL_USE_TLS=%q\n"     "$mail_use_tls"
     printf "REDIS_URL=%q\n"        "$redis_url"
+    printf "MYSQL_READ_HOST=%q\n"  "$mysql_read_host"
+    printf "REDIS_SENTINELS=%q\n"  "$redis_sentinels"
+    printf "REDIS_MASTER_NAME=%q\n" "$redis_master_name"
 }
 
 # Atomically write app/.env.runtime with the three secrets + the rest of
@@ -177,6 +227,11 @@ write_runtime_env_file() {
     : "${MYSQL_PASSWORD:?MYSQL_PASSWORD unset (call load_or_generate_runtime_secrets first)}"
     : "${SECRET_KEY:?SECRET_KEY unset (call load_or_generate_runtime_secrets first)}"
     : "${ROOM_SECRET_KEY:?ROOM_SECRET_KEY unset (call load_or_generate_runtime_secrets first)}"
+    # REPLICATION_PASSWORD is required because the MySQL image's
+    # 02-replication-user.sql template bakes it in at build time. We
+    # generate it in load_or_generate_runtime_secrets when no existing
+    # value is found, so by the time we get here it's always set.
+    : "${REPLICATION_PASSWORD:?REPLICATION_PASSWORD unset (call load_or_generate_runtime_secrets first)}"
 
     # MAIL_* are optional in the strict sense — empty is a valid value.
     # Use ${VAR-} so unset and empty are both treated as empty.
@@ -187,20 +242,31 @@ write_runtime_env_file() {
     local mail_from="${MAIL_FROM-}"
     local mail_use_tls="${MAIL_USE_TLS-}"
     local mysql_port="${MYSQL_PORT-3306}"
-    # REDIS_URL is the pub/sub broker for cross-pod WebSocket
-    # broadcasts. Empty is a valid value (single-pod mode) but we
-    # default to the in-cluster Redis Service for k8s deployments.
-    # Note: this value is itself a URL — we deliberately don't
-    # URL-encode it the way passwords are, because the redis-py
-    # client parses the value as a URL and needs to see the literal
-    # `redis://host:port/db` form.
+    # Redis topology. REDIS_URL is the direct-connect broker URL used
+    # by single-pod dev (uvicorn) and as the Sentinel-mode fallback.
+    # REDIS_SENTINELS is a comma-separated host:port list. Empty is a
+    # valid value for both — empty REDIS_SENTINELS means "use
+    # REDIS_URL directly"; empty REDIS_URL means "single-pod mode".
+    #
+    # These values are themselves URLs / connection strings, not
+    # secrets, so the k8s ConfigMap entries below are the literal
+    # values (no URL-encoding). .env files are read by python-dotenv
+    # which preserves the raw string, so the values are usable on
+    # both deployment paths.
     local redis_url="${REDIS_URL-redis://chatroom-redis:6379/0}"
+    local mysql_read_host="${MYSQL_READ_HOST-}"
+    local redis_sentinels="${REDIS_SENTINELS-}"
+    local redis_master_name="${REDIS_MASTER_NAME-chatroom-redis}"
 
-    local mysql_pw_enc jwt_enc fernet_enc mysql_port_enc
+    local mysql_pw_enc jwt_enc fernet_enc repl_pw_enc mysql_port_enc
     local mail_host_enc mail_port_enc mail_user_enc mail_password_enc mail_from_enc mail_use_tls_enc
     mysql_pw_enc="$(url_encode_value "$MYSQL_PASSWORD")"
     jwt_enc="$(url_encode_value "$SECRET_KEY")"
     fernet_enc="$(url_encode_value "$ROOM_SECRET_KEY")"
+    # REPLICATION_PASSWORD is a credential, not a URL. URL-encode it
+    # anyway so it round-trips safely through 'set -a; source' and
+    # any future hand-edits.
+    repl_pw_enc="$(url_encode_value "$REPLICATION_PASSWORD")"
     mysql_port_enc="$(url_encode_value "$mysql_port")"
     mail_host_enc="$(url_encode_value "$mail_host")"
     mail_port_enc="$(url_encode_value "$mail_port")"
@@ -263,6 +329,20 @@ MYSQL_PASSWORD="${mysql_pw_enc}"
 MYSQL_HOST="mysql"
 MYSQL_PORT=${mysql_port_enc}
 MYSQL_DB="chatroom_db"
+# MYSQL_READ_HOST: read-only endpoints (GET /messages, GET /rooms/my)
+# connect here. On 1-node clusters (kind/k3d/minikube) leave this
+# blank — app/database.py falls back to MYSQL_HOST when it's unset,
+# so reads land on the master. On multi-node clusters set this to
+# "mysql-replica" (matches k8s/24-mysql-replica-service.yaml).
+MYSQL_READ_HOST="${mysql_read_host}"
+
+# --- MySQL replication (consumed by mysql/replication_bootstrap.sh) ------
+# REPLICATION_PASSWORD is the credential the 'repl'@'%' user on the
+# MySQL master uses to authenticate CHANGE MASTER TO from replicas.
+# Baked into the MySQL image at build time via the
+# 02-replication-user.sql.template; rotating it requires rebuilding
+# the image AND running FLUSH PRIVILEGES on the live master.
+REPLICATION_PASSWORD="${repl_pw_enc}"
 
 # --- JWT signing (consumed by app/utils.py) -------------------------------
 SECRET_KEY="${jwt_enc}"
@@ -285,17 +365,27 @@ MAIL_PASSWORD="${mail_password_enc}"
 MAIL_FROM="${mail_from_enc}"
 MAIL_USE_TLS=${mail_use_tls_enc}
 
-# --- Redis pub/sub bus (consumed by app/redis_bus.py) ---------------------
-# Default points at the in-cluster chatroom-redis Service from
-# k8s/16-redis-service.yaml. Override here for local dev
-# (redis://localhost:6379/0) or to disable pub/sub fan-out entirely
-# (leave blank — the app logs a warning and runs in single-pod mode).
+# --- Redis bus (consumed by app/redis_bus.py) ----------------------------
+# The chatroom deployment now runs Redis with Sentinel-managed failover,
+# so the app connects via Sentinels (REDIS_SENTINELS) rather than directly
+# to a single broker. REDIS_URL is kept as the direct-connect fallback
+# for local dev (uvicorn) — the app's bus code prefers REDIS_SENTINELS
+# when both are set, and falls back to REDIS_URL when REDIS_SENTINELS is
+# blank. REDIS_MASTER_NAME is Sentinel's logical name for the master
+# group; it must match the `sentinel monitor` line in
+# k8s/28-redis-sentinel-statefulset.yaml.
 #
-# Note: this is a URL, not a secret, so the k8s ConfigMap entry below
-# is the literal value (no URL-encoding). .env files are read by
-# python-dotenv which preserves the raw string, so the value is
-# usable on both deployment paths.
+# Override REDIS_URL for local dev (redis://localhost:6379/0). Leave
+# REDIS_SENTINELS blank AND REDIS_URL blank to disable cross-pod
+# fan-out entirely (single-pod mode; the bus logs a warning and runs
+# in degraded mode).
+#
+# Note: these values are URLs / connection strings, not secrets, so
+# the k8s ConfigMap entries are the literal values (no URL-encoding).
+# .env files are read by python-dotenv which preserves the raw string.
 REDIS_URL="${redis_url}"
+REDIS_SENTINELS="${redis_sentinels}"
+REDIS_MASTER_NAME="${redis_master_name}"
 EOF
 
     # Atomic rename. If mv fails the tmp file is left for the caller to
@@ -351,10 +441,13 @@ render_k8s_secrets() {
     # one knob for both chatroom-app.MYSQL_PASSWORD and the
     # chatroom-mysql.MYSQL_ROOT_PASSWORD — they must always agree, and
     # the MySQL image's build-arg is the same value, so this stays a
-    # single source.
+    # single source. REPLICATION_PASSWORD is a second Secret value for
+    # chatroom-mysql — it's the credential the 'repl'@'%' user uses
+    # for CHANGE MASTER TO from replica pods.
     : "${MYSQL_PASSWORD:?MYSQL_PASSWORD unset (call load_or_generate_runtime_secrets first)}"
     : "${SECRET_KEY:?SECRET_KEY unset (call load_or_generate_runtime_secrets first)}"
     : "${ROOM_SECRET_KEY:?ROOM_SECRET_KEY unset (call load_or_generate_runtime_secrets first)}"
+    : "${REPLICATION_PASSWORD:?REPLICATION_PASSWORD unset (call load_or_generate_runtime_secrets first)}"
     : "${MAIL_PASSWORD:=}"  # empty is a valid value (no SMTP auth)
 
     # ConfigMap values. Empty is a valid value for MAIL_HOST (disables
@@ -376,26 +469,41 @@ render_k8s_secrets() {
     # it's not a credential). Defaults to the in-cluster Redis Service
     # name. Empty is a valid value to run the app in single-pod mode.
     local redis_url="${REDIS_URL:-redis://chatroom-redis:6379/0}"
+    # MYSQL_READ_HOST: read-only endpoints connect here. Defaults to
+    # empty (1-node fallback to MYSQL_HOST). On multi-node clusters
+    # set this to "mysql-replica" via the rendered ConfigMap.
+    local mysql_read_host="${MYSQL_READ_HOST:-}"
+    # REDIS_SENTINELS: comma-separated host:port list. Empty means
+    # "connect directly via REDIS_URL" (single-broker / local dev).
+    # Defaults to the in-cluster chatroom-redis-sentinel headless
+    # Service so a fresh build lands on the Sentinel-managed cluster.
+    local redis_sentinels="${REDIS_SENTINELS:-}"
+    # REDIS_MASTER_NAME: Sentinel's logical name for the master group.
+    # Must match the `sentinel monitor` line in
+    # k8s/28-redis-sentinel-statefulset.yaml. The app passes this to
+    # redis.asyncio.sentinel.Sentinel.
+    local redis_master_name="${REDIS_MASTER_NAME:-chatroom-redis}"
 
     # URL-encode the values that feed a URL parser (MYSQL_PASSWORD,
-    # SECRET_KEY, ROOM_SECRET_KEY, MYSQL_HOST, MYSQL_USER, MYSQL_DB).
-    # The encoding is defensive (auto-generated values are already
-    # URL-safe) but load-bearing for MYSQL_PASSWORD specifically —
-    # runbook §9.1.2 documents that the encoded form is what both
-    # the chatroom-app Secret and the chatroom-mysql image's
-    # 99-grants.sql must agree on, since app/database.py builds
+    # SECRET_KEY, ROOM_SECRET_KEY, REPLICATION_PASSWORD, MYSQL_HOST,
+    # MYSQL_USER, MYSQL_DB). The encoding is defensive (auto-generated
+    # values are already URL-safe) but load-bearing for MYSQL_PASSWORD
+    # specifically — runbook §9.1.2 documents that the encoded form
+    # is what both the chatroom-app Secret and the chatroom-mysql
+    # image's 99-grants.sql must agree on, since app/database.py builds
     # mysql+pymysql://user:password@host/db and PyMySQL URL-decodes
     # the userinfo component on connect.
     #
     # MAIL_USER and MAIL_FROM are emitted verbatim — see the block
     # comment in the generated env file for the SMTP rationale.
-    local mysql_pw_enc jwt_enc fernet_enc mail_password_enc
+    local mysql_pw_enc jwt_enc fernet_enc repl_pw_enc mail_password_enc
     local mysql_host_enc mysql_port_enc mysql_user_enc mysql_db_enc
     local algorithm_enc access_token_enc
     local mail_host_enc mail_port_enc mail_user_enc mail_from_enc mail_use_tls_enc
     mysql_pw_enc="$(url_encode_value "$MYSQL_PASSWORD")"
     jwt_enc="$(url_encode_value "$SECRET_KEY")"
     fernet_enc="$(url_encode_value "$ROOM_SECRET_KEY")"
+    repl_pw_enc="$(url_encode_value "$REPLICATION_PASSWORD")"
     mail_password_enc="$(url_encode_value "$mail_password")"
     mysql_host_enc="$(url_encode_value "$mysql_host")"
     mysql_port_enc="$(url_encode_value "$mysql_port")"
@@ -442,6 +550,11 @@ metadata:
 type: Opaque
 stringData:
   MYSQL_ROOT_PASSWORD: "${mysql_pw_enc}"
+  # REPLICATION_PASSWORD: credential for the 'repl'@'%' user. The
+  # master uses it to authenticate CHANGE MASTER TO from replicas.
+  # Also baked into the MySQL image at build time via
+  # 02-replication-user.sql.template.
+  REPLICATION_PASSWORD: "${repl_pw_enc}"
 ---
 apiVersion: v1
 kind: Secret
@@ -471,6 +584,11 @@ data:
   MYSQL_PORT: "${mysql_port_enc}"
   MYSQL_USER: "${mysql_user_enc}"
   MYSQL_DB: "${mysql_db_enc}"
+  # MYSQL_READ_HOST: where read-only endpoints (GET /messages,
+  # GET /rooms/my) connect. Empty falls back to MYSQL_HOST in
+  # app/database.py (1-node clusters). On multi-node clusters set
+  # this to "mysql-replica" — see k8s/24-mysql-replica-service.yaml.
+  MYSQL_READ_HOST: "${mysql_read_host}"
   ALGORITHM: "${algorithm_enc}"
   ACCESS_TOKEN_EXPIRE_MINUTES: "${access_token_enc}"
   MAIL_HOST: "${mail_host_enc}"
@@ -482,6 +600,17 @@ data:
   # client can parse it directly. URL-encoding it (the way passwords
   # are) would break the redis:// scheme parsing.
   REDIS_URL: "${redis_url}"
+  # REDIS_SENTINELS: comma-separated host:port list. When non-empty,
+  # the app uses redis.asyncio.sentinel.Sentinel to discover the
+  # current master instead of connecting via REDIS_URL directly.
+  # Defaults to the in-cluster chatroom-redis-sentinel headless
+  # Service (k8s/30-redis-sentinel-service.yaml) so a fresh deploy
+  # automatically picks up the new Sentinel-managed Redis topology.
+  REDIS_SENTINELS: "${redis_sentinels}"
+  # REDIS_MASTER_NAME: Sentinel's logical name for the master group.
+  # Must match the `sentinel monitor` line in
+  # k8s/28-redis-sentinel-statefulset.yaml.
+  REDIS_MASTER_NAME: "${redis_master_name}"
 EOF
 
     # Atomic rename. Same error-handling choice as write_runtime_env_file.

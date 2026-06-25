@@ -1,15 +1,16 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: chatroom-redis
+  name: redis-headless
   namespace: chatroom
   labels:
     app.kubernetes.io/name: chatroom
     app.kubernetes.io/component: redis
 spec:
-  # ClusterIP — Redis is only ever reached by chatroom-app pods inside
-  # the cluster. The app's REDIS_URL is `redis://chatroom-redis:6379/0`.
-  type: ClusterIP
+  # Headless service for StatefulSet pod DNS: redis-N.redis-headless.
+  # Used by replica pods (`replicaof redis-0.redis-headless 6379`) and by
+  # Sentinels to discover peers without going through a load balancer.
+  clusterIP: None
   selector:
     app.kubernetes.io/name: chatroom
     app.kubernetes.io/component: redis

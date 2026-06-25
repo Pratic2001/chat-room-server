@@ -179,15 +179,24 @@ log "Wrote $K8S_SECRETS_RUNTIME (chmod 600)"
 APP_IMAGE="chat-room-server:latest"
 MYSQL_IMAGE="chatroom-mysql:latest"
 
-log "Building $MYSQL_IMAGE (with baked root password)..."
+log "Building $MYSQL_IMAGE (with baked root password + replication user)..."
 # Build context is the mysql/ directory (not the repo root), so the
 # Dockerfile's `COPY init/...` lines resolve correctly. We can't use the
 # repo root here because .dockerignore strips the mysql/ tree out of the
 # context — the same ignore rules that keep the app image lean would
 # otherwise remove the SQL files this image needs.
+#
+# Two build-args are baked into the image:
+#   MYSQL_ROOT_PASSWORD — root user's password (used by the app and by
+#                         replication-username SQL on replicas).
+#   REPLICATION_PASSWORD — credential for the 'repl'@'%' user, baked
+#                          into 02-replication-user.sql.template. Used
+#                          by replicas to authenticate CHANGE MASTER TO
+#                          against the master.
 docker build \
     "${DOCKER_BUILD_ARGS[@]}" \
     --build-arg "MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD}" \
+    --build-arg "REPLICATION_PASSWORD=${REPLICATION_PASSWORD}" \
     -f "$REPO_ROOT/mysql/Dockerfile" \
     -t "$MYSQL_IMAGE" \
     "$REPO_ROOT/mysql"

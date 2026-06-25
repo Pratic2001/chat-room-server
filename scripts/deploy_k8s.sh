@@ -29,20 +29,28 @@
 #      it landed. The subsequent rollout status wait picks up the
 #      replacement pods.
 #   6. Scales chatroom-app to one replica per cluster node.
-#   7. Waits for both Deployments to roll out.
-#   8. Prints the Ingress address (or, if no Ingress is installed, the
+#   7. Scales statefulset/mysql, statefulset/redis to one replica per
+#      cluster node, and statefulset/redis-sentinel to min(3, NODE_COUNT).
+#   8. Waits for the three StatefulSets (mysql, redis, redis-sentinel)
+#      and the chatroom-app Deployment to roll out, in that order so the
+#      data plane is settled before the app's readiness probes start
+#      hitting it.
+#   9. Prints the Ingress address (or, if no Ingress is installed, the
 #      instructions to port-forward).
 #
-# Note on `tolerationSeconds`: each Deployment manifest
-# (k8s/15-redis-deployment.yaml, k8s/21-mysql-deployment.yaml,
-# k8s/40-app-deployment.yaml) sets `tolerationSeconds: 10` on the
-# standard node-NotReady/unreachable NoExecute taints. When a node
-# goes unhealthy the pod is evicted within 10s rather than waiting
-# the k8s default of 300s — these pods hold no state worth keeping
-# bound to a dead node, and the rescheduled replica comes back up
-# quickly. The cluster-wide components in front of this stack
-# (ingress-nginx controller, MetalLB) have their own `terminationGracePeriodSeconds`
-# values — see RUNBOOK §2.3.1 for what to tune and why.
+# Note on `tolerationSeconds`: each StatefulSet and Deployment
+# manifest that holds the data tier (k8s/23-mysql-statefulset.yaml,
+# k8s/26-redis-statefulset.yaml, k8s/28-redis-sentinel-statefulset.yaml)
+# plus the chatroom-app Deployment (k8s/40-app-deployment.yaml) sets
+# `tolerationSeconds: 10` on the standard node-NotReady/unreachable
+# NoExecute taints. When a node goes unhealthy the pod is evicted
+# within 10s rather than waiting the k8s default of 300s — these
+# pods hold no state worth keeping bound to a dead node (the
+# StatefulSets' PVCs ride along when the pod reschedules), and the
+# rescheduled replica comes back up quickly. The cluster-wide
+# components in front of this stack (ingress-nginx controller,
+# MetalLB) have their own `terminationGracePeriodSeconds` values —
+# see RUNBOOK §2.3.1 for what to tune and why.
 #
 # Usage:
 #   ./scripts/deploy_k8s.sh                 # deploy / reconcile
@@ -113,9 +121,9 @@ fi
     1. Build the images locally:   ./scripts/build_images.sh
     2. Images were built elsewhere (CI / a teammate / registry):
          ./scripts/write_runtime_env.sh --from-stdin
-       then paste 9 values (MYSQL_PASSWORD, SECRET_KEY, ROOM_SECRET_KEY,
-       MAIL_PASSWORD, MAIL_HOST, MAIL_USER, MAIL_PORT, MAIL_FROM,
-       MAIL_USE_TLS), one per line, in that order.
+       then paste 10 values (MYSQL_PASSWORD, SECRET_KEY, ROOM_SECRET_KEY,
+       REPLICATION_PASSWORD, MAIL_PASSWORD, MAIL_HOST, MAIL_USER, MAIL_PORT,
+       MAIL_FROM, MAIL_USE_TLS), one per line, in that order.
 
   The MySQL image's 99-grants.sql was baked with a specific
   MYSQL_PASSWORD at build time, so the value you supply must match
@@ -270,13 +278,45 @@ fi
 log "Scaling chatroom-app to $NODE_COUNT replicas (cluster node count)..."
 kubectl scale deployment/chatroom-app --namespace "$NAMESPACE" --replicas="$NODE_COUNT"
 
+# MySQL is a StatefulSet now (master on mysql-0, read-replicas on
+# mysql-1..N-1). Replicas beyond the first run a mysqldump clone
+# followed by `START SLAVE`, which takes a couple of minutes per
+# replica on a cold start — well within the 5m rollout timeout.
+log "Scaling statefulset/mysql to $NODE_COUNT replicas..."
+kubectl scale statefulset/mysql --namespace "$NAMESPACE" --replicas="$NODE_COUNT"
+
+# Redis: same shape. redis-0 is the master; the rest set
+# `replicaof redis-0.redis-headless 6379` in the wrapper entrypoint.
+log "Scaling statefulset/redis to $NODE_COUNT replicas..."
+kubectl scale statefulset/redis --namespace "$NAMESPACE" --replicas="$NODE_COUNT"
+
+# Sentinels run with odd quorum. We cap at min(3, NODE_COUNT) so
+# 1-node clusters still work — a single Sentinel with quorum=1
+# monitors the master fine. (With 1 Sentinel you get no failover
+# redundancy, but you do get the Redis cluster + Streams working
+# correctly, which is the default on kind/k3d/minikube.)
+SENTINEL_REPLICAS="$NODE_COUNT"
+if [[ "$SENTINEL_REPLICAS" -gt 3 ]]; then
+    SENTINEL_REPLICAS=3
+fi
+log "Scaling statefulset/redis-sentinel to $SENTINEL_REPLICAS replicas (min(3, NODE_COUNT))..."
+kubectl scale statefulset/redis-sentinel --namespace "$NAMESPACE" --replicas="$SENTINEL_REPLICAS"
+
 # -----------------------------------------------------------------------------
 # Rollout status
 # -----------------------------------------------------------------------------
-# MySQL must come up first — the app's readiness will fail if it can't
-# reach the DB on the first connection attempts.
-log "Waiting for MySQL to be ready..."
-kubectl -n "$NAMESPACE" rollout status deployment/mysql --timeout=5m
+# Order matters: data tier first (MySQL → Redis → Sentinels), then app.
+# The app's readiness probe will fail on cold start if it can't reach
+# the DB or a Redis master, so we want the data plane settled before
+# we wait on the app.
+log "Waiting for MySQL StatefulSet to be ready..."
+kubectl -n "$NAMESPACE" rollout status statefulset/mysql --timeout=5m
+
+log "Waiting for Redis StatefulSet to be ready..."
+kubectl -n "$NAMESPACE" rollout status statefulset/redis --timeout=5m
+
+log "Waiting for Redis Sentinels to be ready..."
+kubectl -n "$NAMESPACE" rollout status statefulset/redis-sentinel --timeout=5m
 
 log "Waiting for chatroom-app to be ready..."
 kubectl -n "$NAMESPACE" rollout status deployment/chatroom-app --timeout=5m

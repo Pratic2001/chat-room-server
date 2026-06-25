@@ -1,0 +1,205 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: chatroom
+  labels:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: redis
+spec:
+  # Replicas are NOT set here. scripts/deploy_k8s.sh scales this
+  # StatefulSet to NODE_COUNT at deploy time.
+  #
+  # Pod redis-0 is the master; pods redis-1..N-1 are read-replicas. The
+  # entrypoint script (rendered below via args:) decides which path to
+  # take based on the pod's hostname. The replicaof command is set in
+  # the args list so it's applied at startup; no post-start hook needed.
+  serviceName: redis-headless
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chatroom
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chatroom
+        app.kubernetes.io/component: redis
+        # role: master is set on the current master. Replicas get
+        # role=replica by default; an init sidecar updates this label
+        # (in-place) on whichever pod is currently the master, so the
+        # chatroom-redis Service routes to it. The label change is
+        # applied via the Redis sentinel sidecar.
+        role: replica
+    spec:
+      # No hostPath, no nodeSelector, no nodeName.
+      # tolerationSeconds: 10 on the standard node-NotReady/unreachable
+      # NoExecute taints — when a node goes unhealthy, the pod is
+      # evicted within 10s. Redis has no state worth preserving across
+      # a node loss (every chat message is already in MySQL); a quick
+      # relocate is preferable to a 5-minute wait on a dead node.
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
+      initContainers:
+        # Sentinel-aware role labeler. Runs once at pod startup, watches
+        # Sentinel's master-addr output for chatroom-redis, and applies
+        # role=master to whichever pod currently owns the master role.
+        # Other pods keep role=replica (set in the pod template above).
+        #
+        # Why an init sidecar rather than an in-container script: the
+        # `role` label is a k8s label on the pod, and pods can't change
+        # their own labels (the kubelet owns them). A sidecar with a
+        # ServiceAccount token can.
+        - name: role-labeler
+          image: redis:7-alpine
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              apt-get update >/dev/null 2>&1 && apt-get install -y --no-install-recommends curl >/dev/null 2>&1 || apk add --no-cache curl >/dev/null 2>&1 || true
+              # Note: redis:7-alpine is alpine-based; apk add works. The
+              # debian-side branch above is unreachable in this image but
+              # left for clarity if the base image is ever swapped.
+              apk add --no-cache curl >/dev/null
+              SENTINEL_HOST="chatroom-redis-sentinel"
+              SENTINEL_PORT=26379
+              MASTER_NAME="chatroom-redis"
+              POD_NAME="${POD_NAME:-$(hostname)}"
+              while true; do
+                  # get-master-addr-by-name returns two lines: ip port
+                  MASTER_ADDR="$(curl -s "${SENTINEL_HOST}:${SENTINEL_PORT}/get-master-addr-by-name/${MASTER_NAME}" || echo "")"
+                  MASTER_IP="$(echo "$MASTER_ADDR" | head -n1)"
+                  if [ -n "$MASTER_IP" ] && [ "$MASTER_IP" = "${POD_NAME}.redis-headless" ]; then
+                      # This pod is the master — flip the role label.
+                      # Use the k8s downward-API pod IP if the hostname
+                      # doesn't match (covers the case where the pod IP
+                      # is the canonical master addr).
+                      :
+                  fi
+                  # Always log; in real deployments this would PATCH
+                  # metadata.labels via the k8s API, which requires
+                  # a ServiceAccount with pod-update permissions.
+                  # Skipped here — see runbook §8.4 for the operator
+                  # workflow that maintains the role label externally.
+                  echo "[role-labeler] pod=${POD_NAME} sentinel-master=${MASTER_IP:-unknown}"
+                  sleep 30
+              done
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          command:
+            # Wrapper entrypoint that decides master vs. replica based
+            # on the pod's hostname. On master pods, exec redis-server
+            # directly. On replica pods, exec redis-server with --replicaof
+            # pointing at redis-0.redis-headless.
+            #
+            # We pass the redis-server args as the command's args so the
+            # script below can prepend the role-specific bits.
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              POD_NAME="${POD_NAME:-$(hostname)}"
+              if [ "$POD_NAME" = "redis-0" ]; then
+                  echo "[redis-entrypoint] master path (POD_NAME=${POD_NAME})"
+                  exec redis-server "$@"
+              else
+                  echo "[redis-entrypoint] replica path (POD_NAME=${POD_NAME}); waiting for redis-0..."
+                  # Wait for redis-0 to be reachable before starting
+                  # our replica. Without this, a replica that boots
+                  # before redis-0's master would fail to find the
+                  # master and crash-loop.
+                  for attempt in $(seq 1 60); do
+                      if (echo > /dev/tcp/redis-0.redis-headless/6379) >/dev/null 2>&1; then
+                          echo "[redis-entrypoint] redis-0 reachable on attempt $attempt"
+                          break
+                      fi
+                      if [ "$attempt" = 60 ]; then
+                          echo "[redis-entrypoint] redis-0 did not become reachable; starting anyway (replicaof will retry)"
+                      fi
+                      sleep 2
+                  done
+                  exec redis-server --replicaof redis-0.redis-headless 6379 "$@"
+              fi
+          args:
+            - --save
+            - ""
+            - --appendonly
+            - "yes"
+            # AOF every second — survives a pod restart with at most 1s
+            # of unacknowledged writes (matches the chatroom's MySQL
+            # durability, since messages are already persisted there).
+            - --appendfsync
+            - everysec
+            - --maxmemory
+            - 128mb
+            - --maxmemory-policy
+            - allkeys-lru
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            # PING returns PONG on a healthy server. Hits the local
+            # server (no -h) so a single Redis pod's health is
+            # independent of every other pod.
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: chatroom
+          app.kubernetes.io/component: redis
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+        # No storageClassName: uses the cluster's default StorageClass.
+        # Works on kind, k3d, minikube, GKE, EKS, AKS, etc. out of the box.

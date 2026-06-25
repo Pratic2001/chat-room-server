@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-headless
+  namespace: chatroom
+  labels:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: mysql
+spec:
+  # Headless service (clusterIP: None) so StatefulSet pods get a stable
+  # DNS A record: mysql-N.mysql-headless.chatroom.svc.cluster.local.
+  # Required by StatefulSet; the chatroom-mysql StatefulSet spec declares
+  # serviceName: mysql-headless.
+  #
+  # Replicas use this DNS to reach the master at
+  # mysql-0.mysql-headless for CHANGE MASTER TO. Without a headless
+  # service, the standard mysql Service would load-balance across all
+  # pods — which would route the replica's first connection to itself
+  # and break the bootstrap.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+      protocol: TCP

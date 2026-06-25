@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-sentinel
+  namespace: chatroom
+  labels:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: redis-sentinel
+spec:
+  # Sentinel quorum is odd: 3 sentinels → majority = 2. We cap replicas
+  # at min(3, NODE_COUNT) in scripts/deploy_k8s.sh so 1-node and 2-node
+  # clusters still work (with quorum=1).
+  #
+  # Replicas are NOT set here; deploy_k8s.sh scales this to
+  # min(3, NODE_COUNT) at deploy time.
+  serviceName: chatroom-redis-sentinel
+  podManagementPolicy: Parallel
+  # StatefulSet pods are immutable. We need to be able to roll the
+  # Sentinel config (e.g., to bump down-after-milliseconds), so we
+  # keep RollingUpdate with partition=0 — full rolling replace.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chatroom
+      app.kubernetes.io/component: redis-sentinel
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chatroom
+        app.kubernetes.io/component: redis-sentinel
+    spec:
+      # No hostPath, no nodeSelector, no nodeName.
+      # tolerationSeconds: 10 on the standard node-NotReady/unreachable
+      # NoExecute taints — Sentinels themselves are stateless, so a
+      # quick relocate is fine.
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
+      containers:
+        - name: sentinel
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: sentinel
+              containerPort: 26379
+              protocol: TCP
+          command:
+            # Wrapper entrypoint: write the Sentinel config from env
+            # (so we don't need a ConfigMap for the few knobs we use),
+            # then exec redis-sentinel with it.
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              POD_NAME="${POD_NAME:-$(hostname)}"
+              # Quorum: 1 when this is the only sentinel (1-node
+              # clusters), 2 otherwise. Sentinels reach consensus at
+              # majority-of-active; with 3 sentinels a quorum of 2
+              # gives us tolerance for one offline. With 1 sentinel
+              # there's no one to agree with — quorum must be 1.
+              QUORUM="${SENTINEL_QUORUM:-2}"
+              cat > /tmp/sentinel.conf <<EOF
+              port 26379
+              dir /tmp
+              # The master definition is what makes this a "Sentinel
+              # for chatroom-redis" rather than a generic Redis. We
+              # monitor the chatroom-redis service by name; Sentinel
+              # resolves it through the headless service and
+              # discovers the master from any of its known IPs.
+              sentinel monitor chatroom-redis chatroom-redis 6379 ${QUORUM}
+              sentinel down-after-milliseconds chatroom-redis 5000
+              sentinel failover-timeout chatroom-redis 10000
+              sentinel parallel-syncs chatroom-redis 1
+              sentinel resolve-hostnames yes
+              sentinel announce-ip ${POD_NAME}.chatroom-redis-sentinel
+              EOF
+              echo "[sentinel-entrypoint] starting sentinel (pod=${POD_NAME}, quorum=${QUORUM})"
+              exec redis-sentinel /tmp/sentinel.conf
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SENTINEL_QUORUM
+              value: "2"
+            - name: SENTINEL_MASTER_NAME
+              value: "chatroom-redis"
+            - name: SENTINEL_MASTER_HOST
+              value: "chatroom-redis"
+            - name: SENTINEL_MASTER_PORT
+              value: "6379"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          livenessProbe:
+            # `redis-cli -p 26379 ping` returns PONG on a healthy
+            # Sentinel.
+            exec:
+              command: ["redis-cli", "-p", "26379", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "-p", "26379", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3

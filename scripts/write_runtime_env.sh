@@ -4,7 +4,7 @@
 # Write app/.env.runtime without rebuilding the container images.
 #
 # Why this exists: scripts/deploy_k8s.sh refuses to run without
-# app/.env.runtime, because that file holds the three secrets the cluster
+# app/.env.runtime, because that file holds the four secrets the cluster
 # needs at deploy time (MySQL root password, JWT signing key, Fernet key
 # for room pass-phrase encryption). Normally scripts/build_images.sh
 # creates the file as a side effect of building the images.
@@ -30,13 +30,14 @@
 #   MYSQL_PASSWORD
 #   SECRET_KEY
 #   ROOM_SECRET_KEY
+#   REPLICATION_PASSWORD
 #   MAIL_PASSWORD
 #   MAIL_HOST
 #   MAIL_USER
 #   MAIL_PORT
 #   MAIL_FROM
 #   MAIL_USE_TLS
-# (The order after the three secrets matches the prompt order in
+# (The order after the four secrets matches the prompt order in
 # scripts/build_images.sh, so a piped-from-build invocation lines up
 # row-for-row.)
 # -----------------------------------------------------------------------------
@@ -95,30 +96,32 @@ fi
 # Acquire the three values
 # -----------------------------------------------------------------------------
 if [[ "$FROM_STDIN" -eq 1 ]]; then
-    log "Reading 9 values from stdin (3 secrets + 6 MAIL_*)..."
-    # Read exactly nine lines, in order. Trailing newline tolerated.
-    IFS= read -r MYSQL_PASSWORD  || fail "stdin closed before MYSQL_PASSWORD."
-    IFS= read -r SECRET_KEY      || fail "stdin closed before SECRET_KEY."
-    IFS= read -r ROOM_SECRET_KEY || fail "stdin closed before ROOM_SECRET_KEY."
-    IFS= read -r MAIL_PASSWORD   || fail "stdin closed before MAIL_PASSWORD."
-    IFS= read -r MAIL_HOST       || fail "stdin closed before MAIL_HOST."
-    IFS= read -r MAIL_USER       || fail "stdin closed before MAIL_USER."
-    IFS= read -r MAIL_PORT       || fail "stdin closed before MAIL_PORT."
-    IFS= read -r MAIL_FROM       || fail "stdin closed before MAIL_FROM."
-    IFS= read -r MAIL_USE_TLS    || fail "stdin closed before MAIL_USE_TLS."
+    log "Reading 10 values from stdin (4 secrets + 6 MAIL_*)..."
+    # Read exactly ten lines, in order. Trailing newline tolerated.
+    IFS= read -r MYSQL_PASSWORD      || fail "stdin closed before MYSQL_PASSWORD."
+    IFS= read -r SECRET_KEY          || fail "stdin closed before SECRET_KEY."
+    IFS= read -r ROOM_SECRET_KEY     || fail "stdin closed before ROOM_SECRET_KEY."
+    IFS= read -r REPLICATION_PASSWORD || fail "stdin closed before REPLICATION_PASSWORD."
+    IFS= read -r MAIL_PASSWORD       || fail "stdin closed before MAIL_PASSWORD."
+    IFS= read -r MAIL_HOST           || fail "stdin closed before MAIL_HOST."
+    IFS= read -r MAIL_USER           || fail "stdin closed before MAIL_USER."
+    IFS= read -r MAIL_PORT           || fail "stdin closed before MAIL_PORT."
+    IFS= read -r MAIL_FROM           || fail "stdin closed before MAIL_FROM."
+    IFS= read -r MAIL_USE_TLS        || fail "stdin closed before MAIL_USE_TLS."
 elif [[ -n "$FROM_FILE" ]]; then
     [[ -f "$FROM_FILE" ]] || fail "--from-file: $FROM_FILE not found."
-    log "Reading 9 values from $FROM_FILE (3 secrets + 6 MAIL_*)..."
+    log "Reading 10 values from $FROM_FILE (4 secrets + 6 MAIL_*)..."
     {
-        IFS= read -r MYSQL_PASSWORD  || fail "$FROM_FILE: missing MYSQL_PASSWORD on line 1."
-        IFS= read -r SECRET_KEY      || fail "$FROM_FILE: missing SECRET_KEY on line 2."
-        IFS= read -r ROOM_SECRET_KEY || fail "$FROM_FILE: missing ROOM_SECRET_KEY on line 3."
-        IFS= read -r MAIL_PASSWORD   || fail "$FROM_FILE: missing MAIL_PASSWORD on line 4."
-        IFS= read -r MAIL_HOST       || fail "$FROM_FILE: missing MAIL_HOST on line 5."
-        IFS= read -r MAIL_USER       || fail "$FROM_FILE: missing MAIL_USER on line 6."
-        IFS= read -r MAIL_PORT       || fail "$FROM_FILE: missing MAIL_PORT on line 7."
-        IFS= read -r MAIL_FROM       || fail "$FROM_FILE: missing MAIL_FROM on line 8."
-        IFS= read -r MAIL_USE_TLS    || fail "$FROM_FILE: missing MAIL_USE_TLS on line 9."
+        IFS= read -r MYSQL_PASSWORD       || fail "$FROM_FILE: missing MYSQL_PASSWORD on line 1."
+        IFS= read -r SECRET_KEY           || fail "$FROM_FILE: missing SECRET_KEY on line 2."
+        IFS= read -r ROOM_SECRET_KEY      || fail "$FROM_FILE: missing ROOM_SECRET_KEY on line 3."
+        IFS= read -r REPLICATION_PASSWORD || fail "$FROM_FILE: missing REPLICATION_PASSWORD on line 4."
+        IFS= read -r MAIL_PASSWORD        || fail "$FROM_FILE: missing MAIL_PASSWORD on line 5."
+        IFS= read -r MAIL_HOST            || fail "$FROM_FILE: missing MAIL_HOST on line 6."
+        IFS= read -r MAIL_USER            || fail "$FROM_FILE: missing MAIL_USER on line 7."
+        IFS= read -r MAIL_PORT            || fail "$FROM_FILE: missing MAIL_PORT on line 8."
+        IFS= read -r MAIL_FROM            || fail "$FROM_FILE: missing MAIL_FROM on line 9."
+        IFS= read -r MAIL_USE_TLS         || fail "$FROM_FILE: missing MAIL_USE_TLS on line 10."
     } < "$FROM_FILE"
 else
     log "Generating fresh credentials..."
@@ -139,6 +142,7 @@ fi
 [[ -n "${MYSQL_PASSWORD:-}"  ]] || fail "MYSQL_PASSWORD is empty."
 [[ -n "${SECRET_KEY:-}"      ]] || fail "SECRET_KEY is empty."
 [[ -n "${ROOM_SECRET_KEY:-}" ]] || fail "ROOM_SECRET_KEY is empty."
+[[ -n "${REPLICATION_PASSWORD:-}" ]] || fail "REPLICATION_PASSWORD is empty."
 # Fernet keys are exactly 44 url-safe base64 chars + '=' padding.
 if ! [[ "$ROOM_SECRET_KEY" =~ ^[A-Za-z0-9_-]{43}=$ ]]; then
     fail "ROOM_SECRET_KEY doesn't look like a Fernet key (expect 44 url-safe base64 chars ending in '='). Got: ${ROOM_SECRET_KEY:0:8}..."

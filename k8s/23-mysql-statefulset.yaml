@@ -1,0 +1,172 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: chatroom
+  labels:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: mysql
+spec:
+  # Replicas are NOT set here. scripts/deploy_k8s.sh scales this
+  # StatefulSet to NODE_COUNT (one pod per cluster node) at deploy time,
+  # so the same manifest works on any cluster size.
+  #
+  # Pod mysql-0 is the master (MYSQL_ROLE=master); pods mysql-1..N-1 are
+  # read-replicas (MYSQL_ROLE=replica). The pod template sets MYSQL_ROLE
+  # from the downward API on POD_NAME so the in-container bootstrap script
+  # (mysql/replication_bootstrap.sh) knows which path to take.
+  serviceName: mysql-headless
+  podManagementPolicy: OrderedReady
+  # StatefulSet pods are immutable: a config change creates a new pod
+  # rather than mutating the existing one. For the chatroom workload
+  # this means rolling the StatefulSet replaces one pod at a time, in
+  # reverse ordinal order — which is exactly what we want for replication:
+  # we don't kill mysql-0 while replicas are still pointing at it.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: chatroom
+      app.kubernetes.io/component: mysql
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: chatroom
+        app.kubernetes.io/component: mysql
+    spec:
+      # No hostPath, no nodeSelector, no nodeName — works on every cluster.
+      # tolerationSeconds: 10 on the standard node-NotReady/unreachable
+      # NoExecute taints — when a node goes unhealthy, the pod is
+      # evicted within 10s rather than waiting the k8s default of 300s.
+      # The k8s default terminationGracePeriodSeconds (30s) is left in
+      # place; that's enough for the InnoDB redo log flush on SIGTERM.
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 10
+      containers:
+        - name: mysql
+          image: chatroom-mysql:latest
+          imagePullPolicy: Never  # built locally by build_images.sh
+          ports:
+            - name: mysql
+              containerPort: 3306
+              protocol: TCP
+          env:
+            # MYSQL_ROOT_PASSWORD and REPLICATION_PASSWORD are sourced
+            # from the chatroom-mysql Secret (rendered by build_images.sh
+            # into k8s/secrets.runtime.yaml). The replica path uses
+            # REPLICATION_PASSWORD to authenticate CHANGE MASTER TO; the
+            # master path doesn't read it directly, but the in-container
+            # bootstrap script reads it on replicas.
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: chatroom-mysql
+                  key: MYSQL_ROOT_PASSWORD
+            - name: REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: chatroom-mysql
+                  key: REPLICATION_PASSWORD
+            - name: MYSQL_ROOT_HOST
+              value: "%"
+            - name: MYSQL_DATABASE
+              value: "chatroom_db"
+            # Downward API: the pod's hostname (and name) is the
+            # StatefulSet pod name (mysql-0, mysql-1, ...). The
+            # in-container bootstrap script (mysql/replication_bootstrap.sh)
+            # derives MYSQL_ROLE from this — see the comment in that
+            # script. We don't set MYSQL_ROLE via env here because k8s
+            # env values are static; the script needs to inspect the
+            # runtime hostname.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          args:
+            # Default args for both roles. The replica-only flags
+            # (--read-only, --super-read-only) are added by the in-image
+            # bootstrap script (mysql/replication_bootstrap.sh) on the
+            # replica path, conditional on MYSQL_ROLE — keeping them out
+            # of this list means a master pod never gets them by accident.
+            #
+            # --server-id is NOT in this list: the bootstrap script
+            # derives a unique value per pod from the pod ordinal
+            # (100 + ordinal) and injects it into the mysqld command
+            # line. Putting a static value here would either collide
+            # across replicas (replication breaks) or fight with the
+            # script's own derivation.
+            - --default-authentication-plugin=caching_sha2_password
+            - --character-set-server=utf8mb4
+            - --collation-server=utf8mb4_unicode_ci
+            - --log-bin=mysql-bin
+            - --gtid-mode=ON
+            - --enforce-gtid-consistency=ON
+            - --binlog-format=ROW
+          # MYSQL_ROLE is computed from the pod's hostname inside the
+          # entrypoint script (mysql/replication_bootstrap.sh) by
+          # inspecting $HOSTNAME. We don't try to set it via env here
+          # because k8s env values are static — the bootstrap needs to
+          # make the master/replica decision at runtime, not at apply time.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          livenessProbe:
+            # mysqladmin ping returns 0 on success. The official mysql image
+            # ships mysqladmin, so no extra tooling needed. We hit
+            # 127.0.0.1 (the pod itself) rather than the StatefulSet pod
+            # DNS because the probe is per-pod — there's no point asking
+            # pod A whether pod B is alive.
+            exec:
+              command:
+                - mysqladmin
+                - ping
+                - -h
+                - "127.0.0.1"
+                - -uroot
+                - -p$(MYSQL_ROOT_PASSWORD)
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            # TCP probe — once 3306 accepts, the server is up. The schema
+            # migrations in /docker-entrypoint-initdb.d/ finish before the
+            # listener is opened on the master, and on replicas the
+            # dump-load + CHANGE MASTER TO finishes before the foreground
+            # mysqld starts listening, so this is a fair readiness signal.
+            tcpSocket:
+              port: mysql
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: chatroom
+          app.kubernetes.io/component: mysql
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
+        # No storageClassName: uses the cluster's default StorageClass.
+        # Works on kind, k3d, minikube, GKE, EKS, AKS, etc. out of the box.

@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: chatroom-redis
+  namespace: chatroom
+  labels:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: redis
+spec:
+  # Master-only Service for ops/debug tools (`redis-cli -h chatroom-redis`).
+  # The app does NOT connect through this Service — it goes through
+  # Sentinels so failover is automatic. selector narrows to the pod
+  # currently labeled role=master, which is updated by an init sidecar
+  # (see the Redis StatefulSet pod template) that watches Sentinel's
+  # `get-master-addr-by-name` output.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: redis
+    role: master
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP

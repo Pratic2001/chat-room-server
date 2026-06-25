@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Response
 from sqlalchemy.orm import Session
 from app import crud, models, schemas
 from app.utils import get_password_hash, decrypt_secret, send_invite_email
-from app.database import get_db
+from app.database import get_db, get_read_db
 from app.routers.auth import get_current_user
 from typing import List
 from html import escape
@@ -14,7 +14,7 @@ def create_room(room: schemas.RoomCreate, db: Session = Depends(get_db), current
     return crud.create_room(db=db, room=room, owner_id=current_user.id)
 
 @router.get("/my", response_model=List[schemas.RoomResponse])
-def get_my_rooms(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+def get_my_rooms(db: Session = Depends(get_read_db), current_user: models.User = Depends(get_current_user)):
     rooms = crud.get_rooms_by_user(db, user_id=current_user.id)
     return rooms
 

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app import crud, models, schemas
-from app.database import get_db
+from app.database import get_db, get_read_db
 from app.routers.auth import get_current_user
 from app.thumbnails import make_thumbnail
 from app.ws_manager import manager
@@ -48,7 +48,7 @@ def get_messages_for_room(
     room_id: int,
     skip: int = 0,
     limit: int = 100,
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_read_db),
     current_user: models.User = Depends(get_current_user),
 ):
     member = db.query(models.RoomMember).filter(

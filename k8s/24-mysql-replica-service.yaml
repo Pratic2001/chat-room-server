@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-replica
+  namespace: chatroom
+  labels:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: mysql
+spec:
+  type: ClusterIP
+  # Read-path Service for the chatroom-app. Routes to all MySQL pods
+  # (master + replicas); the app uses this for read-only queries
+  # (GET /messages, GET /rooms/my) via the read_engine. Writes still
+  # flow through the `mysql` Service which only matches mysql-0.
+  #
+  # On 1-node clusters this Service has a single endpoint (the only
+  # MySQL pod); app/database.py falls back to the write_engine when
+  # MYSQL_READ_HOST == MYSQL_HOST, so the read path is correct even
+  # when there's no replica to read from.
+  #
+  # On multi-node clusters the Service load-balances reads across
+  # every pod. Reads from the master (mysql-0) are consistent; reads
+  # from a replica may lag the master by tens of milliseconds — fine
+  # for the message-history and room-list endpoints, but documented
+  # in the runbook as a known read-after-write limitation.
+  selector:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+      protocol: TCP

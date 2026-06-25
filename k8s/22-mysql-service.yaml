@@ -8,9 +8,13 @@ metadata:
     app.kubernetes.io/component: mysql
 spec:
   type: ClusterIP
+  # Selector narrows to ONLY mysql-0 — the master pod in the StatefulSet.
+  # k8s adds the `statefulset.kubernetes.io/pod-name` label automatically
+  # on every StatefulSet pod, which is how we pick out the master without
+  # needing to set a custom role label. App MYSQL_HOST=mysql resolves to
+  # mysql-0 only; writes always go to the master.
   selector:
-    app.kubernetes.io/name: chatroom
-    app.kubernetes.io/component: mysql
+    statefulset.kubernetes.io/pod-name: mysql-0
   ports:
     - name: mysql
       port: 3306

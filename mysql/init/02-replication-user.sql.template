@@ -1,0 +1,28 @@
+-- 02-replication-user.sql.template
+-- -----------------------------------------------------------------------------
+-- This file is sed-rendered at image-build time by mysql/Dockerfile.
+-- The placeholder __REPLICATION_PASSWORD__ is replaced with the value
+-- passed as the REPLICATION_PASSWORD build-arg from scripts/build_images.sh.
+--
+-- The file ends up at /docker-entrypoint-initdb.d/02-replication-user.sql
+-- (lexical order between 01-schema.sql and 99-grants.sql) and runs once,
+-- on first boot of an empty datadir, courtesy of the official mysql:8
+-- entrypoint.
+--
+-- Purpose: create the 'repl'@'%' account that replica pods use for
+-- CHANGE MASTER TO ... MASTER_USER='repl'. The 'repl' account needs
+-- REPLICATION SLAVE privilege and is the only credential replicas
+-- embed in their bootstrap configuration. Rotating the password
+-- requires editing this template, rebuilding the image, and bouncing
+-- the master pod (so 02-replication-user.sql re-runs against a fresh
+-- datadir). For everyday credential rotation, use REPLICATION_PASSWORD
+-- in app/.env.runtime and redeploy with --rebuild.
+--
+-- The official mysql entrypoint creates 'root'@'%' from
+-- MYSQL_ROOT_PASSWORD; we don't grant replication to root by default
+-- because REPLICATION SLAVE on root is a privilege-escalation risk
+-- if any app-side code path is ever tricked into connecting as root.
+
+CREATE USER 'repl'@'%' IDENTIFIED BY '__REPLICATION_PASSWORD__';
+GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+FLUSH PRIVILEGES;

@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: chatroom-redis-sentinel
+  namespace: chatroom
+  labels:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: redis-sentinel
+spec:
+  # Sentinel discovery Service. The app's REDIS_SENTINELS env var is a
+  # comma-separated list of host:port pairs; this Service exposes every
+  # Sentinel pod under a stable cluster IP for tools (`redis-cli -p 26379`)
+  # and for the app to derive its REDIS_SENTINELS list at startup.
+  #
+  # Headless so individual Sentinels are addressable by their pod DNS
+  # (sentinel-0.sentinel-headless, ...). The app doesn't depend on that
+  # directly — it uses this Service's cluster IP — but the alternative
+  # would be to embed per-pod hostnames in the rendered ConfigMap, which
+  # is brittle on scale-down.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: chatroom
+    app.kubernetes.io/component: redis-sentinel
+  ports:
+    - name: sentinel
+      port: 26379
+      targetPort: sentinel
+      protocol: TCP
