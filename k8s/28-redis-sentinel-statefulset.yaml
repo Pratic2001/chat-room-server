@@ -73,10 +73,20 @@ spec:
               dir /tmp
               # The master definition is what makes this a "Sentinel
               # for chatroom-redis" rather than a generic Redis. We
-              # monitor the chatroom-redis service by name; Sentinel
-              # resolves it through the headless service and
-              # discovers the master from any of its known IPs.
-              sentinel monitor chatroom-redis chatroom-redis 6379 ${QUORUM}
+              # point Sentinel at redis-0.redis-headless (a pod DNS
+              # name from the headless Service) so it monitors a real
+              # address from the moment the cluster starts — no
+              # dependency on the chatroom-redis Service or on any
+              # `role=master` label that nothing in this stack sets.
+              # `sentinel resolve-hostnames yes` below means Sentinel
+              # re-resolves on every election, so failover to
+              # redis-1 or redis-2 still works: when redis-0 dies,
+              # Sentinel promotes a replica, the app's
+              # `redis.asyncio.sentinel.Sentinel` client discovers the
+              # new master on its next call, and the deprecated
+              # chatroom-redis Service (which selects all redis pods)
+              # becomes a static ops/debug alias.
+              sentinel monitor chatroom-redis redis-0.redis-headless 6379 ${QUORUM}
               sentinel down-after-milliseconds chatroom-redis 5000
               sentinel failover-timeout chatroom-redis 10000
               sentinel parallel-syncs chatroom-redis 1

@@ -25,7 +25,7 @@ can hand it to anyone and they can follow it from a clean clone.
 | --- | --- | --- | --- | --- |
 | `chatroom-app` (FastAPI + static frontend) | `chat-room-server:latest` | 1 per cluster node (set by `deploy_k8s.sh`) | none | ClusterIP Service `:80` → Ingress |
 | `mysql` (database, master + read-replicas) | `chatroom-mysql:latest` | 1 per cluster node: 1 master (`mysql-0`) + N-1 read-replicas (`mysql-1..N-1`), joined via GTID-based async replication on first boot | 5Gi RWO PVC per pod | `mysql` ClusterIP Service `:3306` (master only) + `mysql-replica` ClusterIP Service (read-replicas); cluster-internal |
-| `redis` (cache + cross-pod WebSocket fan-out) | `redis:7-alpine` | 1 per cluster node: 1 master (`redis-0`) + N-1 replicas (`redis-1..N-1`), joined via `replicaof` on first boot | 1Gi RWO PVC per pod (AOF) | `chatroom-redis` ClusterIP Service (master only); the app talks to it via Sentinel |
+| `redis` (cache + cross-pod WebSocket fan-out) | `redis:7-alpine` | 1 per cluster node: 1 master (`redis-0`) + N-1 replicas (`redis-1..N-1`), joined via `replicaof` on first boot | 1Gi RWO PVC per pod (AOF) | `chatroom-redis` ClusterIP Service (static alias matching all redis pods); the app talks to it via Sentinel |
 | `redis-sentinel` (Sentinel monitors the Redis master) | `redis:7-alpine` | `min(3, NODE_COUNT)` — odd quorum | none | `chatroom-redis-sentinel` headless Service (pod DNS); app discovers the master through it |
 | `chatroom` Ingress | — | — | — | routes `chatroom.local/` to the app Service |
 
@@ -1821,9 +1821,9 @@ replica in a state where the idempotent restart path skips
 `--initialize-insecure` and re-hits the original bug. Default to
 dropping both pod and PVC.
 
-### 9.11 `redis-1` shows `role:master` instead of `role:slave`
+### 9.11 `redis-1` (or another replica) shows `role:master` instead of `role:slave`
 
-Symptom: every Redis pod thinks it's the master. The wrapper
+Symptom: more than one Redis pod thinks it's the master. The wrapper
 entrypoint in `k8s/26-redis-statefulset.yaml` decides master vs.
 replica from the pod's hostname (`redis-0` → master, anything else
 → `replicaof redis-0.redis-headless 6379`). If the pod's name does
@@ -1870,16 +1870,38 @@ Common causes:
   names.
 
 - **All Sentinels log `+sdown master chatroom-redis`.** Sentinel
-  itself is up but cannot see the master. Verify `redis-0` is
-  `1/1 Ready` and that the `chatroom-redis` Service has endpoints:
+  itself is up but cannot see the master. Sentinel monitors
+  `redis-0.redis-headless` (a pod DNS name from the
+  `redis-headless` Service) — verify `redis-0` is `1/1 Ready` and
+  that the headless Service resolves from inside the cluster:
 
   ```
-  kubectl -n chatroom get endpoints chatroom-redis
-  # should list redis-0's pod IP at port 6379
+  kubectl -n chatroom get pods -l app.kubernetes.io/component=redis
+  # redis-0 must be 1/1 Ready
+  kubectl -n chatroom exec redis-sentinel-0 -- \
+      nslookup redis-0.redis-headless
+  # must return redis-0's pod IP
   ```
 
-  If empty, the `role=master` label on `redis-0` is missing or the
-  Service selector is wrong — see `k8s/29-redis-service.yaml`.
+  If `redis-0` itself is stuck at `0/1`, check its logs:
+
+  ```
+  kubectl -n chatroom logs redis-0 --previous
+  ```
+
+  The most common causes match the mysql replica pattern (§9.10):
+  PVC stuck in `Pending`, the `redis:7-alpine` image missing on the
+  node (`ImagePullBackOff`), or the wrapper entrypoint failing
+  (rare — the script is straightforward). The wrapper entrypoint
+  branches on `${POD_NAME}` from the downward API, so a pod whose
+  name does not match `redis-0`/`redis-1`/... will fall through to
+  the master path (see §9.11).
+
+- **`chatroom-redis` Service has no endpoints.** That Service is a
+  static alias matching every redis pod (the `role=master` selector
+  was removed because nothing in the stack maintained it). If the
+  Service has no endpoints, no redis pods are `1/1 Ready` — fix
+  that first, the Service comes back automatically.
 
 - **Failover happened and the app didn't reconnect.** Sentinel
   promotes a new master and updates its config; the
@@ -1890,6 +1912,57 @@ Common causes:
   ```
   kubectl -n chatroom rollout restart deployment/chatroom-app
   ```
+
+### 9.12.1 `redis-0` stuck at `Init:0/1` (init container never exits)
+
+Symptom: `kubectl -n chatroom get pods` shows `redis-0` in `Pending`
+or `Init:0/1` indefinitely, while `redis-sentinel-0..2` and the rest
+of the stack are healthy. The wrapper entrypoint never gets a chance
+to run.
+
+Common causes:
+
+- **A leftover init container on an older StatefulSet revision.**
+  Earlier revisions of `k8s/26-redis-statefulset.yaml` defined an
+  `initContainer` named `role-labeler` that ran `while true; do ...
+  done` (and never PATCHed any labels). If the StatefulSet is on a
+  controller-revision that still has it, the main `redis` container
+  never starts. Verify by checking the pod's `initContainers`:
+
+  ```
+  kubectl -n chatroom get pod redis-0 -o jsonpath='{.spec.initContainers}' | jq .
+  # should print: []   (empty list)
+  ```
+
+  If `role-labeler` is listed, the StatefulSet is on an older
+  revision. Force the new pod spec by deleting the pod:
+
+  ```
+  kubectl -n chatroom delete pod redis-0 --force --grace-period=0
+  # StatefulSet recreates it with the current (no-init-container) spec
+  ```
+
+- **The image isn't on the node.** `redis:7-alpine` is a stock
+  upstream image; if it isn't already present, kubelet pulls it on
+  first run. Verify:
+
+  ```
+  kubectl -n chatroom describe pod redis-0 | grep -E 'Image|Pull'
+  # ImagePullBackOff / ErrImagePull means the node can't reach the
+  # registry. On local clusters (kind/k3d/minikube) check the
+  # cluster's registry config.
+  ```
+
+- **PVC stuck in `Pending`.** Same pattern as a stuck MySQL replica
+  — see §9.10. The StatefulSet pod won't reach `Init` until its PVC
+  is bound.
+
+After the init-container fix lands, also `kubectl rollout restart
+statefulset/redis-sentinel -n chatroom` so the Sentinel pods pick up
+the new `sentinel monitor` target (`redis-0.redis-headless` instead
+of `chatroom-redis`). Existing Sentinel processes have the old monitor
+target cached in their config and will keep logging `+sdown master`
+until they restart.
 
 ### 9.13 `mysql-replica` Service has no endpoints
 

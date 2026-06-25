@@ -29,12 +29,15 @@ spec:
       labels:
         app.kubernetes.io/name: chatroom
         app.kubernetes.io/component: redis
-        # role: master is set on the current master. Replicas get
-        # role=replica by default; an init sidecar updates this label
-        # (in-place) on whichever pod is currently the master, so the
-        # chatroom-redis Service routes to it. The label change is
-        # applied via the Redis sentinel sidecar.
-        role: replica
+        # No role label here. Master vs. replica is decided by the wrapper
+        # entrypoint from the pod's hostname (redis-0 → master path;
+        # redis-1..N-1 → replica path with --replicaof redis-0.redis-headless).
+        # Pods can't change their own labels, so a runtime role flip after
+        # failover would need a separate operator — instead, Sentinel
+        # monitors redis-0.redis-headless directly and the app reconnects
+        # via redis.asyncio.sentinel.Sentinel on every call. The
+        # chatroom-redis Service is a static alias for all redis pods
+        # (see k8s/29-redis-service.yaml).
     spec:
       # No hostPath, no nodeSelector, no nodeName.
       # tolerationSeconds: 10 on the standard node-NotReady/unreachable
@@ -51,56 +54,6 @@ spec:
           operator: Exists
           effect: NoExecute
           tolerationSeconds: 10
-      initContainers:
-        # Sentinel-aware role labeler. Runs once at pod startup, watches
-        # Sentinel's master-addr output for chatroom-redis, and applies
-        # role=master to whichever pod currently owns the master role.
-        # Other pods keep role=replica (set in the pod template above).
-        #
-        # Why an init sidecar rather than an in-container script: the
-        # `role` label is a k8s label on the pod, and pods can't change
-        # their own labels (the kubelet owns them). A sidecar with a
-        # ServiceAccount token can.
-        - name: role-labeler
-          image: redis:7-alpine
-          command:
-            - /bin/sh
-            - -c
-            - |
-              set -eu
-              apt-get update >/dev/null 2>&1 && apt-get install -y --no-install-recommends curl >/dev/null 2>&1 || apk add --no-cache curl >/dev/null 2>&1 || true
-              # Note: redis:7-alpine is alpine-based; apk add works. The
-              # debian-side branch above is unreachable in this image but
-              # left for clarity if the base image is ever swapped.
-              apk add --no-cache curl >/dev/null
-              SENTINEL_HOST="chatroom-redis-sentinel"
-              SENTINEL_PORT=26379
-              MASTER_NAME="chatroom-redis"
-              POD_NAME="${POD_NAME:-$(hostname)}"
-              while true; do
-                  # get-master-addr-by-name returns two lines: ip port
-                  MASTER_ADDR="$(curl -s "${SENTINEL_HOST}:${SENTINEL_PORT}/get-master-addr-by-name/${MASTER_NAME}" || echo "")"
-                  MASTER_IP="$(echo "$MASTER_ADDR" | head -n1)"
-                  if [ -n "$MASTER_IP" ] && [ "$MASTER_IP" = "${POD_NAME}.redis-headless" ]; then
-                      # This pod is the master — flip the role label.
-                      # Use the k8s downward-API pod IP if the hostname
-                      # doesn't match (covers the case where the pod IP
-                      # is the canonical master addr).
-                      :
-                  fi
-                  # Always log; in real deployments this would PATCH
-                  # metadata.labels via the k8s API, which requires
-                  # a ServiceAccount with pod-update permissions.
-                  # Skipped here — see runbook §8.4 for the operator
-                  # workflow that maintains the role label externally.
-                  echo "[role-labeler] pod=${POD_NAME} sentinel-master=${MASTER_IP:-unknown}"
-                  sleep 30
-              done
-          env:
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
       containers:
         - name: redis
           image: redis:7-alpine

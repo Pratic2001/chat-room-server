@@ -7,17 +7,27 @@ metadata:
     app.kubernetes.io/name: chatroom
     app.kubernetes.io/component: redis
 spec:
-  # Master-only Service for ops/debug tools (`redis-cli -h chatroom-redis`).
-  # The app does NOT connect through this Service — it goes through
-  # Sentinels so failover is automatic. selector narrows to the pod
-  # currently labeled role=master, which is updated by an init sidecar
-  # (see the Redis StatefulSet pod template) that watches Sentinel's
-  # `get-master-addr-by-name` output.
+  # Ops/debug alias for every redis pod (master + replicas). Selects
+  # on the static `component: redis` label so it always has endpoints
+  # — there is no longer any `role=master` filter, because nothing in
+  # this stack maintains such a label and pods cannot change their
+  # own labels anyway. The previous role-tracking scheme was removed
+  # when the broken role-labeler init container was dropped from
+  # k8s/26-redis-statefulset.yaml.
+  #
+  # The app does NOT connect through this Service — it uses Sentinel
+  # (REDIS_SENTINELS=chatroom-redis-sentinel:26379) so failover is
+  # automatic. After a Sentinel-promoted failover the Service here
+  # is stale (it still points at all pods, not just the new master),
+  # which is fine because nothing depends on it for routing.
+  #
+  # To reach the master directly: `redis-0.redis-headless` (the
+  # boot-time master) or ask Sentinel — `kubectl exec redis-sentinel-0
+  # -- redis-cli -p 26379 sentinel get-master-addr-by-name chatroom-redis`.
   type: ClusterIP
   selector:
     app.kubernetes.io/name: chatroom
     app.kubernetes.io/component: redis
-    role: master
   ports:
     - name: redis
       port: 6379
