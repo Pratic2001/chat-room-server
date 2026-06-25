@@ -12,8 +12,9 @@ spec:
   #
   # Pod redis-0 is the master; pods redis-1..N-1 are read-replicas. The
   # entrypoint script (rendered below via args:) decides which path to
-  # take based on the pod's hostname. The replicaof command is set in
-  # the args list so it's applied at startup; no post-start hook needed.
+  # take based on the pod's hostname. The replicaof directive is written
+  # into a dedicated config file by the replica branch — see the long
+  # comment block there for why we don't pass it via CLI args.
   serviceName: redis-headless
   podManagementPolicy: OrderedReady
   updateStrategy:
@@ -31,7 +32,8 @@ spec:
         app.kubernetes.io/component: redis
         # No role label here. Master vs. replica is decided by the wrapper
         # entrypoint from the pod's hostname (redis-0 → master path;
-        # redis-1..N-1 → replica path with --replicaof redis-0.redis-headless).
+        # redis-1..N-1 → replica path with `replicaof redis-0.redis-headless
+        # 6379` written into a per-pod config file).
         # Pods can't change their own labels, so a runtime role flip after
         # failover would need a separate operator — instead, Sentinel
         # monitors redis-0.redis-headless directly and the app reconnects
@@ -65,8 +67,15 @@ spec:
           command:
             # Wrapper entrypoint that decides master vs. replica based
             # on the pod's hostname. On master pods, exec redis-server
-            # directly. On replica pods, exec redis-server with --replicaof
-            # pointing at redis-0.redis-headless.
+            # directly with the StatefulSet's `args:`. On replica pods,
+            # we render the full config (including `replicaof ...`) into
+            # a file and exec redis-server with that file as the only
+            # arg — see the long comment in the replica branch for why
+            # we can't pass `--replicaof host port` via the CLI: the
+            # redis:7-alpine entrypoint turns CLI args into config-file
+            # lines, and any arg that follows `--replicaof` gets
+            # concatenated onto the same `replicaof` line, which Redis
+            # rejects with "wrong number of arguments".
             #
             # IMPORTANT: this script runs under BusyBox ash on the
             # redis:7-alpine image (no bash). /dev/tcp/host/port is a
@@ -79,29 +88,88 @@ spec:
             - /bin/sh
             - -c
             - |
-              set -eu
+              set -u
+              # NB: no `set -e`. The redis-cli calls in the discovery
+              # loop below can fail transiently (Sentinel still
+              # electing, the candidate master still booting, DNS
+              # not yet warm) — they need to be best-effort and let
+              # the loop's explicit checks decide whether to retry.
+              # A `set -e` here would abort on the very first failing
+              # probe and the pod would crash-loop forever.
               POD_NAME="${POD_NAME:-$(hostname)}"
               if [ "$POD_NAME" = "redis-0" ]; then
                   echo "[redis-entrypoint] master path (POD_NAME=${POD_NAME})"
                   exec redis-server "$@"
               else
-                  echo "[redis-entrypoint] replica path (POD_NAME=${POD_NAME}); waiting for redis-0..."
-                  # Wait for redis-0 to be reachable before starting
-                  # our replica. Without this, a replica that boots
-                  # before redis-0's master would fail to find the
-                  # master and crash-loop. We cap at 60s (30 attempts
-                  # × 2s) — by then the kubelet will have restarted us
-                  # via the liveness probe anyway, and a clean restart
-                  # against a now-ready master is better than a 2-minute
-                  # wait that the probe kills before it finishes.
+                  echo "[redis-entrypoint] replica path (POD_NAME=${POD_NAME}); discovering master via Sentinel..."
+                  # Discover the current master from Sentinel rather than
+                  # hard-coding `replicaof redis-0.redis-headless`. The
+                  # hard-coded form caused chained replication: after any
+                  # Sentinel-driven failover demoted redis-0, fresh
+                  # replica pods would replicate from a slave instead of
+                  # the new master, producing a multi-hop chain (and worse
+                  # availability — losing one link drops a whole branch).
+                  #
+                  # `SENTINEL get-master-addr-by-name chatroom-redis`
+                  # returns `[ip, port]`. The IP is the master pod's IP,
+                  # which is fine for boot — Sentinel itself sends
+                  # `REPLICAOF new-master-ip port` to all slaves during a
+                  # failover, so the replica will follow its master from
+                  # then on without our help. We only need a correct
+                  # initial pointer.
+                  #
+                  # We bound the wait at 60s (30 × 2s). By then kubelet
+                  # will have restarted us via the liveness probe anyway,
+                  # and a clean restart against a now-known Sentinel is
+                  # better than waiting indefinitely.
+                  MASTER_IP=""
                   for attempt in $(seq 1 30); do
-                      if redis-cli -h redis-0.redis-headless -p 6379 -t 1 ping >/dev/null 2>&1; then
-                          echo "[redis-entrypoint] redis-0 reachable on attempt $attempt"
-                          break
+                      MASTER_IP=$(redis-cli -h chatroom-redis-sentinel -p 26379 -t 1 sentinel get-master-addr-by-name chatroom-redis 2>/dev/null | head -n 1 | tr -d '\r')
+                      if [ -n "$MASTER_IP" ] && [ "$MASTER_IP" != "(nil)" ]; then
+                          # Sanity-check the candidate is actually a live
+                          # Redis master (a TCP probe alone could hit an
+                          # arbiter; an INFO reply confirms role=master).
+                          # The Redis text protocol uses CRLF line endings,
+                          # so we strip '\r' before grepping — without the
+                          # strip, `^role:master$` won't match the line
+                          # `role:master\r` and the candidate is rejected
+                          # forever even when it really is the master.
+                          if redis-cli -h "$MASTER_IP" -p 6379 -t 1 info replication 2>/dev/null | tr -d '\r' | grep -q '^role:master$'; then
+                              echo "[redis-entrypoint] Sentinel reports master=${MASTER_IP} on attempt $attempt"
+                              break
+                          fi
                       fi
+                      MASTER_IP=""
                       sleep 2
                   done
-                  exec redis-server --replicaof redis-0.redis-headless 6379 "$@"
+                  if [ -z "$MASTER_IP" ]; then
+                      echo "[redis-entrypoint] FATAL: Sentinel did not report a live master within 60s" >&2
+                      exit 1
+                  fi
+                  # The redis:7-alpine entrypoint translates every CLI
+                  # arg into a line in its rendered config file. Passing
+                  # `--replicaof host port` therefore turns into the
+                  # directive `replicaof "host" "port"` — and if any
+                  # further CLI arg follows on the same argv, the next
+                  # arg gets concatenated onto the same `replicaof` line
+                  # and Redis rejects it with "wrong number of arguments".
+                  # The first attempt (`exec redis-server --replicaof ...
+                  # 6379 "$@"`) hit exactly this bug; a second attempt
+                  # that rendered `replicaof ...` into a separate config
+                  # file and exec'd `redis-server "$REPLICA_CONF" -- "$@"`
+                  # also broke, because the entrypoint still appends the
+                  # trailing CLI args to the merged config and the first
+                  # trailing arg (`""` from `--save ""`) lands on the
+                  # same `replicaof` line.
+                  #
+                  # Cleanest fix: render the *full* config (replicaof +
+                  # everything the StatefulSet's `args:` used to pass)
+                  # into our own file and pass that to redis-server.
+                  # That way the entrypoint has no CLI args left to
+                  # splice in, and we own the file format end-to-end.
+                  REPLICA_CONF=/tmp/redis-replica.conf
+                  printf 'replicaof %s 6379\nsave ""\nappendonly yes\nappendfsync everysec\nmaxmemory 128mb\nmaxmemory-policy allkeys-lru\n' "$MASTER_IP" > "$REPLICA_CONF"
+                  exec redis-server "$REPLICA_CONF"
               fi
           args:
             - --save

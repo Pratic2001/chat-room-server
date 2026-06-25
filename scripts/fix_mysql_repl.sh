@@ -124,7 +124,7 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=1; shift ;;
         -y|--yes)
             ASSUME_YES=1; shift ;;
-        status|skip|skip-gtid|reset)
+        status|skip|skip-gtid|reset|grants)
             SUBCMD="$1"; shift
             # Collect remaining positional args (used by skip-gtid).
             while [[ $# -gt 0 && "$1" != -* ]]; do
@@ -181,9 +181,18 @@ REPL_PW="$(kubectl -n "$NAMESPACE" get secret chatroom-mysql \
 # the password via MYSQL_PWD env var, which the in-pod mysql client picks
 # up automatically — avoids the warning about passwords on the command
 # line and keeps the secret out of `kubectl describe pod` output.
+#
+# We use the unix socket (no -h) rather than --protocol=TCP -h 127.0.0.1:
+# every MySQL pod has root@localhost with the cached password (the dump
+# load populates mysql.user from the master, which always has root@%
+# even if it's missing on this replica). Root@127.0.0.1 only works when
+# root@% is present — which is exactly the case the `grants` subcommand
+# is here to repair. Using the socket keeps `status` / `skip` /
+# `skip-gtid` / `reset` callable on a broken replica, so `grants` can
+# then fix it.
 mysql_in_pod() {
     kubectl -n "$NAMESPACE" exec -i "$POD" -- \
-        env MYSQL_PWD="$ROOT_PW" mysql -uroot --protocol=TCP -h 127.0.0.1 "$@"
+        env MYSQL_PWD="$ROOT_PW" mysql -uroot "$@"
 }
 
 # -----------------------------------------------------------------------------
@@ -390,6 +399,53 @@ cmd_reset() {
 }
 
 # -----------------------------------------------------------------------------
+# Subcommand: grants
+# -----------------------------------------------------------------------------
+# Reconcile root@% on a replica to MYSQL_ROOT_PASSWORD from the
+# chatroom-mysql Secret. The chatroom-app's read engine connects as
+# root from a k8s pod IP, so it needs root@%. Replicas can end up
+# without it if the dump-load snapshot (taken by replication_bootstrap.sh
+# at first boot) happened before the master applied its own
+# 99-grants.sql — see mysql/init/99-grants.sql.template for the
+# master-side ordering. Running this on every replica after deploy
+# guarantees the read path works regardless of dump-timing race.
+#
+# Idempotent: re-running on a replica that already has the right
+# grant writes the same hash and is a no-op for the user-facing auth
+# path. Safe under the replica's --read-only / --super-read-only
+# flags because we connect via the local unix socket as root, which
+# bypasses session-level read-only the same way the official mysql
+# entrypoint does during init.
+cmd_grants() {
+    [[ ${#EXTRA_ARGS[@]} -eq 0 ]] || fail "'grants' takes no positional arguments (got: ${EXTRA_ARGS[*]})"
+
+    if [[ $ASSUME_YES -eq 0 && $DRY_RUN -eq 0 ]]; then
+        warn "This will ALTER USER 'root'@'%' IDENTIFIED BY <MYSQL_ROOT_PASSWORD> on $POD."
+        warn "It's idempotent: if root@% is already correct, this is a no-op write to the binlog."
+        read -rp "Proceed? [y/N] " ans
+        [[ "$ans" =~ ^[Yy]$ ]] || fail "Aborted."
+    fi
+
+    local sql="
+        ALTER USER 'root'@'%' IDENTIFIED BY '${ROOT_PW}';
+        FLUSH PRIVILEGES;
+    "
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log "[dry-run] Would execute on $POD:"
+        echo "----- BEGIN SQL -----"
+        printf '%s\n' "$sql"
+        echo "----- END SQL -----"
+        return 0
+    fi
+
+    log "Reconciling root@% on $POD..."
+    mysql_in_pod -e "$sql"
+    log "Done. Current grants:"
+    mysql_in_pod -e "SELECT user, host FROM mysql.user WHERE user='root';"
+}
+
+# -----------------------------------------------------------------------------
 # Dispatch
 # -----------------------------------------------------------------------------
 case "$SUBCMD" in
@@ -397,6 +453,7 @@ case "$SUBCMD" in
     skip)        cmd_skip ;;
     skip-gtid)   cmd_skip_gtid ;;
     reset)       cmd_reset ;;
+    grants)      cmd_grants ;;
     *)
         fail "Unknown subcommand: $SUBCMD (try --help)"
         ;;

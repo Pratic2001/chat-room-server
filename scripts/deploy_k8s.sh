@@ -285,8 +285,12 @@ kubectl scale deployment/chatroom-app --namespace "$NAMESPACE" --replicas="$NODE
 log "Scaling statefulset/mysql to $NODE_COUNT replicas..."
 kubectl scale statefulset/mysql --namespace "$NAMESPACE" --replicas="$NODE_COUNT"
 
-# Redis: same shape. redis-0 is the master; the rest set
-# `replicaof redis-0.redis-headless 6379` in the wrapper entrypoint.
+# Redis: same shape. redis-0 is the master; the rest write
+# `replicaof redis-0.redis-headless 6379` into a per-pod config file
+# in the wrapper entrypoint (it can't go on the CLI — the redis
+# image's entrypoint merges every CLI arg into a single config line,
+# and `--replicaof host port <next-arg>` produces the broken directive
+# `replicaof "host" "port" "<next-arg>"`).
 log "Scaling statefulset/redis to $NODE_COUNT replicas..."
 kubectl scale statefulset/redis --namespace "$NAMESPACE" --replicas="$NODE_COUNT"
 
@@ -311,6 +315,36 @@ kubectl scale statefulset/redis-sentinel --namespace "$NAMESPACE" --replicas="$S
 # we wait on the app.
 log "Waiting for MySQL StatefulSet to be ready..."
 kubectl -n "$NAMESPACE" rollout status statefulset/mysql --timeout=5m
+
+# Reconcile root@% on every ready replica. The chatroom-app's read
+# engine connects as root from a k8s pod IP, so it needs `root@%` on
+# every replica. Replicas can lack that grant when the dump-load
+# snapshot (taken by mysql/replication_bootstrap.sh at first boot)
+# happens before the master applies its own 99-grants.sql — a known
+# dump-timing race. The bootstrap-time guard in replication_bootstrap.sh
+# now ALTER USERs root@% on every fresh replica, so brand-new pods are
+# already correct. We still re-run the fix on every existing replica
+# here: it's idempotent, it repairs any cluster that was deployed
+# before that guard landed, and it converges the grant on every pod
+# to the same password hash regardless of binlog-replication quirks
+# on the mysql schema.
+#
+# We iterate over status.readyReplicas (not spec.replicas) so a
+# partial rollout doesn't make this loop call a not-yet-existing pod
+# — the deploy script just scaled the StatefulSet, so the second
+# replica may still be mid-bootstrap when we get here.
+CURRENT_READY_REPLICAS="$(kubectl get statefulset mysql \
+    --namespace "$NAMESPACE" \
+    -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)"
+if [[ "$CURRENT_READY_REPLICAS" =~ ^[0-9]+$ ]] && (( CURRENT_READY_REPLICAS > 1 )); then
+    for ((i=1; i<CURRENT_READY_REPLICAS; i++)); do
+        log "Reconciling root@% on mysql-$i..."
+        "$REPO_ROOT/scripts/fix_mysql_repl.sh" \
+            grants --pod "mysql-$i" --namespace "$NAMESPACE" --yes
+    done
+else
+    log "Skipping root@% reconciliation (no replicas ready; readyReplicas=$CURRENT_READY_REPLICAS)."
+fi
 
 log "Waiting for Redis StatefulSet to be ready..."
 kubectl -n "$NAMESPACE" rollout status statefulset/redis --timeout=5m
