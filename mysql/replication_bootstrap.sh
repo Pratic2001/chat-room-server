@@ -181,6 +181,51 @@ fi
 # Step 4: Start mysqld in the background with --skip-networking so no
 # external client can race our setup. --socket pins the socket path so
 # the local mysql client knows where to find it.
+#
+# --init-file=/tmp/replica-bootstrap-init.sql is the load-bearing piece
+# of the dump-load path. After --initialize-insecure, root@localhost on
+# MySQL 8 uses caching_sha2_password with an empty hash; the
+# empty-password fast path over a unix socket is unreliable on some
+# MySQL 8 releases — the local `mysql --user=root --socket=…` (no
+# password) call in the dump-load below gets 1045 with (using
+# password: NO). The init file installs auth_socket and pins
+# root@localhost to it BEFORE the background mysqld accepts any client
+# connections, so the dump-load's local mysql client connects
+# passwordlessly via the OS-user match. The init file is idempotent so
+# a re-run on a populated datadir (the script's idempotent-restart
+# path at the top of the replica block) still works.
+log "Writing /tmp/replica-bootstrap-init.sql..."
+cat > /tmp/replica-bootstrap-init.sql <<'INIT_SQL'
+-- Replica bootstrap init file (mysql/replication_bootstrap.sh).
+-- Runs once at mysqld startup, before the server accepts any client
+-- connections. Idempotent so re-runs on a populated datadir (e.g. a
+-- rescheduled replica) don't fail.
+
+-- Register auth_socket plugin if not already registered. INSTALL
+-- PLUGIN has no IF NOT EXISTS form, so guard with
+-- INFORMATION_SCHEMA.PLUGINS.
+SET @do_install := (SELECT COUNT(*) = 0
+    FROM INFORMATION_SCHEMA.PLUGINS
+    WHERE PLUGIN_NAME = 'auth_socket' AND PLUGIN_STATUS = 'ACTIVE');
+SET @sql := IF(@do_install,
+    'INSTALL PLUGIN auth_socket SONAME ''auth_socket.so''',
+    'DO 0');
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+-- Pin root@localhost to auth_socket. The dump-load below runs
+-- `mysql --user=root --socket=…` with no password, and the script
+-- continues to use the same connection for every subsequent local
+-- mysql / mysqladmin call until the foreground mysqld takes over.
+-- auth_socket is the only plugin that gives a reliable password-less
+-- unix-socket connection regardless of MySQL 8 caching_sha2_password
+-- startup state. The plugin's .so is bundled at
+-- /usr/lib/mysql/plugin/auth_socket.so in the mysql:8.0-debian base.
+ALTER USER 'root'@'localhost' IDENTIFIED WITH auth_socket;
+INIT_SQL
+chmod 644 /tmp/replica-bootstrap-init.sql
+
 log "Starting mysqld (background, skip-networking)..."
 mkdir -p /var/run/mysqld
 chown -R mysql:mysql /var/run/mysqld 2>/dev/null || true
@@ -200,6 +245,7 @@ chown -R mysql:mysql /var/run/mysqld 2>/dev/null || true
     --skip-networking \
     --socket=/var/run/mysqld/mysqld.sock \
     --pid-file=/var/run/mysqld/mysqld.pid \
+    --init-file=/tmp/replica-bootstrap-init.sql \
     >> /var/log/mysqld-bootstrap.log 2>&1 &
 # MYSQLD_BG_PID is captured for diagnostics if the startup fails.
 MYSQLD_BG_PID=$!
@@ -225,14 +271,19 @@ for attempt in $(seq 1 60); do
 done
 
 # Step 5: Dump-load from master. The dump includes the mysql/ system
-# schema, so the local repl user and root user (which we just initialized
-# with no password) get overwritten by the master's values. The dump
-# itself is piped through `mysql --user=root --socket=…` with no
-# password, because on the freshly-initialized server root@localhost
-# uses auth_socket (matches the OS root user — same as the init). The
-# `ALTER USER 'root'@'localhost' IDENTIFIED WITH auth_socket;` reset
-# below restores that same auth_socket shortcut for every subsequent
-# local mysql call in this script.
+# schema, so the local repl user and root user get overwritten by the
+# master's values. The dump is piped through `mysql --user=root
+# --socket=…` with no password; this connection works because the
+# `--init-file` on the background mysqld above already pinned
+# `root@localhost` to `auth_socket` (which authenticates by matching
+# the OS user — root in this container — and skips the password
+# roundtrip entirely). The dump itself then overwrites mysql.user with
+# the master's rows, which use `caching_sha2_password` + a hash of
+# `MYSQL_ROOT_PASSWORD`. The `ALTER USER 'root'@'localhost'
+# IDENTIFIED WITH auth_socket;` reset below re-pins root to
+# auth_socket so every subsequent local mysql call in this script
+# (CHANGE MASTER TO, START SLAVE, the temp mysqld shutdown) is again
+# password-less. See RUNBOOK.md §9.10 for the full failure modes.
 log "Cloning master via mysqldump..."
 # --no-tablespaces: skip tablespace metadata. The 'repl'@'%' user only
 # has REPLICATION SLAVE — mysqldump's tablespaces branch additionally
@@ -261,34 +312,6 @@ if ! mysqldump \
 fi
 log "Dump-load complete."
 
-# Register the auth_socket plugin if it isn't loaded yet. The
-# /usr/lib/mysql/plugin/auth_socket.so shared object is bundled in the
-# mysql:8.0-debian base image but is NOT registered in the mysql.plugin
-# table by --initialize-insecure — so on a freshly-initialized replica
-# the plugin is unknown to the server and a direct
-# `ALTER USER ... IDENTIFIED WITH auth_socket` fails with
-# `ERROR 1524 (HY000): Plugin 'auth_socket' is not loaded`.
-#
-# INSTALL PLUGIN has no IF NOT EXISTS form (a re-INSTALL errors with
-# ERROR 1968), and this script is meant to be re-runnable on rescheduled
-# replicas, so guard the install with a SELECT against
-# INFORMATION_SCHEMA.PLUGINS — the same table the server itself reads
-# when resolving `IDENTIFIED WITH <plugin>` lookups.
-#
-# After the dump-load above, the local mysql.plugin was overwritten by
-# the master's row, which registers auth_socket as ACTIVE (the master
-# runs the same plugin via its own 99-grants.sql path / app connections).
-# So on a normal clone the guard short-circuits and we skip the install.
-# On a fresh `--initialize-insecure` without a dump (defensive only —
-# shouldn't happen with the current topology) the guard fires.
-if ! mysql --user=root --socket=/var/run/mysqld/mysqld.sock -Nse \
-        "SELECT 1 FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME='auth_socket' AND PLUGIN_STATUS='ACTIVE'" \
-        | grep -q '^1$'; then
-    log "Installing auth_socket plugin (not registered on this server)..."
-    mysql --user=root --socket=/var/run/mysqld/mysqld.sock \
-        -e "INSTALL PLUGIN auth_socket SONAME 'auth_socket.so'"
-fi
-
 # After the dump, root@localhost on this replica has been overwritten by
 # the master's `mysql.user` rows — which use `caching_sha2_password` (the
 # MySQL 8 default) with a hash of the master's MYSQL_ROOT_PASSWORD. That
@@ -305,10 +328,14 @@ fi
 # only for the mysqld processes, never for the mysql client), so
 # auth_socket is correct here.
 #
-# Prerequisite: the plugin must be registered before this ALTER USER runs
-# — see the INFORMATION_SCHEMA.PLUGINS guard immediately above. On the
-# mysql:8.0-debian base the .so is at /usr/lib/mysql/plugin/, so the
-# install always succeeds; the guard just makes the step idempotent.
+# Prerequisite: the auth_socket plugin must be registered before this
+# ALTER USER runs. The `--init-file` on the background mysqld
+# (see "Step 4" above) installed it idempotently at server startup, so
+# it's always available here. The earlier "INSTALL PLUGIN if not
+# registered" guard that lived in this slot was removed when the
+# init-file took over the install — the dump-load already used a
+# passwordless auth_socket connection, so a post-dump install would
+# have been redundant.
 #
 # We use the same dump-time mysql --user=root --socket=… (no password)
 # connection that the dump-load just used, so no password roundtrip is

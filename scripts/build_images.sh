@@ -120,6 +120,10 @@ prompt_default() {
 }
 
 log "SMTP configuration (leave blank to disable invite emails)..."
+# MYSQL_READ_HOST is prompted at the end of this block (after MAIL_USE_TLS)
+# so the topology decision — single-node (leave empty) vs multi-node
+# (set to mysql-replica) — can be made without re-running the SMTP
+# prompts.
 MAIL_HOST="$(prompt_default '  MAIL_HOST' "$MAIL_HOST")"
 # MAIL_PORT: must be an integer 1-65535 or blank (→ 587). Re-prompt on
 # garbage input rather than failing the whole build.
@@ -155,6 +159,48 @@ while :; do
         n|no|0|false)  MAIL_USE_TLS="false"; break ;;
         "")            MAIL_USE_TLS="$MAIL_USE_TLS"; break ;;  # default kept
         *) warn "MAIL_USE_TLS must be y/n/yes/no/true/false (or blank); got '$MAIL_USE_TLS_INPUT'." ;;
+    esac
+done
+
+# MYSQL_READ_HOST: read-only endpoints (GET /messages, GET /rooms/my)
+# connect here. On 1-node clusters (kind/k3d/minikube) keep this empty
+# so app/database.py falls back to MYSQL_HOST and reads land on the
+# master. On multi-node clusters set it to "mysql-replica" (matches
+# k8s/24-mysql-replica-service.yaml) so reads land on the replica.
+#
+# Two-step prompt: first ask whether to keep it empty (the 1-node
+# default). If the user says yes, MYSQL_READ_HOST stays empty. If no,
+# prompt for the actual host. This is structured as y/n rather than a
+# free-form read so it's obvious from the prompt itself what "empty"
+# means in this context — a blank value with a free-form prompt is
+# ambiguous between "I want to keep it empty" and "I just hit enter by
+# accident".
+while :; do
+    KEEP_READ_HOST_EMPTY_INPUT="$(prompt_default '  Keep MYSQL_READ_HOST empty (1-node / single-master)?' "$([[ -z "$MYSQL_READ_HOST" ]] && echo y || echo n)")"
+    case "${KEEP_READ_HOST_EMPTY_INPUT,,}" in
+        y|yes|1|true)
+            MYSQL_READ_HOST=""
+            break
+            ;;
+        n|no|0|false)
+            # Multi-node path: ask for the actual read host. The
+            # default mirrors the in-cluster chatroom-mysql-replica
+            # Service (k8s/24-mysql-replica-service.yaml) so a fresh
+            # build that wants replicas picks the right name. Host
+            # names are typically short hostnames (no URL-special
+            # chars), so we accept any non-empty value verbatim.
+            while :; do
+                MYSQL_READ_HOST_INPUT="$(prompt_default '  MYSQL_READ_HOST' "${MYSQL_READ_HOST:-mysql-replica}")"
+                if [[ -n "$MYSQL_READ_HOST_INPUT" ]]; then
+                    MYSQL_READ_HOST="$MYSQL_READ_HOST_INPUT"
+                    break
+                fi
+                warn "MYSQL_READ_HOST cannot be blank (answer 'y' to the previous question if you want it empty)."
+            done
+            break
+            ;;
+        "") warn "Please answer y (keep empty) or n (set a value)." ;;
+        *)  warn "Please answer y (keep empty) or n (set a value); got '$KEEP_READ_HOST_EMPTY_INPUT'." ;;
     esac
 done
 

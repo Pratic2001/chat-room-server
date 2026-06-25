@@ -1691,14 +1691,30 @@ Common causes:
   STATUS\G` for the underlying error.
 
 - **`ERROR 1045 (28000): Access denied for user 'root'@'localhost'
+  (using password: NO)` from the dump-load's local `mysql` client.**
+  This is the dump-load itself failing: the local `mysql --user=root
+  --socket=…` (no password) call inside the `mysqldump | mysql …`
+  pipeline gets rejected. On MySQL 8, `mysqld --initialize-insecure`
+  creates `root@localhost` with `caching_sha2_password` and an empty
+  hash, and the empty-password fast path over a unix socket is not
+  reliable on every release — sometimes the server returns 1045 with
+  `(using password: NO)`. The replica bootstrap script handles this
+  with a `--init-file` that registers the `auth_socket` plugin and
+  pins `root@localhost` to `auth_socket` **before** the background
+  mysqld accepts any client connections, so the dump-load's no-
+  password connection matches the OS root user inside the container
+  and is accepted without a password roundtrip. If you're seeing this
+  error, the running `chatroom-mysql` image predates the `--init-file`
+  fix — rebuild and roll the StatefulSet (see Recovery §9.10.1 below).
+
+- **`ERROR 1045 (28000): Access denied for user 'root'@'localhost'
   (using password: YES)` from the local `mysql` client** right after
   the dump-load completes. The dump's `mysql --user=root --socket=…`
-  (no password) connection succeeded because the freshly-initialized
-  server's `root@localhost` uses the `auth_socket` plugin (matches the
-  OS root user inside the container). The dump itself overwrites
-  `root@localhost` with the master's row, which uses
-  `caching_sha2_password` (MySQL 8 default) and stores a hash of
-  `MYSQL_ROOT_PASSWORD`. The replica bootstrap then tries to
+  (no password) connection succeeded — `root@localhost` is already
+  pinned to `auth_socket` by the `--init-file` described in the bullet
+  above. The dump itself overwrites `root@localhost` with the master's
+  row, which uses `caching_sha2_password` (MySQL 8 default) and stores
+  a hash of `MYSQL_ROOT_PASSWORD`. The replica bootstrap then tries to
   `CHANGE MASTER TO + START SLAVE` over that same socket using
   `--password="$MYSQL_ROOT_PASSWORD"` — and on a unix-socket
   connection, `caching_sha2_password` has a known sharp edge where
@@ -1709,6 +1725,101 @@ Common causes:
   is password-less and routed via the OS-user match. If you see this
   error on an older build, rebuild the MySQL image so the new
   bootstrap script ships.
+
+### 9.10.1 Recovery: stuck `mysql-1` after a bootstrap failure
+
+The bootstrap script exits 1 on any of the failure modes above, and
+the pod's restartPolicy is `Always`, so the replica enters
+`CrashLoopBackOff`. The PVC has a partially-initialized datadir from
+the failed attempt — either the temp mysqld got far enough to write
+files, or it didn't. The script's idempotent-restart path at
+`mysql/replication_bootstrap.sh:161-162` then skips
+`--initialize-insecure` on the next attempt (it sees an existing
+`${DATADIR}/mysql` directory), so a re-run on a stale PVC hits the
+same bug regardless of which image is running.
+
+**Default to dropping both pod and PVC** so the StatefulSet recreates
+with a fresh datadir. The replica has no useful state to preserve —
+replication is fresh-cloned from the master on every cold start, so
+there's nothing to lose on the replica side.
+
+1. Build the patched image:
+
+   ```
+   ./scripts/build_images.sh
+   ```
+
+2. Load it into the cluster's container runtime (the deploy script
+   doesn't do this — `imagePullPolicy: Never` means the image has to
+   be present locally on every node, but kind/k3d/minikube all share
+   a Docker daemon with the host so a single load is enough):
+
+   ```
+   kind load docker-image chatroom-mysql:latest    # kind
+   k3d image import chatroom-mysql:latest --cluster <name>   # k3d
+   minikube image load chatroom-mysql:latest       # minikube
+   ```
+
+3. Apply the new manifest and reconcile the cluster (this is
+   idempotent — safe to run on a healthy cluster too):
+
+   ```
+   ./scripts/deploy_k8s.sh
+   ```
+
+4. **Drop the stuck pod and its PVC** so the StatefulSet recreates
+   with a fresh datadir:
+
+   ```
+   kubectl -n chatroom delete pod mysql-1
+   kubectl -n chatroom delete pvc data-mysql-1
+   ```
+
+   The StatefulSet recreates the pod within seconds; the PVC is
+   re-bound to a freshly-provisioned volume (the cluster's default
+   StorageClass handles this). The new pod's bootstrap runs from a
+   blank datadir — `--initialize-insecure` runs, the `--init-file`
+   pins `root@localhost` to `auth_socket`, the dump-load succeeds.
+
+5. Watch the bootstrap log for the success markers. The whole flow
+   takes 30-90s on a populated master:
+
+   ```
+   kubectl -n chatroom logs -f mysql-1 | grep -E 'init-file|MASTER_AUTO|Seconds_Behind|Dump-load|Replication started'
+   ```
+
+   You should see, in order:
+   - `Writing /tmp/replica-bootstrap-init.sql...`
+   - `Local mysqld ready on attempt N`
+   - `Dump-load complete`
+   - `Replication started successfully`
+   - `Slave_IO_Running: Yes` + `Slave_SQL_Running: Yes` (from the
+     `SHOW SLAVE STATUS` verification)
+
+6. Confirm replication is keeping up:
+
+   ```
+   kubectl -n chatroom exec mysql-1 -- \
+       mysql -uroot -e 'SHOW SLAVE STATUS\G' | grep Seconds_Behind
+   # Seconds_Behind_Master: 0
+   ```
+
+   And that the row count on a sample table matches the master
+   (replication lag is sub-second in steady state, so a few-second
+   gap between the two `COUNT(*)` calls is plenty):
+
+   ```
+   kubectl -n chatroom exec mysql-0 -- mysql -uroot chatroom_db \
+       -e 'SELECT COUNT(*) AS messages FROM messages'
+   kubectl -n chatroom exec mysql-1 -- mysql -uroot chatroom_db \
+       -e 'SELECT COUNT(*) AS messages FROM messages'
+   ```
+
+This recovery flow also applies to any future replica bootstrap
+failure — keeping a stale PVC after an image rollback can leave the
+replica in a state where the idempotent restart path skips
+`--initialize-insecure` and re-hits the original bug. Default to
+dropping both pod and PVC.
 
 ### 9.11 `redis-1` shows `role:master` instead of `role:slave`
 
