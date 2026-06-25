@@ -22,7 +22,19 @@
 -- MYSQL_ROOT_PASSWORD; we don't grant replication to root by default
 -- because REPLICATION SLAVE on root is a privilege-escalation risk
 -- if any app-side code path is ever tricked into connecting as root.
-
+--
+-- RELOAD is needed alongside REPLICATION SLAVE because mysqldump
+-- --single-transaction issues `FLUSH TABLES` to get a consistent
+-- snapshot. Without RELOAD, the dump fails with
+--   mysqldump: Couldn't execute 'FLUSH TABLES': Access denied;
+--     you need (at least one of) the RELOAD or FLUSH_TABLES
+--     privilege(s) for this operation (1227)
+-- Replicas will then log "Initial dump-load failed; check that the
+-- master is healthy and credentials match." (this is a credentials
+-- problem only in the sense that the 'repl' user is missing a
+-- privilege the dump needs). RELOAD is the safer of the two grants
+-- — it's a common replication-tooling requirement, and 'repl' is
+-- already trusted with the binlog stream.
 CREATE USER 'repl'@'%' IDENTIFIED BY '__REPLICATION_PASSWORD__';
-GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+GRANT REPLICATION SLAVE, RELOAD ON *.* TO 'repl'@'%';
 FLUSH PRIVILEGES;

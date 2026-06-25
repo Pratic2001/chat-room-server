@@ -217,15 +217,13 @@ done
 
 # Step 5: Dump-load from master. The dump includes the mysql/ system
 # schema, so the local repl user and root user (which we just initialized
-# with no password) get overwritten by the master's values. After this
-# step, root@localhost has the master's password and requires it for
-# fresh connections — so the post-dump mysql / mysqladmin calls below
-# use --password=$MYSQL_ROOT_PASSWORD.
-#
-# The dump itself is piped through `mysql --user=root` without a password
-# because that connection starts before the dump's `ALTER USER` statement
-# lands, and on the freshly-initialized server root@localhost uses
-# auth_socket (matches the OS root user — same as the init).
+# with no password) get overwritten by the master's values. The dump
+# itself is piped through `mysql --user=root --socket=…` with no
+# password, because on the freshly-initialized server root@localhost
+# uses auth_socket (matches the OS root user — same as the init). The
+# `ALTER USER 'root'@'localhost' IDENTIFIED WITH auth_socket;` reset
+# below restores that same auth_socket shortcut for every subsequent
+# local mysql call in this script.
 log "Cloning master via mysqldump..."
 if ! mysqldump \
     --host="${MYSQL_MASTER_HOST}" \
@@ -246,15 +244,39 @@ if ! mysqldump \
 fi
 log "Dump-load complete."
 
-# Helper: run a mysql client command against the local server with the
-# post-dump root credentials. Defined after the dump-load because before
-# the dump, root@localhost uses auth_socket (no password needed); after,
-# it requires MYSQL_ROOT_PASSWORD.
+# After the dump, root@localhost on this replica has been overwritten by
+# the master's `mysql.user` rows — which use `caching_sha2_password` (the
+# MySQL 8 default) with a hash of the master's MYSQL_ROOT_PASSWORD. That
+# plugin on a unix-socket connection has a known sharp edge: it requires
+# either a secure transport or a successful RSA key exchange for the
+# cleartext password, and even with --password on the command line the
+# mysql client can fail with "Access denied" (1227 / 1045) because the
+# server doesn't accept the cleartext over the socket under all startup
+# states. The reliable workaround is to re-pin root@localhost to
+# auth_socket (matches the OS root user inside the container), which
+# gives every local `mysql` call a password-less connection by virtue of
+# running as root — same trick the official mysql entrypoint uses during
+# init. This script runs as root throughout (gosu drops to the mysql user
+# only for the mysqld processes, never for the mysql client), so
+# auth_socket is correct here.
+#
+# We use the same dump-time mysql --user=root --socket=… (no password)
+# connection that the dump-load just used, so no password roundtrip is
+# needed to make this change.
+mysql --user=root --socket=/var/run/mysqld/mysqld.sock <<'SQL'
+ALTER USER 'root'@'localhost' IDENTIFIED WITH auth_socket;
+FLUSH PRIVILEGES;
+SQL
+
+# Helper: run a mysql client command against the local server as root
+# via the unix socket and the auth_socket plugin. Defined after the
+# dump-load + auth_socket reset because both steps assume the dump-time
+# password-less connection is still valid.
 mysql_local() {
-    mysql --user=root --password="${MYSQL_ROOT_PASSWORD}" --socket=/var/run/mysqld/mysqld.sock "$@"
+    mysql --user=root --socket=/var/run/mysqld/mysqld.sock "$@"
 }
 mysqladmin_local() {
-    mysqladmin --user=root --password="${MYSQL_ROOT_PASSWORD}" --socket=/var/run/mysqld/mysqld.sock "$@"
+    mysqladmin --user=root --socket=/var/run/mysqld/mysqld.sock "$@"
 }
 
 # Step 6+7: Configure replication and start the slave thread.

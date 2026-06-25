@@ -1690,6 +1690,26 @@ Common causes:
   is not making progress — check `Last_IO_Error` in `SHOW SLAVE
   STATUS\G` for the underlying error.
 
+- **`ERROR 1045 (28000): Access denied for user 'root'@'localhost'
+  (using password: YES)` from the local `mysql` client** right after
+  the dump-load completes. The dump's `mysql --user=root --socket=…`
+  (no password) connection succeeded because the freshly-initialized
+  server's `root@localhost` uses the `auth_socket` plugin (matches the
+  OS root user inside the container). The dump itself overwrites
+  `root@localhost` with the master's row, which uses
+  `caching_sha2_password` (MySQL 8 default) and stores a hash of
+  `MYSQL_ROOT_PASSWORD`. The replica bootstrap then tries to
+  `CHANGE MASTER TO + START SLAVE` over that same socket using
+  `--password="$MYSQL_ROOT_PASSWORD"` — and on a unix-socket
+  connection, `caching_sha2_password` has a known sharp edge where
+  the server doesn't accept the cleartext password under all startup
+  states, so the client gets a 1045. The replica bootstrap script
+  handles this by re-pinning `root@localhost` to `auth_socket`
+  immediately after the dump, so every subsequent local `mysql` call
+  is password-less and routed via the OS-user match. If you see this
+  error on an older build, rebuild the MySQL image so the new
+  bootstrap script ships.
+
 ### 9.11 `redis-1` shows `role:master` instead of `role:slave`
 
 Symptom: every Redis pod thinks it's the master. The wrapper
