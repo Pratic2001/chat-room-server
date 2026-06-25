@@ -68,8 +68,14 @@ spec:
             # directly. On replica pods, exec redis-server with --replicaof
             # pointing at redis-0.redis-headless.
             #
-            # We pass the redis-server args as the command's args so the
-            # script below can prepend the role-specific bits.
+            # IMPORTANT: this script runs under BusyBox ash on the
+            # redis:7-alpine image (no bash). /dev/tcp/host/port is a
+            # bash-only feature and silently "fails open" under ash
+            # because the redirect-target /dev/tcp/.../port is treated
+            # as a missing path. Use redis-cli to probe instead — it's
+            # in the same image, so no extra install, and it also
+            # verifies the peer speaks Redis (a bare TCP-connect check
+            # would happily pass against a TCP echo server).
             - /bin/sh
             - -c
             - |
@@ -83,14 +89,15 @@ spec:
                   # Wait for redis-0 to be reachable before starting
                   # our replica. Without this, a replica that boots
                   # before redis-0's master would fail to find the
-                  # master and crash-loop.
-                  for attempt in $(seq 1 60); do
-                      if (echo > /dev/tcp/redis-0.redis-headless/6379) >/dev/null 2>&1; then
+                  # master and crash-loop. We cap at 60s (30 attempts
+                  # × 2s) — by then the kubelet will have restarted us
+                  # via the liveness probe anyway, and a clean restart
+                  # against a now-ready master is better than a 2-minute
+                  # wait that the probe kills before it finishes.
+                  for attempt in $(seq 1 30); do
+                      if redis-cli -h redis-0.redis-headless -p 6379 -t 1 ping >/dev/null 2>&1; then
                           echo "[redis-entrypoint] redis-0 reachable on attempt $attempt"
                           break
-                      fi
-                      if [ "$attempt" = 60 ]; then
-                          echo "[redis-entrypoint] redis-0 did not become reachable; starting anyway (replicaof will retry)"
                       fi
                       sleep 2
                   done
