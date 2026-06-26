@@ -95,11 +95,22 @@ CONSUMER_GROUP = "chatroom-app"
 # Module-level handles. init_bus fills these in; everyone else imports
 # the names below.
 _local_dispatch: Callable[[int, str], Awaitable[None]] | None = None
-# `_client` is the redis.asyncio.Redis instance for direct connections
-# (local dev), or the redis.asyncio.sentinel.Sentinel instance for
-# Sentinel-managed deployments. The bus uses it to call XADD / XREADGROUP
-# etc. transparently in both modes.
+# `_client` is the redis.asyncio.Redis instance used for every bus
+# operation (XADD / XREADGROUP / XACK / XGROUP CREATE). In direct mode
+# (REDIS_URL) this is the connection returned by `aioredis.from_url`.
+# In Sentinel mode (REDIS_SENTINELS) this is the *master* connection
+# returned by `sentinel.master_for(...)` — `Sentinel` itself only knows
+# about discovery (discover_master / get_master_addr_by_name), so we
+# resolve the master once here and reuse the resulting client for the
+# whole process. If the master fails over, the next call to `master_for`
+# picks up the new master; reconnect is handled in `_run_subscriber`'s
+# retry loop.
 _client = None  # type: ignore[var-annotated]
+# The underlying Sentinel instance, kept around for `close()` on
+# shutdown (master_for clients don't own the Sentinel connection, so
+# closing the master connection alone leaks it). Only set in
+# Sentinel mode; None in direct mode.
+_sentinel: object | None = None
 # True when running against a Sentinel-managed cluster (vs. a single
 # Redis instance via REDIS_URL).
 _sentinel_mode: bool = False
@@ -180,7 +191,7 @@ async def _try_connect() -> bool:
     when the bus is actually enabled. Keeps `import app.main` working
     in environments without Redis installed locally.
     """
-    global _client, _sentinel_mode, _master_name, _enabled, _subscriber_task
+    global _client, _sentinel, _sentinel_mode, _master_name, _enabled, _subscriber_task
 
     sentinels = _sentinels()
     url = _url()
@@ -194,17 +205,30 @@ async def _try_connect() -> bool:
     if sentinels is not None:
         _master_name = os.getenv("REDIS_MASTER_NAME", "chatroom-redis")
         _sentinel_mode = True
-        _client = aisentinel.Sentinel(
+        sentinel_password = os.getenv("REDIS_PASSWORD") or None
+        _sentinel = aisentinel.Sentinel(
             sentinels,
             socket_timeout=5,
-            password=os.getenv("REDIS_PASSWORD") or None,
+            password=sentinel_password,
         )
         # Probe Sentinel by asking for the master's address. If
         # Sentinel is up but the master isn't yet elected, this
         # raises MasterNotFoundError; we treat that as a transient
         # failure so the retry loop in `init_bus` can pick it up.
         try:
-            master_addr = await _client.discover_master(_master_name)
+            master_addr = await _sentinel.discover_master(_master_name)
+            # `Sentinel` itself only exposes discovery methods; bus
+            # operations (XADD / XREADGROUP / XACK / XGROUP CREATE) live
+            # on the master client. Resolve it once here so the rest of
+            # the bus can use `_client` uniformly in both Sentinel and
+            # direct mode. `master_for` re-discovers on connection loss,
+            # so a Sentinel failover triggers a one-call reconnect the
+            # next time `master_for` is invoked.
+            _client = _sentinel.master_for(
+                _master_name,
+                socket_timeout=5,
+                password=sentinel_password,
+            )
         except Exception as e:
             log.warning(
                 "Sentinels reachable but master %r not yet discovered: %s. "
@@ -212,6 +236,7 @@ async def _try_connect() -> bool:
                 _master_name, e,
             )
             _client = None
+            _sentinel = None
             _sentinel_mode = False
             return False
         log.info(
@@ -220,6 +245,7 @@ async def _try_connect() -> bool:
         )
     else:
         _sentinel_mode = False
+        _sentinel = None
         _client = aioredis.from_url(url, encoding="utf-8", decode_responses=True)
         await _client.ping()
 
@@ -320,7 +346,7 @@ async def init_bus(local_dispatch: Callable[[int, str], Awaitable[None]]) -> Non
 async def shutdown_bus() -> None:
     """Cancel the subscriber (and any pending retry loop) and close the
     Redis client. Idempotent."""
-    global _client, _subscriber_task, _retry_task, _enabled, _local_dispatch, _sentinel_mode
+    global _client, _sentinel, _subscriber_task, _retry_task, _enabled, _local_dispatch, _sentinel_mode
 
     _enabled = False
     if _retry_task is not None:
@@ -339,13 +365,18 @@ async def shutdown_bus() -> None:
         _subscriber_task = None
     if _client is not None:
         try:
-            if _sentinel_mode:
-                await _client.close()
-            else:
-                await _client.aclose()
+            await _client.aclose()
         except Exception:
             pass
         _client = None
+    if _sentinel is not None:
+        # `redis.asyncio.sentinel.Sentinel` itself doesn't expose a close
+        # method — it's just a discovery wrapper. The `master_for` client
+        # owns its own `SentinelConnectionPool` (closed above via
+        # `_client.aclose()`), so closing the master connection releases
+        # everything Sentinel-related. Drop the handle so a subsequent
+        # `_try_connect` rebuilds the wrapper.
+        _sentinel = None
     _sentinel_mode = False
     _local_dispatch = None
 
@@ -369,6 +400,7 @@ async def publish(room_id: int, payload: str) -> None:
     callback directly so a single-pod setup behaves exactly as it did
     before this module existed.
     """
+    global _client
     if not _enabled:
         if _local_dispatch is not None:
             try:
@@ -383,8 +415,19 @@ async def publish(room_id: int, payload: str) -> None:
     except Exception as e:
         # A transient publish failure shouldn't break the user's
         # request. The message is already persisted to MySQL, so a
-        # refresh will pick it up.
+        # refresh will pick it up. In Sentinel mode, also try to
+        # re-resolve the master so the *next* publish hits the new
+        # master instead of pinning the old (now-replica) address.
         log.warning("Redis XADD failed for room %s: %s", room_id, e)
+        if _sentinel_mode and _sentinel is not None:
+            try:
+                _client = _sentinel.master_for(
+                    _master_name,
+                    socket_timeout=5,
+                    password=os.getenv("REDIS_PASSWORD") or None,
+                )
+            except Exception as e2:
+                log.warning("Master re-resolution after XADD failure also failed: %s", e2)
 
 
 async def _run_subscriber() -> None:
@@ -396,12 +439,21 @@ async def _run_subscriber() -> None:
     dispatch (e.g. all local sockets are broken), we still XACK so the
     pending list doesn't grow without bound — the message is also in
     MySQL via the REST/WS upload path, so a refresh recovers it.
+
+    On a Sentinel failover the master_for connection points at a
+    Redis that is now a replica and rejects writes/reads-on-master.
+    We detect that (or any other persistent error) and re-resolve the
+    master via `_sentinel.master_for` so the next XREADGROUP targets
+    the new master. Backoff caps at 30s so a permanently-down Redis
+    doesn't pin a tight loop.
     """
-    assert _client is not None
+    global _client
+    assert _sentinel_mode is False or _sentinel is not None  # mypy appeasement
     consumer = _consumer_name()
     backoff = 1.0
     while True:
         try:
+            assert _client is not None
             # XREADGROUP GROUP <group> <consumer> COUNT N BLOCK 5000 STREAMS <key> >
             # `>` means "messages not yet delivered to any consumer in
             # this group". BLOCK 5000 returns after 5s of inactivity so
@@ -446,8 +498,22 @@ async def _run_subscriber() -> None:
         except Exception as e:
             # Connection lost (Sentinel failover, network blip, etc.).
             # Back off and try again. Cap at 30s so a permanently-down
-            # Redis doesn't pin a tight loop.
+            # Redis doesn't pin a tight loop. In Sentinel mode we also
+            # re-resolve the master so a failover picks up the new
+            # master on the next iteration instead of pinning the old
+            # (now-replica) address.
             log.warning("Redis subscriber error: %s. Retrying in %.1fs.", e, backoff)
+            if _sentinel_mode and _sentinel is not None:
+                try:
+                    _client = _sentinel.master_for(
+                        _master_name,
+                        socket_timeout=5,
+                        password=os.getenv("REDIS_PASSWORD") or None,
+                    )
+                    log.info("Re-resolved Redis master via Sentinel after subscriber error.")
+                    backoff = 1.0  # fresh connection — try promptly
+                except Exception as e2:
+                    log.warning("Master re-resolution failed: %s", e2)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
 
