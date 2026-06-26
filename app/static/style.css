@@ -17,6 +17,12 @@
     --danger: #d93b3b;
     --danger-soft: #fdecec;
     --success: #2ea66a;
+    /* AI assistant color palette (purple — distinct from the blue accent
+     * so AI messages are recognizable at a glance). Used by
+     * .message.ai-message and .message .author.ai-author. */
+    --ai-accent: #7c3aed;
+    --ai-accent-soft: #f3edff;
+    --ai-author: #7c3aed;
     --radius: 10px;
     --radius-lg: 14px;
     --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
@@ -46,6 +52,9 @@
     --received: #232733;
     --received-text: #e7e9ee;
     --danger-soft: #3a1f1f;
+    --ai-accent: #a78bfa;
+    --ai-accent-soft: #2a1f4a;
+    --ai-author: #a78bfa;
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.5);
 }
@@ -398,6 +407,30 @@ textarea {
     color: var(--text-muted);
     margin: 0 4px 2px;
 }
+/* AI-authored messages: purple-tinted bubble + purple author label.
+ * Applied in addition to `.message.received` (the AI never gets the
+ * `.sent` class because the human sender is never "the current user").
+ * The author color override survives even if the bubble color is masked
+ * by some theme quirk — purple "🤖 assistant" is the canonical AI marker. */
+.message.ai-message .bubble {
+    background: var(--ai-accent-soft);
+    color: var(--text);
+    border: 1px solid var(--ai-accent);
+    border-bottom-left-radius: 4px;
+}
+.message .author.ai-author {
+    color: var(--ai-author);
+    font-weight: 600;
+}
+/* Make the AI toggle row's label sit inline with its checkbox (the
+ * default <label> wraps to a new line, which makes the form look like
+ * the AI toggle is a separate field). */
+.ai-toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.ai-toggle-row .optional-mark { margin-left: 0; }
 .bubble {
     padding: 8px 12px;
     border-radius: 14px;

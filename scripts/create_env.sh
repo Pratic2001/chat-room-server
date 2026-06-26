@@ -186,6 +186,29 @@ MAIL_USER=CHANGE_ME_smtp_username
 MAIL_PASSWORD=CHANGE_ME_smtp_password
 MAIL_FROM="Chat Room <no-reply@example.com>"
 MAIL_USE_TLS=true
+
+# --- Ollama (AI assistant backend) -----------------------------------------
+# Used by app/ai.py when a user mentions @assistant in a room that was
+# created with ai_enabled=true. The AI sends the room's last 30 messages
+# (text content + filenames for image/file/video) to Ollama and persists
+# the response like any other chat message.
+#
+# OLLAMA_HOST must include scheme (http:// or https://). The runtime
+# passes the value through unchanged when a port is already present
+# (e.g. http://1.2.3.4:9999); otherwise it appends ":OLLAMA_PORT". For
+# local development, run `ollama serve` in another terminal and set:
+#   OLLAMA_HOST=http://localhost
+#   OLLAMA_PORT=11434
+# then `ollama pull llama3.2` (or whichever model you set below) once
+# before the first @assistant mention.
+#
+# OLLAMA_MODEL must be a model you've already pulled. Common choices:
+# llama3.2 (small/fast), llama3.1:8b, mistral, qwen2.5, phi3. The app
+# silently does nothing if Ollama is unreachable, so it's safe to leave
+# these set when the AI feature is unused.
+OLLAMA_HOST=http://localhost
+OLLAMA_PORT=11434
+OLLAMA_MODEL=llama3.2
 ENV_TEMPLATE
 
 # -----------------------------------------------------------------------------

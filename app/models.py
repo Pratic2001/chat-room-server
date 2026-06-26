@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, LargeBinary, Enum
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, LargeBinary, Enum, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -31,6 +31,14 @@ class Room(Base):
     secret_phrase_hash = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    # Per-room AI assistant config. Set at room creation; not editable later.
+    # Existing rooms created before these columns existed have ai_enabled=NULL
+    # which evaluates falsy in the trigger check, so they default to "AI off".
+    ai_enabled = Column(Boolean, nullable=False, default=False)
+    # Persona key (one of ALLOWED_PERSONAS in app/schemas.py). NULL when
+    # ai_enabled is False. VARCHAR(32) is plenty — longest key is "Anime-girlfriend".
+    ai_persona = Column(String(32), nullable=True)
 
     # Relationships
     owner = relationship("User", foreign_keys=[owner_id])

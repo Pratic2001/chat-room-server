@@ -29,6 +29,16 @@ if not all([MYSQL_USER, MYSQL_PASSWORD, MYSQL_HOST, MYSQL_DB]):
 # across the master and read-replicas.
 MYSQL_READ_HOST = os.getenv("MYSQL_READ_HOST") or MYSQL_HOST
 
+# AI assistant config (consumed by app/ai.py). All three are optional at
+# startup — app/ai.py only fires when a user mentions @assistant, and a
+# missing Ollama host just means the AI silently produces no replies
+# (with a WARNING log). OLLAMA_HOST must include scheme (http://, https://)
+# and may already include a port — app/ai.py::_ollama_url only appends
+# ":OLLAMA_PORT" when no port is present.
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama")
+OLLAMA_PORT = os.getenv("OLLAMA_PORT", "11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+
 
 def _build_url(host: str) -> str:
     return f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{host}/{MYSQL_DB}"

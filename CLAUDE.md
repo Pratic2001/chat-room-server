@@ -66,7 +66,12 @@ The project ships an HTTP frontend at `/`; you can also drive it from any WebSoc
 There is no test suite in the repo (`requirements.txt` has no pytest). For a smoke test:
 
 - `curl http://localhost:8000/healthz` → `{"status":"ok"}`
-- Sign up → log in → `GET /rooms/my` → `POST /rooms/` → `POST /rooms/join-by-name` → connect to `ws://localhost:8000/ws/{room_id}?token=<jwt>` and send a text `WSMessage`.
+- Sign up → log in → `GET /rooms/my` → `POST /rooms/` with
+  `{"ai_enabled": true, "ai_persona": "Professional"}` →
+  `POST /rooms/join-by-name` → connect to
+  `ws://localhost:8000/ws/{room_id}?token=<jwt>` and send a text
+  `WSMessage` containing `@assistant`. Within a few seconds the AI
+  should reply on the same WebSocket.
 
 ## Environment
 
@@ -76,6 +81,42 @@ There is no test suite in the repo (`requirements.txt` has no pytest). For a smo
 - `SECRET_KEY` (JWT), `ALGORITHM` (HS256), `ACCESS_TOKEN_EXPIRE_MINUTES`
 - `ROOM_SECRET_KEY` (Fernet) — `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Rotating this key invalidates every stored room pass phrase.
 - `MAIL_HOST`, `MAIL_PORT`, `MAIL_USER`, `MAIL_PASSWORD`, `MAIL_FROM`, `MAIL_USE_TLS`
+- `OLLAMA_HOST`, `OLLAMA_PORT`, `OLLAMA_MODEL` — Ollama endpoint for the
+  AI assistant (consumed by `app/ai.py`). `OLLAMA_HOST` must include
+  scheme and may already include a port; `OLLAMA_PORT` is only appended
+  when no port is present. See the "AI assistant" section above.
+
+## AI assistant
+
+Rooms with `ai_enabled=true` get a synthetic `@assistant` participant.
+The assistant is implemented as a single `users` row with
+`username='assistant'` and a persona selected from a fixed enum:
+Professional, Funny, Chaotic, Sarcastic, Anime-girlfriend,
+Peter-Griffin, Stewie-Griffin (the API values are hyphenated; the
+frontend `<select>` shows friendly labels).
+
+Trigger: when a user sends a text message containing the whole-word
+mention `@assistant` (case-insensitive, regex `(?<![\w])@assistant(?![\w])`
+so `admin@assistant.com` does NOT trigger), `app/ai.py::maybe_reply`
+runs as a background `asyncio` task. The task reads the last 30 messages
+for context, builds an Ollama chat prompt with the room's persona system
+prompt + history, and POSTs to `OLLAMA_HOST/api/chat`. If the message
+also contains a `/search <query>` keyword (same word-boundary regex),
+DuckDuckGo snippets are added as additional context before the LLM
+call. The reply is persisted to MySQL and broadcast via the existing
+WebSocket manager, so every connected client sees it like any other
+message.
+
+The AI does NOT reply to image/file/video messages (it observes them
+silently — they appear in its context as one-line notes like
+`"bob sent an image: cat.jpg"`). The AI does NOT reply to its own
+messages (loop prevention in `maybe_reply`). The AI is a `RoomMember`
+of every AI-enabled room; its membership is created at room creation,
+so no separate join API is needed.
+
+Frontend: create-room modal has an "Enable AI assistant" checkbox + a
+persona dropdown. Messages from the AI render with a purple bubble
+border and a 🤖-prefixed author line.
 
 ## Conventions / things that are easy to miss
 

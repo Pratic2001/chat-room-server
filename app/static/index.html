@@ -101,6 +101,24 @@
                     <span>Secret phrase <span class="optional-mark">(optional)</span></span>
                     <input type="text" id="new-room-secret" maxlength="80" autocomplete="off">
                 </label>
+                <label class="ai-toggle-row">
+                    <input type="checkbox" id="new-room-ai-enabled">
+                    <span>Enable AI assistant <span class="optional-mark">(mention with <code>@assistant</code>)</span></span>
+                </label>
+                <label id="new-room-ai-persona-row" hidden>
+                    <span>AI persona</span>
+                    <select id="new-room-ai-persona">
+                        <!-- `value` is the canonical API key (hyphenated);
+                             the displayed text is the friendly label. -->
+                        <option value="Professional">Professional</option>
+                        <option value="Funny">Funny</option>
+                        <option value="Chaotic">Chaotic</option>
+                        <option value="Sarcastic">Sarcastic</option>
+                        <option value="Anime-girlfriend">Anime girlfriend</option>
+                        <option value="Peter-Griffin">Peter Griffin</option>
+                        <option value="Stewie-Griffin">Stewie Griffin</option>
+                    </select>
+                </label>
                 <p id="create-room-error" class="form-error" role="alert"></p>
                 <div class="modal-actions">
                     <button type="button" id="modal-cancel" class="btn btn-ghost">Cancel</button>

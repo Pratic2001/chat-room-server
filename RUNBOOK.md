@@ -14,7 +14,7 @@ can hand it to anyone and they can follow it from a clean clone.
 >
 > **If you built the images elsewhere** (CI, a teammate, or in a
 > registry): run `./scripts/write_runtime_env.sh --from-stdin` and paste
-> the 10 values from `app/.env.runtime` — one per line, in the order
+> the 13 values from `app/.env.runtime` — one per line, in the order
 > documented in §6.5 — then run `./scripts/deploy_k8s.sh`. See §6.5.
 
 ---
@@ -1008,6 +1008,40 @@ http://localhost:8000/
 
 You should see the chat frontend served by FastAPI's static-files
 mount.
+
+### 7.6 AI assistant smoke test
+
+If you enabled the AI at build time (you answered the "Ollama
+configuration" prompts in `scripts/build_images.sh` and the
+`OLLAMA_HOST` you supplied is reachable), create an AI-enabled room
+and verify the trigger:
+
+```
+TOKEN="<paste token here>"
+# Create an AI-enabled room.
+curl -s -X POST http://localhost:8000/rooms/ \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"name":"ai-room","ai_enabled":true,"ai_persona":"Funny"}'
+# returns {"id":...,"name":"ai-room","owner_id":...,
+#         "ai_enabled":true,"ai_persona":"Funny",...}
+
+# Open a WS connection (websocat, or any WS client) and send:
+#   {"message_type":"text","content":"hi @assistant, tell me a joke"}
+# Within ~15s the AI should respond with a Funny-persona reply that
+# also reaches every other connected client (cross-pod fan-out via the
+# Redis bus).
+
+# If the AI never replies:
+#   - Check the app pod's logs for "Ollama POST failed" or
+#     "AI maybe_reply crashed" warnings.
+#   - Confirm the model is pulled on the Ollama side
+#     (`ollama pull llama3.2` against OLLAMA_HOST).
+#   - Confirm OLLAMA_HOST is reachable from the pod
+#     (`kubectl -n chatroom exec <app-pod> -- curl -sv $OLLAMA_HOST`).
+#   - Try "@ASSISTANT ping" — the mention is case-insensitive, and
+#     typos here are the most common cause of "the AI never fires".
+```
 
 ---
 

@@ -24,6 +24,11 @@ CREATE TABLE IF NOT EXISTS rooms (
     secret_phrase_hash VARCHAR(512) NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     owner_id INT NOT NULL,
+    -- Per-room AI assistant config (set at room creation; not editable
+    -- later). ai_enabled defaults to 0 so rooms created before this column
+    -- existed are "AI off" by default.
+    ai_enabled TINYINT(1) NOT NULL DEFAULT 0,
+    ai_persona VARCHAR(32) NULL,
     FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
@@ -42,6 +47,12 @@ ALTER TABLE rooms MODIFY COLUMN secret_phrase_hash VARCHAR(512) NULL;
 -- in MySQL 8.0+; on older versions the duplicate-name check above is the
 -- only thing standing between you and a failure here).
 ALTER TABLE rooms ADD UNIQUE INDEX rooms_name_unique (name);
+
+-- AI assistant config (idempotent on MySQL 8 — `ADD COLUMN IF NOT EXISTS`
+-- is supported). For MySQL 5.7 these would error and need to be wrapped in
+-- a stored procedure check; that path is out of scope here.
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS ai_enabled TINYINT(1) NOT NULL DEFAULT 0;
+ALTER TABLE rooms ADD COLUMN IF NOT EXISTS ai_persona VARCHAR(32) NULL;
 
 -- Room members table (many-to-metween users and rooms)
 CREATE TABLE IF NOT EXISTS room_members (

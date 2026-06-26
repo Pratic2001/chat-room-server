@@ -91,6 +91,12 @@ load_or_generate_runtime_secrets() {
     # mode — connect directly to REDIS_URL". The defaults here match
     # the in-cluster chatroom-redis / chatroom-redis-sentinel Services.
     local redis_url mysql_read_host redis_sentinels redis_master_name
+    # Ollama (AI assistant) topology values. Defaults match an in-cluster
+    # Ollama Service named "ollama"; users running Ollama elsewhere (a
+    # different VM, a remote host, the same box) override OLLAMA_HOST at
+    # the build-images prompt. See the new "Ollama configuration" block
+    # in scripts/build_images.sh.
+    local ollama_host ollama_port ollama_model
 
     if [[ -n "$existing_env" && -f "$existing_env" ]]; then
         # Reuse — exact same values the previous build/deploy used.
@@ -147,6 +153,13 @@ load_or_generate_runtime_secrets() {
             # group. Must match the `sentinel monitor` line in
             # k8s/28-redis-sentinel-statefulset.yaml.
             printf '%s\n' "${REDIS_MASTER_NAME-chatroom-redis}" > /tmp/_crs_redis_master_name
+            # Ollama topology. Older .env.runtime files (pre-AI-assistant)
+            # won't have these; use defaults via ${VAR-default} so they
+            # load cleanly. The user can edit .env.runtime and re-run
+            # scripts/build_images.sh to change them.
+            printf '%s\n' "${OLLAMA_HOST-http://ollama}"   > /tmp/_crs_ollama_host
+            printf '%s\n' "${OLLAMA_PORT-11434}"          > /tmp/_crs_ollama_port
+            printf '%s\n' "${OLLAMA_MODEL-llama3.2}"      > /tmp/_crs_ollama_model
         )
         mysql_pw="$(cat /tmp/_crs_mysql_pw)";          rm -f /tmp/_crs_mysql_pw
         jwt="$(cat /tmp/_crs_jwt)";                    rm -f /tmp/_crs_jwt
@@ -163,6 +176,9 @@ load_or_generate_runtime_secrets() {
         mysql_read_host="$(cat /tmp/_crs_mysql_read_host)"; rm -f /tmp/_crs_mysql_read_host
         redis_sentinels="$(cat /tmp/_crs_redis_sentinels)"; rm -f /tmp/_crs_redis_sentinels
         redis_master_name="$(cat /tmp/_crs_redis_master_name)"; rm -f /tmp/_crs_redis_master_name
+        ollama_host="$(cat /tmp/_crs_ollama_host)";       rm -f /tmp/_crs_ollama_host
+        ollama_port="$(cat /tmp/_crs_ollama_port)";       rm -f /tmp/_crs_ollama_port
+        ollama_model="$(cat /tmp/_crs_ollama_model)";     rm -f /tmp/_crs_ollama_model
     else
         # Generate. Same algorithms as change_db_password.sh.
         mysql_pw="$(generate_url_safe_password)"
@@ -201,6 +217,14 @@ load_or_generate_runtime_secrets() {
         mysql_read_host=""
         redis_sentinels="chatroom-redis-sentinel:26379"
         redis_master_name="chatroom-redis"
+        # Ollama topology defaults. "http://ollama" assumes an in-cluster
+        # Ollama Service with that exact name — common with an Ollama
+        # sidecar, but most users will override this at the
+        # build-images prompt to a real URL (http://1.2.3.4:11434,
+        # https://ollama.example.com, etc.).
+        ollama_host="http://ollama"
+        ollama_port="11434"
+        ollama_model="llama3.2"
     fi
 
     printf "MYSQL_PASSWORD=%q\n"   "$mysql_pw"
@@ -218,6 +242,9 @@ load_or_generate_runtime_secrets() {
     printf "MYSQL_READ_HOST=%q\n"  "$mysql_read_host"
     printf "REDIS_SENTINELS=%q\n"  "$redis_sentinels"
     printf "REDIS_MASTER_NAME=%q\n" "$redis_master_name"
+    printf "OLLAMA_HOST=%q\n"     "$ollama_host"
+    printf "OLLAMA_PORT=%q\n"     "$ollama_port"
+    printf "OLLAMA_MODEL=%q\n"    "$ollama_model"
 }
 
 # Atomically write app/.env.runtime with the three secrets + the rest of
@@ -266,6 +293,12 @@ write_runtime_env_file() {
     local mysql_read_host="${MYSQL_READ_HOST-}"
     local redis_sentinels="${REDIS_SENTINELS-}"
     local redis_master_name="${REDIS_MASTER_NAME-chatroom-redis}"
+    # Ollama (AI assistant). These are URLs / model names, not credentials,
+    # so the k8s ConfigMap entries are the literal values (no URL-encoding).
+    # .env files are read by python-dotenv which preserves the raw string.
+    local ollama_host="${OLLAMA_HOST-http://ollama}"
+    local ollama_port="${OLLAMA_PORT-11434}"
+    local ollama_model="${OLLAMA_MODEL-llama3.2}"
 
     local mysql_pw_enc jwt_enc fernet_enc repl_pw_enc mysql_port_enc
     local mail_host_enc mail_port_enc mail_user_enc mail_password_enc mail_from_enc mail_use_tls_enc
@@ -395,6 +428,30 @@ MAIL_USE_TLS=${mail_use_tls_enc}
 REDIS_URL="${redis_url}"
 REDIS_SENTINELS="${redis_sentinels}"
 REDIS_MASTER_NAME="${redis_master_name}"
+
+# --- Ollama (AI assistant backend; consumed by app/ai.py) ---------------
+# The AI assistant is opt-in per room (set ai_enabled=true at room
+# creation). When @assistant is mentioned in a text message, app/ai.py
+# POSTs to ${OLLAMA_HOST}:${OLLAMA_PORT}/api/chat with the room's
+# persona system prompt and the last 30 messages as context.
+#
+# OLLAMA_HOST may include scheme (http://, https://) and optionally a
+# port. app/ai.py::_ollama_url only appends ":OLLAMA_PORT" when no port
+# is present in the host. Examples:
+#   OLLAMA_HOST=http://ollama                  → http://ollama:11434
+#   OLLAMA_HOST=http://1.2.3.4                 → http://1.2.3.4:11434
+#   OLLAMA_HOST=http://1.2.3.4:9999            → http://1.2.3.4:9999  (port honored)
+#   OLLAMA_HOST=https://ollama.example.com     → https://ollama.example.com:11434
+#
+# Local dev: run "ollama serve" in another terminal and set
+# OLLAMA_HOST=http://localhost. Then "ollama pull llama3.2" (or
+# whatever model you set below) once before the first mention.
+#
+# These are URLs / model names, not credentials — the k8s ConfigMap
+# entries are the literal values (no URL-encoding).
+OLLAMA_HOST="${ollama_host}"
+OLLAMA_PORT=${ollama_port}
+OLLAMA_MODEL="${ollama_model}"
 EOF
 
     # Atomic rename. If mv fails the tmp file is left for the caller to
@@ -492,6 +549,12 @@ render_k8s_secrets() {
     # k8s/28-redis-sentinel-statefulset.yaml. The app passes this to
     # redis.asyncio.sentinel.Sentinel.
     local redis_master_name="${REDIS_MASTER_NAME:-chatroom-redis}"
+    # Ollama topology (URLs / model names — go in the ConfigMap, not the
+    # Secret). Default "http://ollama" assumes an in-cluster Service; users
+    # typically override at the build-images prompt to a real URL.
+    local ollama_host="${OLLAMA_HOST:-http://ollama}"
+    local ollama_port="${OLLAMA_PORT:-11434}"
+    local ollama_model="${OLLAMA_MODEL:-llama3.2}"
 
     # URL-encode the values that feed a URL parser (MYSQL_PASSWORD,
     # SECRET_KEY, ROOM_SECRET_KEY, REPLICATION_PASSWORD, MYSQL_HOST,
@@ -620,6 +683,16 @@ data:
   # Must match the `sentinel monitor` line in
   # k8s/28-redis-sentinel-statefulset.yaml.
   REDIS_MASTER_NAME: "${redis_master_name}"
+  # Ollama (AI assistant). These are URLs / model names, not secrets —
+  # they live in the ConfigMap (not the chatroom-app Secret). The app
+  # reads them at startup via app/database.py and passes them to
+  # app/ai.py. Empty is NOT a valid value at the Ollama API level, but
+  # is harmless on the chatroom side: app/ai.py only fires when a user
+  # mentions @assistant, and a failed Ollama call is logged + swallowed
+  # (the chat continues).
+  OLLAMA_HOST: "${ollama_host}"
+  OLLAMA_PORT: "${ollama_port}"
+  OLLAMA_MODEL: "${ollama_model}"
 EOF
 
     # Atomic rename. Same error-handling choice as write_runtime_env_file.

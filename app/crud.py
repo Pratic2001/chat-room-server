@@ -10,6 +10,7 @@ from app.utils import (
     verify_password,
 )
 from datetime import datetime
+import secrets
 
 
 # Raised by `create_room` when the requested name collides with an
@@ -23,6 +24,18 @@ class RoomNameConflict(Exception):
         super().__init__(f"A room with the name {name!r} already exists")
 
 # User CRUD
+# Synthetic account used as the sender for AI-generated messages.
+# Created lazily by `get_or_create_ai_user` on first AI use; never logged
+# into via /auth/login (the random password is never revealed). Frontend
+# keys AI messages off this username (see app/static/script.js and
+# app/ai.py::contains_mention for the matching trigger regex).
+AI_USERNAME = "assistant"
+# Sentinel email so the row satisfies users.email UNIQUE NOT NULL. Stable
+# across re-runs so a second call to get_or_create_ai_user does not try
+# to create a duplicate. Cannot collide with a real signup because of the
+# `.internal` TLD.
+AI_USER_EMAIL = "assistant@chatroom.internal"
+
 def get_user_by_username(db: Session, username: str):
     return db.query(models.User).filter(models.User.username == username).first()
 
@@ -43,6 +56,37 @@ def create_user(db: Session, user: schemas.UserCreate):
     db.commit()
     db.refresh(db_user)
     return db_user
+
+def get_or_create_ai_user(db: Session):
+    """Return the AI assistant's User row, creating it on first call.
+
+    Idempotent in normal use: a second call after creation returns the
+    cached row. Race-safe: if two requests try to create the row at the
+    same time, the `users.username` UNIQUE constraint catches the loser,
+    which rolls back and re-reads.
+
+    The hashed password is a random URL-safe token that nobody knows —
+    login via /auth/login is intentionally broken for this account.
+    """
+    existing = db.query(models.User).filter(models.User.username == AI_USERNAME).first()
+    if existing:
+        return existing
+    random_pw = secrets.token_urlsafe(48)  # ~64 chars, well under bcrypt's 72-byte limit
+    ai_user = models.User(
+        username=AI_USERNAME,
+        email=AI_USER_EMAIL,
+        hashed_password=get_password_hash(random_pw),
+    )
+    db.add(ai_user)
+    try:
+        db.commit()
+    except IntegrityError:
+        # Another request created the AI user between our read and write.
+        # Roll back, re-read, return the winner's row.
+        db.rollback()
+        return db.query(models.User).filter(models.User.username == AI_USERNAME).first()
+    db.refresh(ai_user)
+    return ai_user
 
 def authenticate_user(db: Session, username: str, password: str):
     user = get_user_by_username(db, username)
@@ -71,7 +115,13 @@ def create_room(db: Session, room: schemas.RoomCreate, owner_id: int):
     db_room = models.Room(
         name=room.name,
         secret_phrase_hash=secret_phrase_hash,
-        owner_id=owner_id
+        owner_id=owner_id,
+        # AI assistant config (validated upstream by RoomBase._persona_must_match).
+        # ai_persona is ignored unless ai_enabled is True — normalize to NULL
+        # so the column reflects the real intent rather than carrying a
+        # misleading string on a disabled room.
+        ai_enabled=bool(room.ai_enabled),
+        ai_persona=room.ai_persona if room.ai_enabled else None,
     )
     db.add(db_room)
     try:
@@ -87,6 +137,20 @@ def create_room(db: Session, room: schemas.RoomCreate, owner_id: int):
     db.refresh(db_room)
     # Owner is automatically a member of the room they created
     db.add(models.RoomMember(room_id=db_room.id, user_id=owner_id))
+    # If the room has AI enabled, add the assistant as a member too. This
+    # keeps /rooms/my consistent (the AI shows up in member counts) and
+    # means future features that key off RoomMember (e.g. notification
+    # fan-out) include the AI without a separate code path.
+    if db_room.ai_enabled:
+        ai_user = get_or_create_ai_user(db)
+        already = db.query(models.RoomMember).filter(
+            and_(
+                models.RoomMember.room_id == db_room.id,
+                models.RoomMember.user_id == ai_user.id,
+            )
+        ).first()
+        if not already:
+            db.add(models.RoomMember(room_id=db_room.id, user_id=ai_user.id))
     db.commit()
     db.refresh(db_room)
     return db_room

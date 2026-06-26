@@ -162,6 +162,36 @@ while :; do
     esac
 done
 
+log "Ollama configuration (the AI assistant backend; leave OLLAMA_HOST blank to disable)..."
+# OLLAMA_HOST may include scheme (http://, https://) and optionally a
+# port — app/ai.py::_ollama_url only appends ":OLLAMA_PORT" when no port
+# is already present. We accept the value verbatim (no scheme/port
+# munging here) so the runtime sees exactly what the operator typed.
+#
+# Reuse the existing env value as the default so a re-run that didn't
+# change Ollama config keeps the same host/model — same idempotent
+# behavior as the MAIL_* prompts above.
+OLLAMA_HOST="$(prompt_default '  OLLAMA_HOST (include scheme, e.g. http://ollama or https://ollama.example.com; blank = AI disabled)' "$OLLAMA_HOST")"
+# OLLAMA_PORT: integer 1-65535 or blank (→ 11434). Same shape as MAIL_PORT.
+while :; do
+    OLLAMA_PORT_INPUT="$(prompt_default '  OLLAMA_PORT' "$OLLAMA_PORT")"
+    if [[ -z "$OLLAMA_PORT_INPUT" ]]; then
+        OLLAMA_PORT="11434"
+        break
+    fi
+    if [[ "$OLLAMA_PORT_INPUT" =~ ^[0-9]+$ ]] && (( OLLAMA_PORT_INPUT >= 1 && OLLAMA_PORT_INPUT <= 65535 )); then
+        OLLAMA_PORT="$OLLAMA_PORT_INPUT"
+        break
+    fi
+    warn "OLLAMA_PORT must be an integer 1-65535 (or blank for 11434); got '$OLLAMA_PORT_INPUT'."
+done
+# OLLAMA_MODEL must be a model already pulled into the Ollama instance
+# (`ollama pull <model>` is a separate one-time step the operator runs
+# against the configured host). Default is llama3.2 — small enough to run
+# comfortably on a developer laptop while still being capable enough
+# for the persona system prompts.
+OLLAMA_MODEL="$(prompt_default '  OLLAMA_MODEL (must be pulled into the Ollama instance)' "$OLLAMA_MODEL")"
+
 # MYSQL_READ_HOST: read-only endpoints (GET /messages, GET /rooms/my)
 # connect here. On 1-node clusters (kind/k3d/minikube) keep this empty
 # so app/database.py falls back to MYSQL_HOST and reads land on the

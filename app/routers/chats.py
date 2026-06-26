@@ -1,11 +1,13 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app import crud, models, schemas
+from app.ai import contains_mention, maybe_reply
 from app.database import get_db
 from app.thumbnails import make_thumbnail
 from app.utils import SECRET_KEY, ALGORITHM
 from app.ws_manager import manager
 from jose import JWTError, jwt
+import asyncio
 import json
 import base64
 
@@ -188,6 +190,23 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
                         **common,
                     )
                 await manager.broadcast(ws_msg.model_dump_json(), room_id)
+
+                # AI trigger: fire-and-forget. Runs in the background so
+                # the WS receive loop is never blocked by Ollama latency.
+                # The task opens its own DB session (see app/ai.py) so
+                # the request-scoped session is not held open across the
+                # HTTP call. Gated by ai_enabled so non-AI rooms skip the
+                # cheap DB read; gated by username match so the AI never
+                # replies to its own messages.
+                if msg.message_type == "text" and contains_mention(msg.content or ""):
+                    ai_room = crud.get_room_by_id(db, room_id)
+                    if ai_room and ai_room.ai_enabled and user.username != crud.AI_USERNAME:
+                        asyncio.create_task(maybe_reply(
+                            room_id=room_id,
+                            triggering_user_id=user.id,
+                            triggering_message_id=db_msg.id,
+                            triggering_text=msg.content or "",
+                        ))
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, room_id)

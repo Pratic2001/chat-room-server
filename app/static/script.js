@@ -467,6 +467,14 @@ class ChatApp {
 
         document.getElementById('logout-btn').addEventListener('click', () => this._logout());
         document.getElementById('create-room-btn').addEventListener('click', () => this._openCreateModal());
+        // AI toggle: show/hide the persona <select> based on the checkbox.
+        // The <select> stays in the DOM so screen readers can still find
+        // the label; we just hide it visually when AI is disabled.
+        const aiCheckbox = document.getElementById('new-room-ai-enabled');
+        const aiPersonaRow = document.getElementById('new-room-ai-persona-row');
+        aiCheckbox.addEventListener('change', () => {
+            aiPersonaRow.hidden = !aiCheckbox.checked;
+        });
         document.getElementById('join-by-name-btn').addEventListener('click', () => this._openJoinByNameModal());
         document.getElementById('invite-btn').addEventListener('click', () => this._openInviteModal());
         document.getElementById('leave-room-btn').addEventListener('click', () => this._leaveRoom());
@@ -635,6 +643,12 @@ class ChatApp {
     _openCreateModal() {
         document.getElementById('new-room-name').value = '';
         document.getElementById('new-room-secret').value = '';
+        // Reset AI fields: off by default; persona row hidden; persona
+        // select defaults to "Professional" so a fresh toggle-on has a
+        // valid value to send.
+        document.getElementById('new-room-ai-enabled').checked = false;
+        document.getElementById('new-room-ai-persona').value = 'Professional';
+        document.getElementById('new-room-ai-persona-row').hidden = true;
         document.getElementById('create-room-error').textContent = '';
         document.getElementById('modal-backdrop').hidden = false;
         setTimeout(() => document.getElementById('new-room-name').focus(), 0);
@@ -653,11 +667,26 @@ class ChatApp {
             return;
         }
         try {
+            const aiEnabled = document.getElementById('new-room-ai-enabled').checked;
+            // The frontend only sends a persona when AI is actually
+            // enabled — the schema validator will reject "ai_enabled:
+            // true with persona: null", and the server normalizes
+            // "ai_enabled: false with persona set" to NULL anyway. This
+            // avoids sending a value the user clearly didn't intend.
+            const aiPersona = aiEnabled
+                ? document.getElementById('new-room-ai-persona').value
+                : null;
             const res = await this._authFetch('/rooms/', {
                 method: 'POST',
                 // Pass secret_phrase: null when empty so the server stores NULL
-                // and the room becomes open to anyone with the name.
-                body: JSON.stringify({ name, secret_phrase: secret || null }),
+                // and the room becomes open to anyone with the name. Same
+                // pattern for ai_persona.
+                body: JSON.stringify({
+                    name,
+                    secret_phrase: secret || null,
+                    ai_enabled: aiEnabled,
+                    ai_persona: aiPersona,
+                }),
             });
             const data = await res.json();
             if (!res.ok) throw new Error(extractErrorMessage(data, 'Failed to create room'));
@@ -1012,14 +1041,17 @@ class ChatApp {
         if (empty) empty.remove();
 
         const isSent = msg.user_id != null && this.user && msg.user_id === this.user.id;
+        const isAi = msg.username === 'assistant';
         const wrap = document.createElement('div');
-        wrap.className = `message ${isSent ? 'sent' : 'received'}`;
+        wrap.className = `message ${isSent ? 'sent' : 'received'}${isAi ? ' ai-message' : ''}`;
 
         const showAuthor = !isSent && msg.username;
         if (showAuthor) {
             const a = document.createElement('div');
-            a.className = 'author';
-            a.textContent = msg.username;
+            a.className = 'author' + (isAi ? ' ai-author' : '');
+            // Prefix the AI's author line with a robot emoji so the visual
+            // distinction survives even when the CSS class fails to load.
+            a.textContent = isAi ? `🤖 ${msg.username}` : msg.username;
             wrap.appendChild(a);
         }
 

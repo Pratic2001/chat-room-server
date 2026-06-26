@@ -1,10 +1,12 @@
 import base64
+import asyncio
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app import crud, models, schemas
+from app.ai import contains_mention, maybe_reply
 from app.database import get_db, get_read_db
 from app.routers.auth import get_current_user
 from app.thumbnails import make_thumbnail
@@ -154,5 +156,19 @@ async def create_message(
             created_at=db_msg.created_at,
         )
     await manager.broadcast(ws_msg.model_dump_json(), room_id)
+
+    # AI trigger: fire-and-forget. Runs in the background so the HTTP
+    # response is not delayed by Ollama latency. The task opens its own
+    # DB session (see app/ai.py) so the request-scoped session is not
+    # held open across the HTTP call.
+    if body.message_type == "text" and contains_mention(body.content or ""):
+        ai_room = crud.get_room_by_id(db, room_id)
+        if ai_room and ai_room.ai_enabled and current_user.username != crud.AI_USERNAME:
+            asyncio.create_task(maybe_reply(
+                room_id=room_id,
+                triggering_user_id=current_user.id,
+                triggering_message_id=db_msg.id,
+                triggering_text=body.content or "",
+            ))
 
     return schemas.MessageResponse(**payload)

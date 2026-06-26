@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS rooms (
     secret_phrase_hash VARCHAR(512) NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     owner_id INT NOT NULL,
+    ai_enabled TINYINT(1) NOT NULL DEFAULT 0,
+    ai_persona VARCHAR(32) NULL,
     FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
 );
 

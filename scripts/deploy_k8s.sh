@@ -172,12 +172,19 @@ fi
     printf '%s\n' "${MAIL_PASSWORD-}"    > /tmp/_crs_mail_password
     printf '%s\n' "${MAIL_FROM-Chat Room <no-reply@example.com>}" > /tmp/_crs_mail_from
     printf '%s\n' "${MAIL_USE_TLS-true}" > /tmp/_crs_mail_use_tls
+    # Ollama (AI assistant). Defaults match the same defaults used by
+    # scripts/build_images.sh — so an older app/.env.runtime that predates
+    # the AI assistant still loads cleanly here.
+    printf '%s\n' "${OLLAMA_HOST-http://ollama}"  > /tmp/_crs_ollama_host
+    printf '%s\n' "${OLLAMA_PORT-11434}"          > /tmp/_crs_ollama_port
+    printf '%s\n' "${OLLAMA_MODEL-llama3.2}"      > /tmp/_crs_ollama_model
 )
 trap 'rm -f /tmp/_crs_mysql_pw /tmp/_crs_jwt /tmp/_crs_fernet \
         /tmp/_crs_mysql_host /tmp/_crs_mysql_port /tmp/_crs_mysql_user /tmp/_crs_mysql_db \
         /tmp/_crs_alg /tmp/_crs_exp \
         /tmp/_crs_mail_host /tmp/_crs_mail_port /tmp/_crs_mail_user /tmp/_crs_mail_password \
-        /tmp/_crs_mail_from /tmp/_crs_mail_use_tls' EXIT
+        /tmp/_crs_mail_from /tmp/_crs_mail_use_tls \
+        /tmp/_crs_ollama_host /tmp/_crs_ollama_port /tmp/_crs_ollama_model' EXIT
 MYSQL_PASSWORD="$(cat /tmp/_crs_mysql_pw)"
 SECRET_KEY="$(cat /tmp/_crs_jwt)"
 ROOM_SECRET_KEY="$(cat /tmp/_crs_fernet)"
@@ -193,6 +200,13 @@ MAIL_USER="$(cat /tmp/_crs_mail_user)"
 MAIL_PASSWORD="$(cat /tmp/_crs_mail_password)"
 MAIL_FROM="$(cat /tmp/_crs_mail_from)"
 MAIL_USE_TLS="$(cat /tmp/_crs_mail_use_tls)"
+# These three are read into shell scope so any operator debugging the
+# deploy (or a follow-up kubectl patch) sees the same values that just
+# landed in the rendered ConfigMap. deploy_k8s.sh itself does not use
+# them — k8s/secrets.runtime.yaml is what kubectl apply actually reads.
+OLLAMA_HOST="$(cat /tmp/_crs_ollama_host)"
+OLLAMA_PORT="$(cat /tmp/_crs_ollama_port)"
+OLLAMA_MODEL="$(cat /tmp/_crs_ollama_model)"
 
 # -----------------------------------------------------------------------------
 # Create namespace
