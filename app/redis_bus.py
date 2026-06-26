@@ -486,12 +486,22 @@ async def _run_subscriber() -> None:
             # tuples. We have one stream so unpack the first element.
             for _stream_key, entries in streams:
                 for entry_id, fields in entries:
+                    # Normalize the field map up-front so the lookup below
+                    # works regardless of `decode_responses` on the
+                    # underlying connection. Sentinel's `master_for` does
+                    # NOT inherit `decode_responses=True` from the wrapper,
+                    # so entries come back with bytes keys + bytes values;
+                    # `fields.get("data", ...)` with a str key would
+                    # silently return the default and `json.loads("{}")`
+                    # then makes us think the envelope is malformed.
+                    decoded = _decode_fields(fields)
+                    eid = _decode_str(entry_id)
                     try:
-                        envelope = json.loads(fields.get("data", "{}"))
+                        envelope = json.loads(decoded.get("data", "{}"))
                         room_id = int(envelope["room_id"])
                         payload = envelope["payload"]
                     except (ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
-                        log.warning("Discarding malformed bus envelope %s: %s", entry_id, e)
+                        log.warning("Discarding malformed bus envelope %s: %s", eid, e)
                         # Ack so we don't loop on a poison-pill message.
                         await _safe_xack(entry_id)
                         continue
@@ -504,7 +514,7 @@ async def _run_subscriber() -> None:
                             # ack the entry below; the message lives in
                             # MySQL so a refresh will re-fetch it.
                             log.warning("Local dispatch failed for room %s (entry %s): %s",
-                                        room_id, entry_id, e)
+                                        room_id, eid, e)
                     await _safe_xack(entry_id)
         except asyncio.CancelledError:
             # Normal shutdown.
@@ -539,3 +549,25 @@ async def _safe_xack(entry_id: str) -> None:
         await _client.xack(STREAM_KEY, CONSUMER_GROUP, entry_id)
     except Exception as e:
         log.warning("Redis XACK failed for entry %s: %s", entry_id, e)
+
+
+def _decode_str(v):
+    """Decode a bytes (or bytearray) value to str; pass everything else through."""
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8", errors="replace")
+    return v
+
+
+def _decode_fields(fields):
+    """Return a copy of an XREADGROUP fields dict with str keys + str values.
+
+    `redis.asyncio` returns stream fields as bytes when the underlying
+    connection was opened without `decode_responses=True`. The Sentinel
+    `master_for` path falls into that bucket — see the long comment at
+    `_try_connect` for why we leave `decode_responses` off there. Without
+    normalization, downstream `.get("data", ...)` lookups with str keys
+    silently return the default and the envelope gets discarded as
+    malformed. Cheap to do here, keeps the subscriber independent of
+    which connection mode produced the entry.
+    """
+    return {_decode_str(k): _decode_str(v) for k, v in fields.items()}
