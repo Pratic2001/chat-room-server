@@ -33,11 +33,21 @@ Redis's standard replication, so consumers see a consistent view.
 
 Degraded mode
 -------------
-If `REDIS_URL` is unset (the default for `scripts/create_env.sh` /
-local `uvicorn` dev), the bus stays inert: `publish` calls the local
-dispatch callback synchronously and the subscriber task never starts.
-That keeps the single-pod dev path identical to its previous behaviour
-without requiring the developer to stand up Redis.
+There are two paths into degraded (local-only) mode:
+
+1. `REDIS_URL` and `REDIS_SENTINELS` are both unset — the default for
+   `scripts/create_env.sh` / local `uvicorn` dev. The bus stays inert:
+   `publish` calls the local dispatch callback synchronously and the
+   subscriber task never starts. Keeps the single-pod dev path
+   identical to its previous behaviour without requiring the developer
+   to stand up Redis.
+
+2. Redis/Sentinel is configured but unreachable at startup — the bus
+   runs in degraded mode for the gap and a background retry task
+   re-attempts connection every 5s (capped at 30s). Once it succeeds,
+   the subscriber starts and cross-pod fan-out resumes without a pod
+   restart. This covers the deploy-time race where the app pods
+   become Ready before the Redis StatefulSet has converged.
 
 Sentinel mode
 -------------
@@ -96,6 +106,12 @@ _sentinel_mode: bool = False
 # Master name for Sentinel — only meaningful when _sentinel_mode is True.
 _master_name: str = "chatroom-redis"
 _subscriber_task: asyncio.Task | None = None
+# Background task that re-runs _try_connect when the initial Sentinel
+# discovery races the Redis StatefulSet at deploy time (or when Sentinel
+# is briefly unreachable). When init_bus can't reach the master, the
+# retry loop keeps trying every 5s (capped at 30s) until it succeeds;
+# once it does, the subscriber starts and the retry task exits.
+_retry_task: asyncio.Task | None = None
 _enabled: bool = False
 
 
@@ -150,6 +166,114 @@ def _consumer_name() -> str:
     return os.getenv("POD_NAME") or socket.gethostname() or "unknown"
 
 
+async def _try_connect() -> bool:
+    """One attempt at connecting to Redis (Sentinel or direct).
+
+    Sets module-level `_client`, `_sentinel_mode`, and `_master_name`
+    on success and starts the subscriber task. Returns True on success,
+    False on a transient failure (Sentinel not converged yet, network
+    blip, etc). Callers should fall back to a retry loop on False; they
+    must not crash the app on False — the degraded local-dispatch path
+    in `publish` keeps single-pod traffic working in the meantime.
+
+    Imports `redis.asyncio` lazily so the dependency is only required
+    when the bus is actually enabled. Keeps `import app.main` working
+    in environments without Redis installed locally.
+    """
+    global _client, _sentinel_mode, _master_name, _enabled, _subscriber_task
+
+    sentinels = _sentinels()
+    url = _url()
+
+    if sentinels is None and url is None:
+        return False
+
+    import redis.asyncio as aioredis  # type: ignore
+    import redis.asyncio.sentinel as aisentinel  # type: ignore
+
+    if sentinels is not None:
+        _master_name = os.getenv("REDIS_MASTER_NAME", "chatroom-redis")
+        _sentinel_mode = True
+        _client = aisentinel.Sentinel(
+            sentinels,
+            socket_timeout=5,
+            password=os.getenv("REDIS_PASSWORD") or None,
+        )
+        # Probe Sentinel by asking for the master's address. If
+        # Sentinel is up but the master isn't yet elected, this
+        # raises MasterNotFoundError; we treat that as a transient
+        # failure so the retry loop in `init_bus` can pick it up.
+        try:
+            master_addr = await _client.discover_master(_master_name)
+        except Exception as e:
+            log.warning(
+                "Sentinels reachable but master %r not yet discovered: %s. "
+                "Will retry.",
+                _master_name, e,
+            )
+            _client = None
+            _sentinel_mode = False
+            return False
+        log.info(
+            "Sentinel discovered master %r at %s:%d",
+            _master_name, master_addr[0], master_addr[1],
+        )
+    else:
+        _sentinel_mode = False
+        _client = aioredis.from_url(url, encoding="utf-8", decode_responses=True)
+        await _client.ping()
+
+    # Ensure the consumer group exists. MKSTREAM creates the stream
+    # if it doesn't exist yet (so the very first publish doesn't
+    # fail with NOGROUP). BUSYGROUP means the group already exists
+    # — race with another pod during a cold start; we ignore it.
+    try:
+        await _client.xgroup_create(
+            name=STREAM_KEY,
+            groupname=CONSUMER_GROUP,
+            id="0",  # start from id 0 so a fresh group sees the backlog
+            mkstream=True,
+        )
+    except Exception as e:
+        if "BUSYGROUP" in str(e):
+            pass  # already exists, fine
+        else:
+            raise
+
+    _enabled = True
+    _subscriber_task = asyncio.create_task(_run_subscriber(), name="redis-bus-subscriber")
+    log.info("Redis bus connected (%s); cross-pod broadcast enabled.",
+             "Sentinel-managed" if _sentinel_mode else f"direct @ {url}")
+    return True
+
+
+async def _retry_connect_loop() -> None:
+    """Re-attempt connection until it succeeds, then exit.
+
+    A pod that lost the Sentinel-convergence race at startup shouldn't
+    stay in single-pod mode for its whole lifetime — Sentinel converges
+    a few seconds later and we want the bus to come up without a
+    restart. Backoff caps at 30s so a permanently-down Redis doesn't
+    pin a tight retry loop.
+    """
+    global _retry_task
+    backoff = 5.0
+    attempt = 0
+    try:
+        while True:
+            attempt += 1
+            if await _try_connect():
+                log.info("Redis bus came up on retry (attempt %d); cross-pod broadcast enabled.",
+                         attempt)
+                return
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        _retry_task = None
+
+
 async def init_bus(local_dispatch: Callable[[int, str], Awaitable[None]]) -> None:
     """Wire the bus to a local-dispatch callback and start the subscriber.
 
@@ -157,9 +281,15 @@ async def init_bus(local_dispatch: Callable[[int, str], Awaitable[None]]) -> Non
     the bus receives. The implementation in `ws_manager.py` walks its
     locally-tracked sockets for `room_id` and sends the payload down
     each one.
+
+    If the initial connection attempt fails (most commonly because the
+    Redis StatefulSet isn't fully converged yet at deploy time), a
+    background retry task keeps trying until it succeeds. The
+    application stays usable in the meantime via the degraded
+    single-pod dispatch path in `publish` — cross-pod fan-out is just
+    paused until the bus comes up.
     """
-    global _local_dispatch, _client, _sentinel_mode, _master_name
-    global _subscriber_task, _enabled
+    global _local_dispatch, _retry_task, _enabled
 
     _local_dispatch = local_dispatch
 
@@ -177,82 +307,29 @@ async def init_bus(local_dispatch: Callable[[int, str], Awaitable[None]]) -> Non
         _enabled = False
         return
 
-    # Imported lazily so the dependency is only required when the
-    # bus is actually enabled. Keeps `import app.main` working in
-    # environments without Redis installed locally.
-    import redis.asyncio as aioredis  # type: ignore
-    import redis.asyncio.sentinel as aisentinel  # type: ignore
+    if await _try_connect():
+        return
 
-    try:
-        if sentinels is not None:
-            _master_name = os.getenv("REDIS_MASTER_NAME", "chatroom-redis")
-            _sentinel_mode = True
-            _client = aisentinel.Sentinel(
-                sentinels,
-                socket_timeout=5,
-                password=os.getenv("REDIS_PASSWORD") or None,
-            )
-            # Probe Sentinel by asking for the master's address. If
-            # Sentinel is up but the master isn't yet elected, this
-            # raises MasterNotFoundError; we treat that as a transient
-            # failure and fall back to degraded mode.
-            try:
-                master_addr = await _client.discover_master(_master_name)
-            except Exception as e:
-                log.warning(
-                    "Sentinels reachable but master %r not yet discovered: %s. "
-                    "Falling back to degraded mode (no fan-out until Sentinel converges).",
-                    _master_name, e,
-                )
-                _enabled = False
-                _client = None
-                return
-            log.info(
-                "Sentinel discovered master %r at %s:%d",
-                _master_name, master_addr[0], master_addr[1],
-            )
-        else:
-            _sentinel_mode = False
-            _client = aioredis.from_url(url, encoding="utf-8", decode_responses=True)
-            await _client.ping()
-
-        # Ensure the consumer group exists. MKSTREAM creates the stream
-        # if it doesn't exist yet (so the very first publish doesn't
-        # fail with NOGROUP). BUSYGROUP means the group already exists
-        # — race with another pod during a cold start; we ignore it.
-        try:
-            await _client.xgroup_create(
-                name=STREAM_KEY,
-                groupname=CONSUMER_GROUP,
-                id="0",  # start from id 0 so a fresh group sees the backlog
-                mkstream=True,
-            )
-        except Exception as e:
-            if "BUSYGROUP" in str(e):
-                pass  # already exists, fine
-            else:
-                raise
-
-        _enabled = True
-        _subscriber_task = asyncio.create_task(_run_subscriber(), name="redis-bus-subscriber")
-        log.info("Redis bus connected (%s); cross-pod broadcast enabled.",
-                 "Sentinel-managed" if _sentinel_mode else f"direct @ {url}")
-    except Exception as e:
-        # Don't crash the app if Redis is briefly unavailable at startup.
-        # The next message will retry via the publisher; if Redis stays
-        # down the symptom is "messages don't reach other pods", which
-        # is the same failure mode a missing Redis would have.
-        log.warning("Could not connect to Redis: %s. Falling back to single-pod mode.", e)
-        _enabled = False
-        _client = None
-        _sentinel_mode = False
+    # Initial attempt failed. Schedule a retry loop so a deploy-time
+    # race with Sentinel convergence doesn't leave the pod permanently
+    # degraded. Idempotent: a second init_bus call won't spawn two loops.
+    if _retry_task is None or _retry_task.done():
+        _retry_task = asyncio.create_task(_retry_connect_loop(), name="redis-bus-retry")
 
 
 async def shutdown_bus() -> None:
-    """Cancel the subscriber and close the Redis client. Idempotent."""
-    global _client, _subscriber_task, _enabled, _local_dispatch, _sentinel_mode
+    """Cancel the subscriber (and any pending retry loop) and close the
+    Redis client. Idempotent."""
+    global _client, _subscriber_task, _retry_task, _enabled, _local_dispatch, _sentinel_mode
 
     _enabled = False
+    if _retry_task is not None:
+        _retry_task.cancel()
+        try:
+            await _retry_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        _retry_task = None
     if _subscriber_task is not None:
         _subscriber_task.cancel()
         try:
