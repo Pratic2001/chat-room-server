@@ -693,7 +693,7 @@ class ChatApp {
             this._closeCreateModal();
             await this._loadRooms();
             // The owner is already a member (crud.create_room adds the creator).
-            this._enterRoom(data.id, data.name);
+            this._enterRoom(data.id, data.name, !!data.ai_enabled);
         } catch (err) {
             errEl.textContent = err.message;
         }
@@ -740,7 +740,7 @@ class ChatApp {
             const data = await res.json();
             if (!res.ok) throw new Error(extractErrorMessage(data, 'Could not join room'));
             this._closeJoinModal();
-            this._enterRoom(roomId, data.name || roomName);
+            this._enterRoom(roomId, data.name || roomName, !!data.ai_enabled);
         } catch (err) {
             errEl.textContent = err.message;
         }
@@ -786,7 +786,7 @@ class ChatApp {
             this._closeJoinByNameModal();
             // Refresh sidebar so the new room row appears, then enter it.
             await this._loadRooms();
-            this._enterRoom(data.id, data.name);
+            this._enterRoom(data.id, data.name, !!data.ai_enabled);
         } catch (err) {
             errEl.textContent = err.message;
         } finally {
@@ -794,7 +794,7 @@ class ChatApp {
         }
     }
 
-    _enterRoom(roomId, roomName) {
+    _enterRoom(roomId, roomName, aiEnabled = false) {
         this.currentRoomId = roomId;
         this.currentRoomName = roomName;
         document.getElementById('current-room-name').textContent = roomName;
@@ -804,6 +804,10 @@ class ChatApp {
         document.getElementById('attach-btn').disabled = false;
         document.getElementById('leave-room-btn').disabled = false;
         document.getElementById('invite-btn').disabled = false;
+        // Surface the @assistant hint when the active room has AI enabled.
+        // The backend strips the mention before sending to the LLM, so users
+        // only need to type it as a whole word — no special syntax required.
+        this._setAiHint(aiEnabled);
         document.getElementById('message-input').focus();
 
         // Update active state in sidebar
@@ -823,6 +827,23 @@ class ChatApp {
         this._loadHistory(roomId);
     }
 
+    _setAiHint(enabled) {
+        // Show the "@assistant" hint when the active room has AI enabled.
+        // Two surfaces so it's visible whether the box is empty or full:
+        //  - placeholder (only shown while the input is empty)
+        //  - the persistent composer-hint span (always visible when AI is on)
+        const input = document.getElementById('message-input');
+        const hint = document.getElementById('composer-hint');
+        if (!input || !hint) return;
+        if (enabled) {
+            input.placeholder = 'Type a message — try @assistant …';
+            hint.hidden = false;
+        } else {
+            input.placeholder = 'Type a message';
+            hint.hidden = true;
+        }
+    }
+
     _leaveRoom(roomId, roomName) {
         // If explicit roomId passed and it isn't the current one, just refresh list.
         if (roomId && this.currentRoomId !== roomId) {
@@ -839,6 +860,8 @@ class ChatApp {
         document.getElementById('current-room-sub').textContent = 'Choose a room from the sidebar, or create a new one.';
         document.getElementById('message-input').disabled = true;
         document.getElementById('message-input').value = '';
+        // Drop the AI hint — the next room may not have AI enabled.
+        this._setAiHint(false);
         document.getElementById('send-btn').disabled = true;
         document.getElementById('attach-btn').disabled = true;
         document.getElementById('leave-room-btn').disabled = true;

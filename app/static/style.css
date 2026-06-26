@@ -532,6 +532,27 @@ textarea {
 }
 .composer .btn { flex-shrink: 0; }
 
+/* AI hint shown under the composer when the active room has AI enabled.
+   Mirrors the purple used for AI bubbles/authors so the hint is
+   recognisably part of the AI feature without competing with it. */
+.composer-hint {
+    display: block;
+    padding: 6px 16px 10px;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--ai-author, #7c3aed);
+    background: var(--surface);
+    border-top: 1px solid transparent;
+    flex-shrink: 0;
+}
+.composer-hint[hidden] { display: none; }
+.composer-hint code {
+    background: var(--surface-2);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 11.5px;
+}
+
 /* ---------- Modal ---------- */
 .modal-backdrop {
     position: fixed;

@@ -80,7 +80,8 @@
                         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
                     </button>
                     <input type="file" id="file-input" class="visually-hidden" accept="image/*,video/*,.pdf,.txt,.zip">
-                    <input type="text" id="message-input" class="composer-input" placeholder="Type a message" maxlength="4000" disabled>
+                    <input type="text" id="message-input" class="composer-input" placeholder="Type a message" maxlength="4000" disabled aria-describedby="composer-hint">
+                    <span id="composer-hint" class="composer-hint" hidden>💡 Type <code>@assistant</code> to ask the AI bot (add <code>/search</code> for web context)</span>
                     <button type="submit" id="send-btn" class="btn btn-primary" disabled>Send</button>
                 </form>
             </section>
