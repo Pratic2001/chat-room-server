@@ -206,9 +206,16 @@ async def _try_connect() -> bool:
         _master_name = os.getenv("REDIS_MASTER_NAME", "chatroom-redis")
         _sentinel_mode = True
         sentinel_password = os.getenv("REDIS_PASSWORD") or None
+        # socket_timeout=None: discovery calls should not be artificially
+        # bounded. The retry loop in init_bus / _retry_connect_loop
+        # already paces rediscovery, and a 5s ceiling here would race the
+        # network on a slow link. The XREADGROUP BLOCK below has its own
+        # 5s ceiling; we don't want the client socket to also fire a 5s
+        # timeout on top of it (which is what was producing the
+        # "Timeout reading from 10.244.0.189:6379" log spam).
         _sentinel = aisentinel.Sentinel(
             sentinels,
-            socket_timeout=5,
+            socket_timeout=None,
             password=sentinel_password,
         )
         # Probe Sentinel by asking for the master's address. If
@@ -226,7 +233,14 @@ async def _try_connect() -> bool:
             # next time `master_for` is invoked.
             _client = _sentinel.master_for(
                 _master_name,
-                socket_timeout=5,
+                # socket_timeout=None: every bus operation (XADD,
+                # XREADGROUP, XACK, XGROUP CREATE) should be governed by
+                # its own request-level timeout if any — not by a
+                # blanket 5s ceiling. With BLOCK 5000 in the subscriber
+                # loop, a 5s socket_timeout races Redis returning its
+                # empty result and fires "Timeout reading from <ip>:6379"
+                # every cycle.
+                socket_timeout=None,
                 password=sentinel_password,
             )
         except Exception as e:
@@ -423,7 +437,7 @@ async def publish(room_id: int, payload: str) -> None:
             try:
                 _client = _sentinel.master_for(
                     _master_name,
-                    socket_timeout=5,
+                    socket_timeout=None,
                     password=os.getenv("REDIS_PASSWORD") or None,
                 )
             except Exception as e2:
@@ -507,7 +521,7 @@ async def _run_subscriber() -> None:
                 try:
                     _client = _sentinel.master_for(
                         _master_name,
-                        socket_timeout=5,
+                        socket_timeout=None,
                         password=os.getenv("REDIS_PASSWORD") or None,
                     )
                     log.info("Re-resolved Redis master via Sentinel after subscriber error.")

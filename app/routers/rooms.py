@@ -11,7 +11,15 @@ router = APIRouter()
 
 @router.post("/", response_model=schemas.RoomResponse)
 def create_room(room: schemas.RoomCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    return crud.create_room(db=db, room=room, owner_id=current_user.id)
+    try:
+        return crud.create_room(db=db, room=room, owner_id=current_user.id)
+    except crud.RoomNameConflict:
+        # `rooms.name` is UNIQUE; on a duplicate insert the DB layer
+        # raises `RoomNameConflict` after rolling back. Return 409 so
+        # the frontend `_handleCreateRoom` can show the message in
+        # `#create-room-error` (it pipes `detail` through
+        # `extractErrorMessage` and renders the string).
+        raise HTTPException(status_code=409, detail="A room with that name already exists")
 
 @router.get("/my", response_model=List[schemas.RoomResponse])
 def get_my_rooms(db: Session = Depends(get_read_db), current_user: models.User = Depends(get_current_user)):

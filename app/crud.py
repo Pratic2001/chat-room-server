@@ -1,5 +1,6 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
+from sqlalchemy.exc import IntegrityError
 from app import models, schemas
 from app.utils import (
     encrypt_secret,
@@ -9,6 +10,17 @@ from app.utils import (
     verify_password,
 )
 from datetime import datetime
+
+
+# Raised by `create_room` when the requested name collides with an
+# existing room. The DB layer stays free of FastAPI imports; the router
+# catches this and turns it into a 409 response.
+class RoomNameConflict(Exception):
+    """A room with the requested name already exists."""
+
+    def __init__(self, name: str):
+        self.name = name
+        super().__init__(f"A room with the name {name!r} already exists")
 
 # User CRUD
 def get_user_by_username(db: Session, username: str):
@@ -62,7 +74,16 @@ def create_room(db: Session, room: schemas.RoomCreate, owner_id: int):
         owner_id=owner_id
     )
     db.add(db_room)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # `rooms.name` has a UNIQUE index. Race condition: two requests
+        # pick the same name at the same time, or the user typed a name
+        # that already exists. Either way the DB rejects the insert;
+        # rollback so the session is reusable, then surface a clean
+        # conflict so the router can return 409 instead of leaking a 500.
+        db.rollback()
+        raise RoomNameConflict(room.name)
     db.refresh(db_room)
     # Owner is automatically a member of the room they created
     db.add(models.RoomMember(room_id=db_room.id, user_id=owner_id))
