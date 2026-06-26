@@ -192,11 +192,16 @@ REPL_PW="$(kubectl -n "$NAMESPACE" get secret chatroom-mysql \
 # fails with `Plugin 'auth_socket' is not loaded`. TCP at 127.0.0.1
 # always works on chatroom replicas because replication_bootstrap.sh
 # reconciles root@% on every replica it boots (CREATE + ALTER USER), so
-# `root@127.0.0.1` authenticates as root@%. Using TCP as a fallback keeps
-# `status` / `skip` / `skip-gtid` / `reset` callable on a broken
-# replica, so `grants` can then repair it on the socket path (which
-# bypasses read-only, which TCP does too but the comment in cmd_grants
-# spells out why the socket path is preferred for that one).
+# `root@127.0.0.1` authenticates as root@%. The choice between socket and
+# TCP matters only for *reads* (SELECT, SHOW STATUS) — both work
+# identically when --read-only / --super-read-only are in effect, because
+# those flags only gate writes. For writes (ALTER USER in `grants`,
+# replication-control statements in `skip` / `skip-gtid` / `reset`),
+# --super-read-only blocks both transports equally: the `grants`
+# subcommand gets around this with an explicit SET GLOBAL
+# super_read_only=OFF/ON wrapper, and the replication-control statements
+# are super-read-only-aware on the server side (STOP REPLICA, SET GLOBAL
+# sql_replica_skip_counter, START REPLICA all bypass read-only).
 mysql_in_pod_socket() {
     kubectl -n "$NAMESPACE" exec -i "$POD" -- \
         env MYSQL_PWD="$ROOT_PW" mysql -uroot "$@"
@@ -224,10 +229,26 @@ fi
 log "Confirmed $POD is a replica (@@read_only=1)."
 
 # Detect MySQL version so we pick REPLICA (8.0.22+) vs SLAVE keywords.
+# REPLICA / SOURCE / GTID_NEXT land in 8.0.22; everything in the 8.0.x
+# line below that uses SLAVE. 8.1+ and 9.x use REPLICA unconditionally.
+#
+# VERSION() may include a distro suffix ("8.0.46-debian"), so strip
+# everything past the third dot-separated component before parsing.
+# Earlier versions of this script used `cut -d. -f2` to extract the
+# minor version, which on "8.0.46" returns "0" (the patch's prefix is
+# the field separator), making the comparison always false and the
+# script log "pre-8.0.22, falling back to SLAVE keyword family" on a
+# fresh MySQL 8.0.46 install — observed in the 2026-06-26 deploy on
+# 192.168.0.104 where the dispatch then went down the SLAVE branch
+# against a server that fully supports REPLICA.
 MYSQL_VERSION="$(mysql_in_pod -N -B -e "SELECT VERSION();")"
-MYSQL_MAJOR="$(printf '%s' "$MYSQL_VERSION" | cut -d. -f1)"
-MYSQL_MINOR="$(printf '%s' "$MYSQL_VERSION" | cut -d. -f2)"
-if [[ "$MYSQL_MAJOR" -gt 8 || ( "$MYSQL_MAJOR" -eq 8 && "$MYSQL_MINOR" -ge 22 ) ]]; then
+MYSQL_VERSION_NUM="$(printf '%s' "$MYSQL_VERSION" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+MYSQL_MAJOR="$(printf '%s' "$MYSQL_VERSION_NUM" | cut -d. -f1)"
+MYSQL_MINOR="$(printf '%s' "$MYSQL_VERSION_NUM" | cut -d. -f2)"
+MYSQL_PATCH="$(printf '%s' "$MYSQL_VERSION_NUM" | cut -d. -f3)"
+if [[ "$MYSQL_MAJOR" -gt 8 ]] \
+    || [[ "$MYSQL_MAJOR" -eq 8 && "$MYSQL_MINOR" -gt 0 ]] \
+    || [[ "$MYSQL_MAJOR" -eq 8 && "$MYSQL_MINOR" -eq 0 && "$MYSQL_PATCH" -ge 22 ]]; then
     USE_REPLICA_KEYWORDS=1
     log "MySQL $MYSQL_VERSION — using REPLICA keyword family."
 else
@@ -430,10 +451,8 @@ cmd_reset() {
 #
 # Idempotent: re-running on a replica that already has the right
 # grant writes the same hash and is a no-op for the user-facing auth
-# path. Safe under the replica's --read-only / --super-read-only
-# flags because we connect via the local unix socket as root, which
-# bypasses session-level read-only the same way the official mysql
-# entrypoint does during init.
+# path. The ALTER USER itself is wrapped in a SET GLOBAL
+# super_read_only=OFF / ON pair — see the SQL block below for why.
 cmd_grants() {
     [[ ${#EXTRA_ARGS[@]} -eq 0 ]] || fail "'grants' takes no positional arguments (got: ${EXTRA_ARGS[*]})"
 
@@ -444,8 +463,19 @@ cmd_grants() {
         [[ "$ans" =~ ^[Yy]$ ]] || fail "Aborted."
     fi
 
+    # Replicas run with --super-read-only=ON, which blocks every write
+    # regardless of auth method — `auth_socket` on a local unix socket
+    # lets us connect and SELECT, but ALTER USER / CREATE USER still
+    # return ERROR 1290. Toggle super_read_only off around the write,
+    # then back on. The toggle is global so it briefly lifts the
+    # replica's write-rejection posture; the deploy script's caller
+    # does this on every fresh deploy, and the window between OFF and
+    # ON is a single ALTER USER round-trip, so no concurrent writer can
+    # race in.
     local sql="
+        SET GLOBAL super_read_only = OFF;
         ALTER USER 'root'@'%' IDENTIFIED BY '${ROOT_PW}';
+        SET GLOBAL super_read_only = ON;
         FLUSH PRIVILEGES;
     "
 

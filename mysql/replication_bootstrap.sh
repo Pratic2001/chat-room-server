@@ -397,9 +397,16 @@ mysqladmin_local() {
 #
 # Issuing these statements locally on the replica is safe under all
 # the constraint surfaces we care about:
-#   - --read-only / --super-read-only on the replica don't apply to the
-#     local unix-socket root connection (they're session-level flags
-#     the SQL bypasses the same way the official mysql entrypoint does).
+#   - This block runs against the **background** mysqld we started at
+#     step 4, which has neither --read-only nor --super-read-only
+#     (those flags are only added when we hand off to the foreground
+#     mysqld at the bottom of this script). super-read-only blocks
+#     every write from any session regardless of auth plugin — the
+#     `auth_socket` connection we use here gives us a password-less
+#     login, not a write bypass — so this exact CREATE USER / ALTER
+#     USER against the *foreground* mysqld (e.g. from
+#     scripts/fix_mysql_repl.sh grants) needs an explicit
+#     SET GLOBAL super_read_only = OFF around the write.
 #   - caching_sha2_password hashes MYSQL_ROOT_PASSWORD to the same
 #     value as the master, so the grant converges cluster-wide even
 #     though we're running it independently on every replica.

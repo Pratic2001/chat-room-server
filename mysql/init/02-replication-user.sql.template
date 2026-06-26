@@ -55,7 +55,17 @@
 --   BACKUP_ADMIN   only needed for `LOCK INSTANCE FOR BACKUP` and
 --                  the clone-plugin transport; not used here
 --   SUPER          intentionally never granted to a non-root account
-CREATE USER 'repl'@'%' IDENTIFIED BY '__REPLICATION_PASSWORD__';
+-- Why IF NOT EXISTS: this init script runs once on the master's first
+-- boot (empty datadir) and the resulting CREATE USER event also lands in
+-- the binlog. When a replica later bootstraps via mysqldump (see
+-- mysql/replication_bootstrap.sh), the dump-load brings the user in
+-- from the master's mysql.user snapshot; replaying the binlog then
+-- issues CREATE USER against an existing row, which fails with
+-- ERROR 1396 (ER_CANNOT_USER) and stops the replica's SQL thread
+-- permanently — see RUNBOOK §9.14. CREATE USER IF NOT EXISTS is a no-op
+-- when the user already exists, so the master init path is unchanged
+-- and the replica replay path succeeds.
+CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY '__REPLICATION_PASSWORD__';
 GRANT SELECT, RELOAD, LOCK TABLES,
       SHOW VIEW, TRIGGER, EVENT,
       REPLICATION SLAVE ON *.* TO 'repl'@'%';

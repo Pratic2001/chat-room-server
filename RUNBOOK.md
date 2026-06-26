@@ -2000,8 +2000,14 @@ cause is almost always a single binlog event the replica can't replay
 against its current state — most often an `ALTER USER` line that was
 replayed from the master (the `99-grants.sql` template the master ran
 on first boot also lives in the binlog and gets re-applied to
-replicas). Other common triggers: a duplicate-key `CREATE USER`, a
-`GRANT` for a user that doesn't exist, a `DROP` of a row that already
+replicas). Another frequent trigger on a fresh cluster: a `CREATE USER`
+from the master's `02-replication-user.sql` (the `repl'@'%'`
+replication account) hitting a replica that already has the user from
+the dump-load — fixed in the shipped schema by adding `IF NOT EXISTS`
+to that CREATE USER, so a freshly-built image won't reproduce this; an
+older image will still trip it on first deploy. Other common triggers:
+a duplicate-key `CREATE USER` from a manual SQL session, a `GRANT`
+for a user that doesn't exist, a `DROP` of a row that already
 moved on, etc.
 
 **This is different from §9.10 / §9.10.1** — those cover the replica
