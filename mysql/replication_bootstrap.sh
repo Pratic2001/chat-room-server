@@ -194,6 +194,19 @@ fi
 # passwordlessly via the OS-user match. The init file is idempotent so
 # a re-run on a populated datadir (the script's idempotent-restart
 # path at the top of the replica block) still works.
+#
+# The same --init-file is also passed to the foreground mysqld at the
+# bottom of this script. Reason: the dump-load that follows overwrites
+# mysql.plugin with the master's version, and the master never had
+# auth_socket installed, so the plugin reference in mysql.plugin is
+# gone by the time we hand off to the foreground mysqld. Without
+# re-running the init file on the foreground, the auth_socket plugin
+# isn't loaded there, `root@localhost` (re-pinned to auth_socket below
+# at step "Re-pin root@localhost") is a dangling plugin reference, and
+# any subsequent `kubectl exec ... -- mysql -uroot` (no -h) call fails
+# with `ERROR 1524 (HY000): Plugin 'auth_socket' is not loaded`. The
+# init file's `INSTALL PLUGIN` is guarded by an INFORMATION_SCHEMA.PLUGINS
+# check, so it's a no-op on subsequent restarts.
 log "Writing /tmp/replica-bootstrap-init.sql..."
 cat > /tmp/replica-bootstrap-init.sql <<'INIT_SQL'
 -- Replica bootstrap init file (mysql/replication_bootstrap.sh).
@@ -497,4 +510,5 @@ exec /usr/local/bin/gosu mysql mysqld \
     --slave-skip-errors=1061 \
     --socket=/var/run/mysqld/mysqld.sock \
     --pid-file=/var/run/mysqld/mysqld.pid \
+    --init-file=/tmp/replica-bootstrap-init.sql \
     "$@"

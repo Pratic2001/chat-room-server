@@ -182,17 +182,35 @@ REPL_PW="$(kubectl -n "$NAMESPACE" get secret chatroom-mysql \
 # up automatically — avoids the warning about passwords on the command
 # line and keeps the secret out of `kubectl describe pod` output.
 #
-# We use the unix socket (no -h) rather than --protocol=TCP -h 127.0.0.1:
-# every MySQL pod has root@localhost with the cached password (the dump
-# load populates mysql.user from the master, which always has root@%
-# even if it's missing on this replica). Root@127.0.0.1 only works when
-# root@% is present — which is exactly the case the `grants` subcommand
-# is here to repair. Using the socket keeps `status` / `skip` /
-# `skip-gtid` / `reset` callable on a broken replica, so `grants` can
-# then fix it.
-mysql_in_pod() {
+# Transport: try the unix socket first, then fall back to TCP at
+# 127.0.0.1. The socket path works on standalone `docker run mysql:8`
+# and on chatroom replicas whose bootstrap installed the `auth_socket`
+# plugin. On replicas where the bootstrap couldn't install it
+# (replication_bootstrap.sh writes /tmp/replica-bootstrap-init.sql to
+# `--init-file=` the background mysqld, but the foreground mysqld starts
+# without one — see that script's comment at the exec), socket auth
+# fails with `Plugin 'auth_socket' is not loaded`. TCP at 127.0.0.1
+# always works on chatroom replicas because replication_bootstrap.sh
+# reconciles root@% on every replica it boots (CREATE + ALTER USER), so
+# `root@127.0.0.1` authenticates as root@%. Using TCP as a fallback keeps
+# `status` / `skip` / `skip-gtid` / `reset` callable on a broken
+# replica, so `grants` can then repair it on the socket path (which
+# bypasses read-only, which TCP does too but the comment in cmd_grants
+# spells out why the socket path is preferred for that one).
+mysql_in_pod_socket() {
     kubectl -n "$NAMESPACE" exec -i "$POD" -- \
         env MYSQL_PWD="$ROOT_PW" mysql -uroot "$@"
+}
+mysql_in_pod_tcp() {
+    kubectl -n "$NAMESPACE" exec -i "$POD" -- \
+        env MYSQL_PWD="$ROOT_PW" mysql -uroot -h 127.0.0.1 "$@"
+}
+mysql_in_pod() {
+    if mysql_in_pod_socket -e "SELECT 1" >/dev/null 2>&1; then
+        mysql_in_pod_socket "$@"
+    else
+        mysql_in_pod_tcp "$@"
+    fi
 }
 
 # -----------------------------------------------------------------------------
