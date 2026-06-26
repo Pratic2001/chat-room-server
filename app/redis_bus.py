@@ -31,6 +31,17 @@ the master (via Sentinel), and every consumer group on every pod reads
 from the same key. The Streams data is replicated master→replica by
 Redis's standard replication, so consumers see a consistent view.
 
+One group per pod
+-----------------
+We use a separate consumer group for each pod (named
+`chatroom-app:<pod-name>`), not one shared group. A shared group with
+N consumers only delivers each XADD to ONE of the N pods, so the
+other N-1 pods miss every message and their WebSocket users have to
+refresh to recover. With a per-pod group, each pod's only consumer
+is the pod itself, so XREADGROUP returns every XADD to every pod and
+each pod's `local_dispatch` runs. See the long comment next to
+CONSUMER_GROUP_PREFIX for the rationale.
+
 Degraded mode
 -------------
 There are two paths into degraded (local-only) mode:
@@ -82,15 +93,21 @@ log = logging.getLogger(__name__)
 # not worth the complexity for a chat app of this size.
 STREAM_KEY = "chatroom:room_events"
 
-# One consumer group shared by every chatroom-app pod. Every pod joins
-# the same group with a unique consumer-name (POD_NAME or hostname);
-# the group as a whole gets every message at least once (XREADGROUP
-# with `>` returns messages that no consumer in the group has acked
-# yet, and once a message is acked, it's removed from the pending list
-# for that group). Each pod sees each message exactly once because
-# XREADGROUP delivers each pending entry to exactly one consumer in
-# the group.
-CONSUMER_GROUP = "chatroom-app"
+# One consumer group PER pod, named `chatroom-app:<pod-name>`. We can't
+# share a single group across pods because Redis Streams deliver each
+# XADD to *exactly one* consumer in the group — a shared group with N
+# consumers means each entry reaches only one of N pods, and the other
+# pods' WebSocket users miss it (the original fan-out bug). With a
+# per-pod group, every group's only consumer is the pod itself, so
+# XREADGROUP returns every new XADD to every pod and each pod's
+# `local_dispatch` runs. A fresh pod's group is created with id="$" so
+# it only sees entries added *after* the group exists — we never replay
+# history on join.
+#
+# Stale groups from previous pod names accumulate in XINFO GROUPS but
+# are harmless: each is just one empty entry in the groups list, and a
+# pod restart with the same name reuses its own existing group (BUSYGROUP).
+CONSUMER_GROUP_PREFIX = "chatroom-app"
 
 # Module-level handles. init_bus fills these in; everyone else imports
 # the names below.
@@ -175,6 +192,20 @@ def _consumer_name() -> str:
     PEL recovery (see _run_subscriber below).
     """
     return os.getenv("POD_NAME") or socket.gethostname() or "unknown"
+
+
+def _consumer_group_name() -> str:
+    """Per-pod consumer group name.
+
+    See the long comment next to CONSUMER_GROUP_PREFIX for why each
+    pod needs its own group rather than sharing one. Sanitize the pod
+    name minimally: groups allow most printable chars, but Redis treats
+    colons as separators in some CLI output, and a pod name with a
+    newline would never realistically appear but is cheap to guard
+    against — the consumer-name helper already fell back to socket
+    hostname which can contain '.' and '-' which are all fine.
+    """
+    return f"{CONSUMER_GROUP_PREFIX}:{_consumer_name()}"
 
 
 async def _try_connect() -> bool:
@@ -263,15 +294,20 @@ async def _try_connect() -> bool:
         _client = aioredis.from_url(url, encoding="utf-8", decode_responses=True)
         await _client.ping()
 
-    # Ensure the consumer group exists. MKSTREAM creates the stream
-    # if it doesn't exist yet (so the very first publish doesn't
-    # fail with NOGROUP). BUSYGROUP means the group already exists
-    # — race with another pod during a cold start; we ignore it.
+    # Ensure THIS pod's consumer group exists. Per-pod groups mean each
+    # pod's XREADGROUP returns every new XADD — see the long comment
+    # next to CONSUMER_GROUP_PREFIX. MKSTREAM creates the stream if it
+    # doesn't exist yet (so the very first publish doesn't fail with
+    # NOGROUP). id="$" means "start delivering from the current end of
+    # the stream" — a fresh pod's WebSocket clients only need future
+    # events, not a replay of history. BUSYGROUP means the group
+    # already exists (a pod restart with the same POD_NAME reuses it,
+    # including any unacked entries on its PEL); we ignore that.
     try:
         await _client.xgroup_create(
             name=STREAM_KEY,
-            groupname=CONSUMER_GROUP,
-            id="0",  # start from id 0 so a fresh group sees the backlog
+            groupname=_consumer_group_name(),
+            id="$",
             mkstream=True,
         )
     except Exception as e:
@@ -463,6 +499,7 @@ async def _run_subscriber() -> None:
     """
     global _client
     assert _sentinel_mode is False or _sentinel is not None  # mypy appeasement
+    group = _consumer_group_name()
     consumer = _consumer_name()
     backoff = 1.0
     while True:
@@ -470,10 +507,12 @@ async def _run_subscriber() -> None:
             assert _client is not None
             # XREADGROUP GROUP <group> <consumer> COUNT N BLOCK 5000 STREAMS <key> >
             # `>` means "messages not yet delivered to any consumer in
-            # this group". BLOCK 5000 returns after 5s of inactivity so
-            # the loop can be cancelled promptly on shutdown.
+            # this group". Per-pod group means `>` returns every new
+            # XADD to every pod (one entry per group, and we have one
+            # group per pod). BLOCK 5000 returns after 5s of inactivity
+            # so the loop can be cancelled promptly on shutdown.
             streams = await _client.xreadgroup(
-                groupname=CONSUMER_GROUP,
+                groupname=group,
                 consumername=consumer,
                 streams={STREAM_KEY: ">"},
                 count=16,
@@ -543,10 +582,10 @@ async def _run_subscriber() -> None:
 
 
 async def _safe_xack(entry_id: str) -> None:
-    """Best-effort XACK. A failure here is logged but never raised."""
+    """Best-effort XACK against THIS pod's group. A failure here is logged but never raised."""
     assert _client is not None
     try:
-        await _client.xack(STREAM_KEY, CONSUMER_GROUP, entry_id)
+        await _client.xack(STREAM_KEY, _consumer_group_name(), entry_id)
     except Exception as e:
         log.warning("Redis XACK failed for entry %s: %s", entry_id, e)
 
