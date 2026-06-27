@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS room_bans (
     id INT AUTO_INCREMENT PRIMARY KEY,
     room_id INT NOT NULL,
     user_id INT NOT NULL,
-    banned_by INT NOT NULL,
+    banned_by INT NULL,
     banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     reason VARCHAR(500) NULL,
     UNIQUE KEY uq_room_bans_room_user (room_id, user_id),
