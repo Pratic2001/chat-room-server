@@ -4,10 +4,17 @@ from app import crud, models, schemas
 from app.utils import get_password_hash, decrypt_secret, send_invite_email
 from app.database import get_db, get_read_db
 from app.routers.auth import get_current_user
+from app.ws_manager import manager
 from typing import List
 from html import escape
 
 router = APIRouter()
+
+AI_USERNAME = "assistant"  # mirrored from crud; used to recognize the AI member in popovers
+
+def _is_ai_user(user: models.User) -> bool:
+    return bool(user and user.username == AI_USERNAME)
+
 
 @router.post("/", response_model=schemas.RoomResponse)
 def create_room(room: schemas.RoomCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
@@ -33,6 +40,12 @@ def join_room(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
+    # Check banned status first so the error message is unambiguous
+    # even when the user would have failed the pass-phrase check too.
+    # (Both checks returning False from crud.join_room would otherwise
+    # collapse into one indistinguishable 400.)
+    if crud.is_user_banned(db, room_id, current_user.id):
+        raise HTTPException(status_code=403, detail="You are banned from this room")
     success = crud.join_room(
         db=db, room_id=room_id, user_id=current_user.id, secret_phrase=body.secret_phrase
     )
@@ -57,6 +70,8 @@ def join_room_by_name(
     room = crud.get_room_by_name(db, body.name.strip())
     if not room:
         raise HTTPException(status_code=404, detail="No room with that name")
+    if crud.is_user_banned(db, room.id, current_user.id):
+        raise HTTPException(status_code=403, detail="You are banned from this room")
     # Delegate to the same join logic used by /rooms/{id}/join so the
     # pass-phrase rules and idempotency are identical.
     success = crud.join_room(
@@ -66,25 +81,191 @@ def join_room_by_name(
         raise HTTPException(status_code=400, detail="Invalid secret phrase")
     return room
 
+
+@router.get("/{room_id}/members", response_model=List[schemas.RoomMemberOut])
+def list_members(
+    room_id: int,
+    db: Session = Depends(get_read_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Return the room's member list. Any current member may read it
+    (the mention autocomplete and the moderation popover both need it).
+    Members only — non-members get a 403 so the endpoint doesn't leak
+    the membership roster of rooms the caller isn't in."""
+    room = crud.get_room_by_id(db, room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    caller_member = (
+        db.query(models.RoomMember)
+        .filter(
+            models.RoomMember.room_id == room_id,
+            models.RoomMember.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not caller_member:
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+    rows = crud.list_room_members(db, room_id)
+    out: list[schemas.RoomMemberOut] = []
+    for user, joined_at in rows:
+        out.append(schemas.RoomMemberOut(
+            user_id=user.id,
+            username=user.username,
+            joined_at=joined_at,
+            is_owner=(user.id == room.owner_id),
+            is_ai=_is_ai_user(user),
+        ))
+    return out
+
+
+@router.delete("/{room_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def kick_member(
+    room_id: int,
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Owner-only kick: removes the target's membership row. The
+    target's WebSocket(s) for this room are closed so they stop
+    receiving messages immediately. Kicked users can rejoin (unless
+    they're also banned); ban is a separate verb."""
+    room = crud.get_room_by_id(db, room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the room owner can kick members")
+    if user_id == room.owner_id:
+        raise HTTPException(status_code=400, detail="Cannot kick the room owner")
+    target = crud.get_user(db, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if _is_ai_user(target):
+        raise HTTPException(status_code=400, detail="Cannot kick the AI assistant")
+    # No-op (200/204) if the target wasn't a member — kicking a
+    # non-member doesn't make sense but failing noisily here would
+    # break the UI flow that re-fetches the list.
+    crud.kick_member(db, room_id, user_id)
+    # Close the target's WS so they stop receiving messages. Done
+    # AFTER the DB delete so a fast reconnect won't see a "you're
+    # not a member" close from the WS endpoint while the membership
+    # is still being torn down.
+    await manager.disconnect_user(user_id, room_id, code=1000)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/{room_id}/bans", response_model=schemas.BanOut, status_code=status.HTTP_201_CREATED)
+def ban_member(
+    room_id: int,
+    body: schemas.BanCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Owner-only ban: removes the target's membership AND prevents
+    rejoin until the ban is lifted. Idempotent — re-banning the
+    same user with a new reason updates the reason in place."""
+    room = crud.get_room_by_id(db, room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the room owner can ban members")
+    if body.user_id == room.owner_id:
+        raise HTTPException(status_code=400, detail="Cannot ban the room owner")
+    target = crud.get_user(db, body.user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if _is_ai_user(target):
+        raise HTTPException(status_code=400, detail="Cannot ban the AI assistant")
+    ban = crud.ban_user(db, room_id, body.user_id, banned_by=current_user.id, reason=body.reason)
+    # Close the target's WS so they stop receiving messages immediately.
+    await manager.disconnect_user(body.user_id, room_id, code=1000)
+    return schemas.BanOut(
+        id=ban.id,
+        room_id=ban.room_id,
+        user_id=ban.user_id,
+        username=target.username,
+        banned_by=ban.banned_by,
+        banned_at=ban.banned_at,
+        reason=ban.reason,
+    )
+
+
+@router.delete("/{room_id}/bans/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def unban_member(
+    room_id: int,
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Owner-only unban: removes the ban row so the user can rejoin."""
+    room = crud.get_room_by_id(db, room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the room owner can unban members")
+    crud.unban_user(db, room_id, user_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{room_id}/bans", response_model=List[schemas.BanOut])
+def list_bans(
+    room_id: int,
+    db: Session = Depends(get_read_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Owner-only ban list."""
+    room = crud.get_room_by_id(db, room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    if room.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Only the room owner can view the ban list")
+    rows = crud.list_room_bans(db, room_id)
+    return [
+        schemas.BanOut(
+            id=ban.id,
+            room_id=ban.room_id,
+            user_id=ban.user_id,
+            username=username,
+            banned_by=ban.banned_by,
+            banned_at=ban.banned_at,
+            reason=ban.reason,
+        )
+        for ban, username in rows
+    ]
+
+
 @router.delete("/{room_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_room(
+async def delete_room(
     room_id: int,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
+    """Real delete: removes the room and all of its data. Closes the
+    WebSocket of every currently-connected member first so no client
+    is still subscribed to a room that's about to disappear, then
+    wipes messages / memberships / bans / room row in one DB call.
+
+    The previous behavior was "remove the owner's membership" so
+    other members could keep their access; that conflicted with
+    `rooms.name UNIQUE` and made room-name reuse impossible."""
     room = crud.get_room_by_id(db, room_id)
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
     if room.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="Only the room owner can delete it")
-    # Per the chosen semantics, "delete" for the owner removes their
-    # membership. The room row and other members are left intact so
-    # other users can still see and use the room.
-    db.query(models.RoomMember).filter(
-        models.RoomMember.room_id == room_id,
-        models.RoomMember.user_id == current_user.id,
-    ).delete()
-    db.commit()
+
+    # Close every connected socket in the room across all users,
+    # BEFORE the DB delete. We don't need a per-user loop here —
+    # the room is going away, so the per-user distinction doesn't
+    # matter; we just want nobody listening anymore.
+    sockets = manager.active_connections.get(room_id, [])
+    for ws in list(sockets):
+        try:
+            await ws.close(code=1000)
+        except Exception:
+            pass
+    manager.active_connections.pop(room_id, None)
+
+    crud.delete_room_cascade(db, room_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

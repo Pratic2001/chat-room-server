@@ -1,13 +1,16 @@
 import base64
 import asyncio
+import json
+import uuid
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app import crud, models, schemas
-from app.ai import contains_mention, maybe_reply
+from app.ai import stream_reply
 from app.database import get_db, get_read_db
+from app.mentions import contains_mention, extract_mentions
 from app.routers.auth import get_current_user
 from app.thumbnails import make_thumbnail
 from app.ws_manager import manager
@@ -30,6 +33,10 @@ def _serialize(msg):
     string, error parsing unicode" — which is exactly the error attachments
     hit on upload.
     """
+    # `mentions` is a JSON column → SQLAlchemy gives us back a Python
+    # list (or None). Normalize to [] so the response field is never
+    # null and the frontend can index it without a guard.
+    mentions = msg.mentions if isinstance(msg.mentions, list) else []
     return schemas.MessageResponse(
         id=msg.id,
         room_id=msg.room_id,
@@ -42,6 +49,8 @@ def _serialize(msg):
         created_at=msg.created_at,
         data=base64.b64encode(msg.data).decode("utf-8") if msg.data else None,
         thumbnail=base64.b64encode(msg.thumbnail).decode("utf-8") if msg.thumbnail else None,
+        mentions=mentions,
+        caption=msg.caption,
     )
 
 
@@ -109,6 +118,28 @@ async def create_message(
                 raise HTTPException(status_code=400, detail="Invalid image data")
             thumbnail_data = thumb
 
+    # Extract @mentions from text content. We intersect with the
+    # room's actual member list so we don't persist (or highlight)
+    # `@randomname` for someone not in the room. Read the list once
+    # here; the WS path does the same and the membership list is
+    # tiny in practice.
+    mentions: list[str] = []
+    if body.message_type == "text" and body.content:
+        member_usernames = [
+            u.username for u in crud.list_room_members(db, room_id)
+        ]
+        mentions = extract_mentions(body.content, member_usernames)
+
+    # Captions only apply to non-text messages. The composer stages a
+    # file and the typed text together; if the text is empty, the
+    # caption is empty (don't persist a "" caption — looks like
+    # noise in the bubble).
+    caption = (
+        (body.caption or "").strip()
+        if body.message_type != "text" and body.caption
+        else None
+    )
+
     db_msg = crud.create_message(
         db=db,
         message=schemas.MessageCreate(
@@ -123,6 +154,8 @@ async def create_message(
         thumbnail=thumbnail_data,
         file_name=body.file_name,
         mime_type=body.mime_type,
+        caption=caption,
+        mentions=mentions,
     )
     serialized = _serialize(db_msg)
     # Include the sender's username so the client can render the bubble
@@ -142,6 +175,7 @@ async def create_message(
             user_id=current_user.id,
             username=current_user.username,
             created_at=db_msg.created_at,
+            mentions=mentions,
         )
     else:
         ws_msg = schemas.WSMessage(
@@ -154,21 +188,27 @@ async def create_message(
             user_id=current_user.id,
             username=current_user.username,
             created_at=db_msg.created_at,
+            mentions=mentions,
+            caption=caption,
         )
     await manager.broadcast(ws_msg.model_dump_json(), room_id)
 
     # AI trigger: fire-and-forget. Runs in the background so the HTTP
     # response is not delayed by Ollama latency. The task opens its own
     # DB session (see app/ai.py) so the request-scoped session is not
-    # held open across the HTTP call.
+    # held open across the HTTP call. Streams via the same envelope
+    # protocol the WebSocket path uses, so the user sees a typing
+    # indicator + progressive bubble even when sending via REST.
     if body.message_type == "text" and contains_mention(body.content or ""):
         ai_room = crud.get_room_by_id(db, room_id)
         if ai_room and ai_room.ai_enabled and current_user.username != crud.AI_USERNAME:
-            asyncio.create_task(maybe_reply(
+            request_id = str(uuid.uuid4())
+            asyncio.create_task(stream_reply(
                 room_id=room_id,
                 triggering_user_id=current_user.id,
                 triggering_message_id=db_msg.id,
                 triggering_text=body.content or "",
+                request_id=request_id,
             ))
 
     return schemas.MessageResponse(**payload)

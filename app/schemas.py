@@ -142,6 +142,13 @@ class MessageResponse(MessageBase):
     created_at: datetime
     data: Optional[str] = None  # base64 encoded binary data
     thumbnail: Optional[str] = None  # base64 encoded thumbnail
+    # Lowercase usernames mentioned in `content` that are actual room
+    # members. Empty list (NOT null) when no mentions. The frontend
+    # uses this to highlight mentions in the bubble.
+    mentions: List[str] = []
+    # Caption typed alongside a file/image/video. NULL on text-only
+    # messages and on attachment messages sent without a caption.
+    caption: Optional[str] = None
 
 # WebSocket message schemas (for sending/receiving over WS)
 class WSMessage(BaseModel):
@@ -160,3 +167,45 @@ class WSMessage(BaseModel):
     user_id: Optional[int] = None
     username: Optional[str] = None
     created_at: Optional[datetime] = None
+    # Echo of the server-extracted mentions list (lowercase usernames
+    # that are actual room members). Empty list when no mentions.
+    mentions: List[str] = []
+    # Caption typed alongside a file/image/video attachment.
+    caption: Optional[str] = None
+
+
+# ---------- Room members / bans ----------
+
+class RoomMemberOut(BaseModel):
+    """Row in the members list. Used by the mention autocomplete and
+    by the moderation popover. `is_owner` and `is_ai` are computed in
+    the router (they're not ORM columns)."""
+    model_config = ConfigDict(from_attributes=True)
+
+    user_id: int
+    username: str
+    joined_at: datetime
+    is_owner: bool
+    is_ai: bool
+
+
+class BanCreate(BaseModel):
+    """Body for POST /rooms/{id}/bans. Reason is optional and capped
+    so a malicious owner can't dump a wall of text into the DB."""
+    user_id: int
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class BanOut(BaseModel):
+    """Row in the ban list. `username` is joined in the router so the
+    frontend can render the ban list without a second round-trip per
+    row."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    room_id: int
+    user_id: int
+    username: str
+    banned_by: Optional[int] = None
+    banned_at: datetime
+    reason: Optional[str] = None

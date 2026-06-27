@@ -179,6 +179,13 @@ def join_room(db: Session, room_id: int, user_id: int, secret_phrase: str | None
             return False
         if not constant_time_equal(provided, actual):
             return False
+    # Ban check: refuse before touching the membership table. Returning
+    # False here is ambiguous from the caller's perspective ("wrong
+    # phrase" or "banned") — the router handles the disambiguation by
+    # calling `is_user_banned` separately and returning a distinct
+    # 403 with "You are banned from this room." when applicable.
+    if is_user_banned(db, room_id, user_id):
+        return False
     # Check if already a member
     existing = db.query(models.RoomMember).filter(
         and_(
@@ -199,7 +206,8 @@ def get_room_members(db: Session, room_id: int):
 
 # Message CRUD
 def create_message(db: Session, message: schemas.MessageCreate, room_id: int, user_id: int,
-                   data: bytes = None, thumbnail: bytes = None, file_name: str = None, mime_type: str = None):
+                   data: bytes = None, thumbnail: bytes = None, file_name: str = None, mime_type: str = None,
+                   caption: str | None = None, mentions: list[str] | None = None):
     db_message = models.Message(
         room_id=room_id,
         user_id=user_id,
@@ -208,7 +216,12 @@ def create_message(db: Session, message: schemas.MessageCreate, room_id: int, us
         data=data,
         thumbnail=thumbnail,
         file_name=file_name,
-        mime_type=mime_type
+        mime_type=mime_type,
+        # `mentions` is a JSON column. Pass through whatever the
+        # caller extracted (already filtered to room members on the
+        # router side). None → NULL in MySQL.
+        mentions=mentions if mentions else None,
+        caption=caption,
     )
     db.add(db_message)
     db.commit()
@@ -217,3 +230,162 @@ def create_message(db: Session, message: schemas.MessageCreate, room_id: int, us
 
 def get_messages_by_room(db: Session, room_id: int, skip: int = 0, limit: int = 100):
     return db.query(models.Message).filter(models.Message.room_id == room_id).order_by(models.Message.created_at.desc()).offset(skip).limit(limit).all()
+
+
+# ---------- Member / ban / delete helpers ----------
+
+def list_room_members(db: Session, room_id: int):
+    """Return (User, joined_at) tuples for every member of `room_id`,
+    sorted by username (case-insensitive). Used by the members
+    endpoint (mention autocomplete + moderation popover).
+    """
+    # Join users → room_members and project joined_at alongside the
+    # user columns so the caller can render the row without a second
+    # round-trip. `joined_at` is added as a column on the User row via
+    # a label so callers can read `row.joined_at` uniformly.
+    from sqlalchemy.orm import aliased
+    rm = aliased(models.RoomMember)
+    rows = (
+        db.query(models.User, rm.joined_at.label("joined_at"))
+        .join(rm, rm.user_id == models.User.id)
+        .filter(rm.room_id == room_id)
+        .order_by(models.User.username.asc())
+        .all()
+    )
+    return rows
+
+
+def is_user_banned(db: Session, room_id: int, user_id: int) -> bool:
+    """True iff `user_id` is in the room_bans table for `room_id`.
+    Used by the join flow (refuse rejoin) and by the moderation UI
+    (don't show 'Ban' for an already-banned user)."""
+    return (
+        db.query(models.RoomBan)
+        .filter(
+            models.RoomBan.room_id == room_id,
+            models.RoomBan.user_id == user_id,
+        )
+        .first()
+        is not None
+    )
+
+
+def ban_user(db: Session, room_id: int, user_id: int, banned_by: int, reason: str | None = None) -> models.RoomBan:
+    """Insert (or refresh) a ban row. Idempotent: if a row already
+    exists for (room_id, user_id), update the reason and banned_by in
+    place so re-banning with new context overwrites the old. Also
+    removes any active membership so the banned user is gone from the
+    room immediately, not just on next reconnect.
+    """
+    existing = (
+        db.query(models.RoomBan)
+        .filter(
+            models.RoomBan.room_id == room_id,
+            models.RoomBan.user_id == user_id,
+        )
+        .first()
+    )
+    if existing:
+        existing.reason = reason
+        existing.banned_by = banned_by
+        # Bump banned_at so the UI's "banned since" display reflects
+        # the most recent action, not the original ban.
+        from datetime import datetime as _dt
+        existing.banned_at = _dt.utcnow()
+        # Drop the membership if present (ban == kick + block).
+        db.query(models.RoomMember).filter(
+            models.RoomMember.room_id == room_id,
+            models.RoomMember.user_id == user_id,
+        ).delete()
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    # Drop the membership if present before inserting the ban so the
+    # ban row's UNIQUE(room_id, user_id) doesn't have to fight a
+    # membership row for the user's "slot" in the room.
+    db.query(models.RoomMember).filter(
+        models.RoomMember.room_id == room_id,
+        models.RoomMember.user_id == user_id,
+    ).delete()
+    ban = models.RoomBan(
+        room_id=room_id,
+        user_id=user_id,
+        banned_by=banned_by,
+        reason=reason,
+    )
+    db.add(ban)
+    db.commit()
+    db.refresh(ban)
+    return ban
+
+
+def unban_user(db: Session, room_id: int, user_id: int) -> bool:
+    """Remove the ban row for (room_id, user_id). Returns True if a
+    row was actually deleted, False if there was no ban to clear."""
+    deleted = (
+        db.query(models.RoomBan)
+        .filter(
+            models.RoomBan.room_id == room_id,
+            models.RoomBan.user_id == user_id,
+        )
+        .delete()
+    )
+    db.commit()
+    return deleted > 0
+
+
+def list_room_bans(db: Session, room_id: int):
+    """Return all ban rows for `room_id`, joined to User so the
+    router can fill in `username` without a second round-trip."""
+    return (
+        db.query(models.RoomBan, models.User.username.label("username"))
+        .join(models.User, models.User.id == models.RoomBan.user_id)
+        .filter(models.RoomBan.room_id == room_id)
+        .order_by(models.RoomBan.banned_at.desc())
+        .all()
+    )
+
+
+def kick_member(db: Session, room_id: int, user_id: int) -> bool:
+    """Remove the (room_id, user_id) membership row. Returns True if
+    a row was actually deleted (i.e. the user was a member to begin
+    with). Leaves any ban row alone — kick and ban are orthogonal;
+    a kicked user can rejoin unless they're also banned.
+    """
+    deleted = (
+        db.query(models.RoomMember)
+        .filter(
+            models.RoomMember.room_id == room_id,
+            models.RoomMember.user_id == user_id,
+        )
+        .delete()
+    )
+    db.commit()
+    return deleted > 0
+
+
+def delete_room_cascade(db: Session, room_id: int) -> int:
+    """Wipe a room and everything attached to it: messages first
+    (FK), then memberships, then bans (the room_bans.room_id FK has
+    ON DELETE CASCADE so the cascade actually fires from the DB
+    side, but we delete here explicitly so the count returned to
+    the caller is accurate and so the operation is symmetric with
+    the in-memory cleanup the router does). Finally the room row
+    itself. Returns the number of messages deleted (the most useful
+    number to surface in a debug log).
+    """
+    msg_deleted = (
+        db.query(models.Message)
+        .filter(models.Message.room_id == room_id)
+        .delete()
+    )
+    db.query(models.RoomMember).filter(
+        models.RoomMember.room_id == room_id
+    ).delete()
+    db.query(models.RoomBan).filter(
+        models.RoomBan.room_id == room_id
+    ).delete()
+    db.query(models.Room).filter(models.Room.id == room_id).delete()
+    db.commit()
+    return msg_deleted

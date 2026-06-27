@@ -51,6 +51,36 @@ class ConnectionManager:
             if not self.active_connections[room_id]:
                 del self.active_connections[room_id]
 
+    async def disconnect_user(self, user_id: int, room_id: int, code: int = 1000) -> int:
+        """Close every socket in `room_id` belonging to `user_id`.
+
+        Returns the number of sockets closed. Used by the moderation
+        paths (kick / ban) and by the room-delete cascade: the
+        caller closes the sockets first, then commits the DB
+        delete, so no client sees a "you're still in a deleted room"
+        race.
+
+        The `user_id` association lives on the websocket itself —
+        the WS endpoint stashes `user.id` on `websocket.scope["user_id"]`
+        when it accepts the connection (see app/routers/chats.py).
+        """
+        sockets = self.active_connections.get(room_id)
+        if not sockets:
+            return 0
+        closed = 0
+        # Snapshot — `disconnect()` mutates the list.
+        for ws in list(sockets):
+            scope_user_id = (ws.scope or {}).get("user_id")
+            if scope_user_id == user_id:
+                try:
+                    await ws.close(code=code)
+                except Exception:
+                    # Socket already torn down — nothing to do.
+                    pass
+                self.disconnect(ws, room_id)
+                closed += 1
+        return closed
+
     async def broadcast(self, message: str, room_id: int):
         # Hand off to the bus. The bus is responsible for getting the
         # payload to every pod; this pod's local fan-out will happen

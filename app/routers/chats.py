@@ -1,8 +1,9 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app import crud, models, schemas
-from app.ai import contains_mention, maybe_reply
+from app.ai import stream_reply
 from app.database import get_db
+from app.mentions import contains_mention, extract_mentions
 from app.thumbnails import make_thumbnail
 from app.utils import SECRET_KEY, ALGORITHM
 from app.ws_manager import manager
@@ -10,6 +11,7 @@ from jose import JWTError, jwt
 import asyncio
 import json
 import base64
+import uuid
 
 # Allowed file types for upload
 ALLOWED_IMAGE_TYPES = {'image/jpeg', 'image/png', 'image/gif', 'image/webp'}
@@ -61,6 +63,17 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
+    # Stash user.id on the scope so ws_manager.disconnect_user can find
+    # the sockets owned by this user when they're kicked or banned.
+    websocket.scope["user_id"] = user.id
+    # Typing state: monotonic seq incremented every time this user
+    # sends a `typing` envelope. The auto-expire task reads this when
+    # it wakes up and bails if a newer typing has arrived — so we
+    # never broadcast a stale stop_typing.
+    websocket.scope["typing_seq"] = 0
+    # Active auto-expire tasks for this connection; cancelled on disconnect.
+    websocket.scope["typing_tasks"] = set()
+
     await manager.connect(websocket, room_id)
     try:
         # Send chat history (last 50 messages, newest first from DB)
@@ -75,10 +88,14 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
                 "username": msg.user.username if msg.user else None,
                 "created_at": msg.created_at,
             }
+            # `mentions` is a JSON column → list or None. Normalize to
+            # [] so the wire shape matches the HTTP path.
+            mentions = msg.mentions if isinstance(msg.mentions, list) else []
             if msg.message_type == "text":
                 ws_msg = schemas.WSMessage(
                     message_type=msg.message_type,
                     content=msg.content,
+                    mentions=mentions,
                     **common,
                 )
             else:
@@ -88,29 +105,70 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
                     mime_type=msg.mime_type,
                     data=base64.b64encode(msg.data).decode('utf-8') if msg.data is not None else None,
                     thumbnail=base64.b64encode(msg.thumbnail).decode('utf-8') if msg.thumbnail is not None else None,
+                    caption=msg.caption,
+                    mentions=mentions,
                     **common,
                 )
             await websocket.send_text(ws_msg.model_dump_json())
 
         while True:
             data = await websocket.receive_text()
+            # Typing envelopes are not chat messages — they're ephemeral
+            # presence hints. We accept them as a JSON object with a
+            # `type` field, validate they don't carry chat content, and
+            # broadcast them through the same bus as chat messages so
+            # every pod's subscribers see them. No DB write, no Ollama
+            # trigger. Using `manager.broadcast` means cross-pod fan-out
+            # is automatic via the existing Redis Streams bus.
             try:
-                msg = schemas.WSMessage.model_validate_json(data)
+                raw_obj = json.loads(data)
             except json.JSONDecodeError:
                 await websocket.send_text(json.dumps({"error": "Invalid JSON format"}))
                 continue
+            if isinstance(raw_obj, dict) and raw_obj.get("type") in ("typing", "stop_typing"):
+                envelope = {
+                    "type": raw_obj["type"],
+                    "user_id": user.id,
+                    "username": user.username,
+                }
+                await manager.broadcast(json.dumps(envelope), room_id)
+                # On `typing`, schedule an auto-expire stop_typing in 6s
+                # if no newer typing has arrived by then. Covers the
+                # "user closed the tab mid-sentence" case without a
+                # server-side presence table.
+                if raw_obj["type"] == "typing":
+                    websocket.scope["typing_seq"] += 1
+                    seq = websocket.scope["typing_seq"]
+                    task = asyncio.create_task(
+                        _typing_ttl(room_id, user.id, user.username, seq, websocket)
+                    )
+                    websocket.scope["typing_tasks"].add(task)
+                    task.add_done_callback(websocket.scope["typing_tasks"].discard)
+                continue
+            # Anything else must conform to the chat-message schema.
+            try:
+                msg = schemas.WSMessage.model_validate_json(data)
             except Exception:
                 await websocket.send_text(json.dumps({"error": "Invalid message format"}))
                 continue
 
             # Save message to DB
             db_msg = None
+            extracted_mentions: list[str] = []
             if msg.message_type == "text":
+                # Intersect @-mentions in the content with the room's
+                # actual members so we don't persist (or highlight)
+                # mentions of users not in the room.
+                member_usernames = [
+                    u.username for u in crud.list_room_members(db, room_id)
+                ]
+                extracted_mentions = extract_mentions(msg.content or "", member_usernames)
                 db_msg = crud.create_message(
                     db=db,
                     message=schemas.MessageCreate(message_type="text", content=msg.content),
                     room_id=room_id,
-                    user_id=user.id
+                    user_id=user.id,
+                    mentions=extracted_mentions,
                 )
             else:
                 # For binary messages, we expect data to be base64 encoded
@@ -163,7 +221,10 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
                     data=binary_data,
                     thumbnail=thumbnail_data,
                     file_name=msg.file_name,
-                    mime_type=msg.mime_type
+                    mime_type=msg.mime_type,
+                    # Caption is a non-text-only field; the WS path
+                    # mirrors the HTTP one. Empty caption → NULL.
+                    caption=(msg.caption or "").strip() or None,
                 )
 
             # Broadcast to all connections in the room
@@ -178,6 +239,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
                     ws_msg = schemas.WSMessage(
                         message_type=db_msg.message_type,
                         content=db_msg.content,
+                        mentions=extracted_mentions,
                         **common,
                     )
                 else:
@@ -187,6 +249,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
                         mime_type=db_msg.mime_type,
                         data=base64.b64encode(db_msg.data).decode('utf-8') if db_msg.data is not None else None,
                         thumbnail=base64.b64encode(db_msg.thumbnail).decode('utf-8') if db_msg.thumbnail is not None else None,
+                        caption=db_msg.caption,
+                        mentions=extracted_mentions,
                         **common,
                     )
                 await manager.broadcast(ws_msg.model_dump_json(), room_id)
@@ -201,11 +265,18 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
                 if msg.message_type == "text" and contains_mention(msg.content or ""):
                     ai_room = crud.get_room_by_id(db, room_id)
                     if ai_room and ai_room.ai_enabled and user.username != crud.AI_USERNAME:
-                        asyncio.create_task(maybe_reply(
+                        # Generate a request id locally so the streaming
+                        # envelopes broadcast by stream_reply can be
+                        # correlated to a placeholder bubble the client
+                        # opens in response to the same id. A uuid4 is
+                        # overkill but unambiguous across pods.
+                        request_id = str(uuid.uuid4())
+                        asyncio.create_task(stream_reply(
                             room_id=room_id,
                             triggering_user_id=user.id,
                             triggering_message_id=db_msg.id,
                             triggering_text=msg.content or "",
+                            request_id=request_id,
                         ))
 
     except WebSocketDisconnect:
@@ -214,3 +285,60 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
         # In a production app, you might want to log this error
         print(f"WebSocket error: {e}")
         await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+    finally:
+        # Cancel any pending typing-TTL tasks for this connection so
+        # we don't try to broadcast on a closed socket. Also broadcast
+        # a final stop_typing so other clients see the indicator clear
+        # the moment the user disconnects (the tab-close case) instead
+        # of waiting up to 6s for the TTL to expire.
+        tasks = websocket.scope.get("typing_tasks") or set()
+        for t in tasks:
+            t.cancel()
+        if websocket.scope.get("user_id") is not None:
+            try:
+                await manager.broadcast(json.dumps({
+                    "type": "stop_typing",
+                    "user_id": websocket.scope["user_id"],
+                    "username": user.username,
+                }), room_id)
+            except Exception:
+                # Best-effort — the broadcast path may already be torn
+                # down if the manager itself raised during disconnect.
+                pass
+
+
+async def _typing_ttl(room_id: int, user_id: int, username: str, seq: int, websocket: WebSocket):
+    """Sleep `TYPING_TTL` seconds, then broadcast a stop_typing.
+
+    Used to auto-clear a stale typing indicator when the user closed
+    their tab mid-keystroke. Each `typing` envelope increments the
+    connection's seq counter; if a newer typing has bumped it by the
+    time this task wakes, the task exits silently — only the
+    most-recent TTL ever fires its stop_typing broadcast.
+
+    Cancellation-safe: if the socket disconnects, the surrounding
+    `finally` block cancels us and we exit without broadcasting.
+    """
+    try:
+        await asyncio.sleep(TYPING_TTL_S)
+    except asyncio.CancelledError:
+        return
+    # Bail if a newer typing has bumped the seq.
+    if websocket.scope.get("typing_seq") != seq:
+        return
+    try:
+        await manager.broadcast(json.dumps({
+            "type": "stop_typing",
+            "user_id": user_id,
+            "username": username,
+        }), room_id)
+    except Exception:
+        # Manager may be torn down mid-flight; not our problem.
+        pass
+
+
+# Auto-expire window: how long after the last `typing` envelope we wait
+# before broadcasting stop_typing on the user's behalf. Picked to be
+# longer than the client's 2s throttle + the 5s client-side debounce,
+# so the server-side TTL is the backstop, not the primary mechanism.
+TYPING_TTL_S = 6.0

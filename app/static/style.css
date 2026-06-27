@@ -155,10 +155,98 @@ input[type="password"] {
 input[type="text"]:focus,
 input[type="email"]:focus,
 input[type="password"]:focus,
-textarea:focus {
+textarea:focus,
+select:focus {
     outline: none;
     border-color: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* ---------- Select ----------
+ * Match the surrounding input style: same border, radius, padding, and
+ * focus ring. The native chevron varies by OS — replace it with an
+ * inline SVG that picks up `currentColor`, so it follows the page
+ * theme (and the user-chosen accent in custom themes).
+ */
+select {
+    width: 100%;
+    padding: 10px 36px 10px 12px;
+    font: inherit;
+    color: var(--text);
+    background-color: var(--surface);
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236b7280' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'></polyline></svg>");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+    background-size: 14px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    cursor: pointer;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+select:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+/* Dark-mode chevron: the SVG is grayscale via stroke color; swap to a
+ * lighter shade so the icon stays visible against the dark surface. */
+[data-theme="dark"] select {
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239aa0ac' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'></polyline></svg>");
+}
+
+/* ---------- Checkbox ----------
+ * Square box matching the input border/radius family; turns into the
+ * accent color when checked. Sized to sit inline with 14px label text
+ * without inflating the line height of the row.
+ */
+input[type="checkbox"] {
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    width: 18px;
+    height: 18px;
+    margin: 0;
+    flex-shrink: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background-color: var(--surface);
+    cursor: pointer;
+    position: relative;
+    transition: background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+input[type="checkbox"]:hover { border-color: var(--accent); }
+input[type="checkbox"]:focus-visible {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+input[type="checkbox"]:checked {
+    background-color: var(--accent);
+    border-color: var(--accent);
+}
+/* White check drawn via clip-path so we don't need a separate SVG asset.
+ * The shape is a two-stroke checkmark; works at any size. */
+input[type="checkbox"]:checked::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 5px;
+    width: 5px;
+    height: 9px;
+    border: solid #fff;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+}
+input[type="checkbox"]:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 textarea {
@@ -424,11 +512,20 @@ textarea {
 }
 /* Make the AI toggle row's label sit inline with its checkbox (the
  * default <label> wraps to a new line, which makes the form look like
- * the AI toggle is a separate field). */
+ * the AI toggle is a separate field). Overrides the generic `label`
+ * rule above (display: block; margin-bottom: 14px) so the toggle row
+ * flows horizontally while still respecting the same vertical spacing. */
 .ai-toggle-row {
     display: flex;
     align-items: center;
     gap: 8px;
+    margin-bottom: 14px;
+}
+.ai-toggle-row > span {
+    /* The base `label > span` rule sets margin-bottom: 4px, which
+     * creates a stray gap under the text in a flex row. Zero it out
+     * so the label text sits flush with the checkbox baseline. */
+    margin-bottom: 0;
 }
 .ai-toggle-row .optional-mark { margin-left: 0; }
 .bubble {
@@ -753,4 +850,286 @@ textarea {
 .auth-theme-row .theme-toggle {
     background: transparent;
     border-color: var(--border);
+}
+
+/* ---------- Attach preview (composer) ---------- */
+.attach-preview {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 0 0 auto;
+    max-width: 260px;
+    padding: 6px 8px;
+    background: var(--accent-soft, #eef1ff);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}
+.attach-preview-thumb {
+    width: 36px;
+    height: 36px;
+    flex: 0 0 36px;
+    border-radius: 6px;
+    overflow: hidden;
+    background: var(--bg-2, #f5f6f8);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    line-height: 1;
+}
+.attach-preview-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+.attach-preview-meta {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+.attach-preview-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.attach-preview-size {
+    font-size: 11px;
+    color: var(--text-dim, #6b7280);
+}
+.attach-preview-clear {
+    padding: 2px 8px;
+    font-size: 16px;
+    line-height: 1;
+}
+[data-theme="dark"] .attach-preview {
+    background: rgba(255,255,255,0.04);
+}
+
+/* ---------- Caption rendered inside a non-text bubble ---------- */
+.bubble-caption {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
+
+/* ---------- @mention highlight in bubbles ---------- */
+.mention {
+    color: var(--accent, #4f6df5);
+    background: var(--accent-soft, #eef1ff);
+    padding: 1px 4px;
+    border-radius: 4px;
+    font-weight: 500;
+    cursor: pointer;
+}
+.mention:hover { text-decoration: underline; }
+.mention.mention-self {
+    background: rgba(255, 209, 102, 0.25);
+}
+
+/* ---------- Mention autocomplete popover ---------- */
+.mention-popover {
+    position: absolute;
+    background: var(--bg, #ffffff);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 6px 24px rgba(15, 23, 42, 0.18);
+    min-width: 180px;
+    max-height: 220px;
+    overflow-y: auto;
+    z-index: 50;
+    padding: 4px;
+}
+.mention-popover-item {
+    padding: 6px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.mention-popover-item.active,
+.mention-popover-item:hover {
+    background: var(--accent-soft, #eef1ff);
+}
+.mention-popover-empty {
+    padding: 8px 10px;
+    font-size: 12px;
+    color: var(--text-dim, #6b7280);
+}
+
+/* ---------- Members popover ---------- */
+.members-modal { max-width: 480px; }
+.members-tabs {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
+}
+.members-tab {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 8px 14px;
+    font-size: 14px;
+    color: var(--text-dim, #6b7280);
+    cursor: pointer;
+    font-weight: 500;
+}
+.members-tab.active {
+    color: var(--accent, #4f6df5);
+    border-bottom-color: var(--accent, #4f6df5);
+}
+.members-list {
+    max-height: 360px;
+    overflow-y: auto;
+    margin: 0 -8px;
+}
+.member-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 10px;
+    border-radius: 8px;
+    gap: 10px;
+}
+.member-row:hover { background: var(--bg-2, #f5f6f8); }
+.member-name {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.member-badge {
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--accent-soft, #eef1ff);
+    color: var(--accent, #4f6df5);
+    font-weight: 600;
+}
+.member-badge.ai-badge { background: #f3edff; color: #8b5cf6; }
+.member-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+.member-actions .btn { padding: 4px 10px; font-size: 12px; }
+.ban-reason-display {
+    font-size: 12px;
+    color: var(--text-dim, #6b7280);
+    font-style: italic;
+    margin-left: 6px;
+}
+.ban-modal { max-width: 440px; }
+
+/* ---------- Typing indicator ----------
+ * Pinned to the bottom of the messages list (above the composer).
+ * Shared shape for humans and AI: a left-aligned received bubble with
+ * three pulsing dots. The AI variant swaps in the purple bubble color
+ * so it's recognisably the assistant without competing with normal
+ * AI messages (which already use the purple palette).
+ */
+.typing-indicator {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    align-self: flex-start;
+    padding: 8px 14px;
+    margin: 4px 0;
+    background: var(--received);
+    color: var(--text-muted);
+    border-radius: 14px;
+    border-bottom-left-radius: 4px;
+    font-size: 13px;
+    box-shadow: var(--shadow-sm);
+}
+.typing-indicator.ai-typing {
+    background: var(--ai-accent-soft);
+    border: 1px solid var(--ai-accent);
+    color: var(--ai-author);
+    font-weight: 500;
+}
+.typing-indicator .typing-dots {
+    display: inline-flex;
+    gap: 3px;
+    align-items: center;
+}
+.typing-indicator .typing-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.4;
+    animation: typing-pulse 1.2s ease-in-out infinite;
+}
+.typing-indicator .typing-dot:nth-child(2) { animation-delay: 0.15s; }
+.typing-indicator .typing-dot:nth-child(3) { animation-delay: 0.3s; }
+@keyframes typing-pulse {
+    0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+    30%           { opacity: 1;   transform: translateY(-2px); }
+}
+
+/* ---------- AI streaming bubble ----------
+ * The placeholder bubble that opens on `ai_start` and grows on
+ * `ai_chunk`. Identical shape to a normal AI message so the user
+ * can't tell whether the bubble is mid-stream or final; the trailing
+ * cursor + dot pulse are the only "in progress" tells. The cursor
+ * is dropped on `ai_end`.
+ */
+.ai-streaming-bubble .bubble {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+}
+.ai-streaming-cursor {
+    display: inline-block;
+    width: 7px;
+    height: 14px;
+    margin-left: 2px;
+    background: var(--ai-accent);
+    border-radius: 2px;
+    vertical-align: -2px;
+    animation: ai-cursor-blink 1s steps(1, end) infinite;
+}
+@keyframes ai-cursor-blink {
+    50% { opacity: 0; }
+}
+
+/* ---------- AI error bubble ----------
+ * Distinct red-tinted bubble for Ollama failures. The "Try again"
+ * button re-triggers the user's last @assistant mention client-side
+ * (no server-side retry API — see script.js::_handleAiError).
+ */
+.ai-error-bubble .bubble {
+    background: var(--danger-soft);
+    color: var(--text);
+    border: 1px solid var(--danger);
+    border-bottom-left-radius: 4px;
+}
+.ai-error-reason {
+    font-size: 13px;
+    margin-bottom: 6px;
+}
+.ai-error-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+}
+.ai-error-actions .btn {
+    padding: 4px 10px;
+    font-size: 12px;
 }

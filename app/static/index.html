@@ -66,6 +66,7 @@
                         <p class="chat-sub" id="current-room-sub">Choose a room from the sidebar, or create a new one.</p>
                     </div>
                     <div class="chat-actions">
+                        <button id="members-btn" class="btn btn-ghost btn-sm" type="button" disabled title="Members">👥</button>
                         <button id="invite-btn" class="btn btn-ghost btn-sm" type="button" disabled>Invite</button>
                         <button id="leave-room-btn" class="btn btn-ghost btn-sm" type="button" disabled>Leave</button>
                     </div>
@@ -80,6 +81,14 @@
                         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
                     </button>
                     <input type="file" id="file-input" class="visually-hidden" accept="image/*,video/*,.pdf,.txt,.zip">
+                    <div id="attach-preview" class="attach-preview" hidden>
+                        <div id="attach-preview-thumb" class="attach-preview-thumb"></div>
+                        <div class="attach-preview-meta">
+                            <div id="attach-preview-name" class="attach-preview-name"></div>
+                            <div id="attach-preview-size" class="attach-preview-size"></div>
+                        </div>
+                        <button type="button" id="attach-preview-clear" class="btn btn-ghost btn-sm attach-preview-clear" aria-label="Remove attachment">×</button>
+                    </div>
                     <input type="text" id="message-input" class="composer-input" placeholder="Type a message" maxlength="4000" disabled aria-describedby="composer-hint">
                     <span id="composer-hint" class="composer-hint" hidden>💡 Type <code>@assistant</code> to ask the AI bot (add <code>/search</code> for web context)</span>
                     <button type="submit" id="send-btn" class="btn btn-primary" disabled>Send</button>
@@ -212,6 +221,45 @@
 
     <!-- Toast -->
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+    <!-- Members popover (also hosts the owner-only ban list tab) -->
+    <div id="members-backdrop" class="modal-backdrop" hidden>
+        <div class="modal members-modal" role="dialog" aria-modal="true" aria-labelledby="members-title">
+            <div class="members-tabs">
+                <button type="button" id="members-tab-members" class="members-tab active" data-tab="members">Members</button>
+                <button type="button" id="members-tab-bans" class="members-tab" data-tab="bans" hidden>Bans</button>
+            </div>
+            <h3 id="members-title" class="visually-hidden">Members</h3>
+            <div id="members-list" class="members-list" role="list"></div>
+            <div id="bans-list" class="members-list" role="list" hidden></div>
+            <p id="members-empty" class="modal-sub" hidden>No members.</p>
+            <div class="modal-actions">
+                <button type="button" id="members-cancel" class="btn btn-ghost">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Ban-reason modal (small inline form) -->
+    <div id="ban-backdrop" class="modal-backdrop" hidden>
+        <div class="modal ban-modal" role="dialog" aria-modal="true" aria-labelledby="ban-title">
+            <h3 id="ban-title">Ban member</h3>
+            <p class="modal-sub" id="ban-sub">Optional reason for the audit log.</p>
+            <form id="ban-form">
+                <label>
+                    <span>Reason <span class="optional-mark">(optional)</span></span>
+                    <textarea id="ban-reason" rows="3" maxlength="500" placeholder="e.g. Spam, harassment…"></textarea>
+                </label>
+                <p id="ban-error" class="form-error" role="alert"></p>
+                <div class="modal-actions">
+                    <button type="button" id="ban-cancel" class="btn btn-ghost">Cancel</button>
+                    <button type="submit" id="ban-submit" class="btn btn-primary">Ban</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Mention autocomplete popover (no backdrop; we manage visibility ourselves) -->
+    <div id="mention-popover" class="mention-popover" hidden role="listbox" aria-label="Mention suggestions"></div>
 
     <script src="/static/script.js"></script>
 </body>

@@ -308,6 +308,15 @@ function hslToHex(h, s, l) {
 // Single shared instance used by every page.
 const theme = new Theme();
 
+// Whole-word @assistant check. Mirrors the server's regex in
+// app/mentions.py / app/ai.py — the @ must not be part of an email
+// (admin@assistant.com does NOT match) and the username must end at
+// a non-word boundary.
+function containsAssistantMention(text) {
+    if (!text) return false;
+    return /(?<![\w])@assistant(?![\w])/i.test(text);
+}
+
 // Normalize a FastAPI error response into a human-readable string.
 // FastAPI returns 422 with `detail: [{loc, msg, type, ...}, ...]` for
 // validation errors and `detail: "..."` (or `detail: {msg: "..."}`) for
@@ -345,6 +354,7 @@ class ChatApp {
         this.ws = null;
         this.currentRoomId = null;
         this.currentRoomName = null;
+        this.currentRoomOwnerId = null;  // set on _enterRoom; gates the moderation UI
         this.pendingJoinRoomId = null;
         this.pendingJoinRoomName = null;
         this.isSending = false;
@@ -355,6 +365,53 @@ class ChatApp {
         // HTTP — without deduping by id, every historical message would
         // appear twice. Bounded so it doesn't grow forever in a long session.
         this._renderedIds = new Set();
+        // Staged attachment (set by _stageFile, cleared on send or
+        // when the user clicks ×). `{ file, messageType, dataUrl,
+        // objectUrl }` — we keep the objectUrl so the preview image
+        // doesn't need to re-decode the file every redraw, and we
+        // revoke it on clear/send to avoid leaking memory.
+        this.pendingFile = null;
+        // Map of user_id → { username, isAi, seq } for users currently
+        // typing in the active room. `seq` is the last-seen typing seq
+        // (incremented on every typing envelope we receive) and is
+        // used by the auto-expire timer to bail when a newer typing
+        // arrives. The map is wiped on _leaveRoom.
+        this._typingUsers = new Map();
+        // Single DOM node reused for the typing indicator. Created
+        // lazily on first use; hidden when no one is typing.
+        this._typingEl = null;
+        // Throttle state for typing emissions. The server-side TTL is
+        // 6s, so we cap client emissions at once per 2s to avoid
+        // flooding the bus on rapid keystrokes.
+        this._lastTypingSentAt = 0;
+        // When the composer has been quiet for this long without an
+        // active keystroke, we send a stop_typing and clear the
+        // pending debounce. Longer than the throttle so a burst of
+        // keystrokes (typing → typing → …) doesn't get a stop_typing
+        // wedged in the middle.
+        this._typingQuietMs = 1500;
+        this._typingQuietTimer = null;
+        // AI streaming state. Map of streaming-bubble-id (the
+        // request_id echoed by the server) → { wrap, bubble, text }.
+        // We track each in-progress AI bubble so ai_chunk envelopes
+        // can append text and ai_end can drop the placeholder cursor.
+        this._aiBubbles = new Map();
+        // Last @assistant mention the user sent. Used by the AI
+        // error bubble's "Try again" button so the user can retry
+        // without re-typing the prompt. Cleared on _leaveRoom.
+        this._lastAiMention = null;
+        // Cached member list for the current room. Refetched on
+        // _enterRoom; used by the mention autocomplete and the
+        // members popover. Each row: { user_id, username, joined_at,
+        // is_owner, is_ai }.
+        this.members = [];
+        // Mention-autocomplete state. Popover is anchored to the
+        // composer input; candidates = members filtered by the
+        // @-prefix the user has typed.
+        this._mentionState = { open: false, query: '', candidates: [], activeIndex: -1 };
+        // When a user clicks Ban in the members popover we stash the
+        // target here so the ban-reason modal knows who to ban.
+        this._pendingBan = null;
         this.init();
     }
 
@@ -478,6 +535,7 @@ class ChatApp {
         document.getElementById('join-by-name-btn').addEventListener('click', () => this._openJoinByNameModal());
         document.getElementById('invite-btn').addEventListener('click', () => this._openInviteModal());
         document.getElementById('leave-room-btn').addEventListener('click', () => this._leaveRoom());
+        document.getElementById('members-btn').addEventListener('click', () => this._openMembersPopover());
 
         const form = document.getElementById('message-form');
         form.addEventListener('submit', (e) => {
@@ -486,23 +544,36 @@ class ChatApp {
         });
 
         const input = document.getElementById('message-input');
-        input.addEventListener('input', () => {
-            document.getElementById('send-btn').disabled = input.value.trim().length === 0;
-        });
-        input.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                this._sendMessage();
-            }
+        input.addEventListener('input', () => this._onComposerInput());
+        input.addEventListener('keydown', (e) => this._onComposerKeyDown(e));
+        // Close the mention popover when the composer loses focus.
+        input.addEventListener('blur', () => {
+            // Slight delay so a mousedown on a popover item can fire
+            // before we hide it.
+            setTimeout(() => this._closeMentionPopover(), 120);
+            // Leaving the composer means the user has stopped typing
+            // (even if they tabbed out without sending). Tell the
+            // room so the indicator clears immediately rather than
+            // waiting for the server-side TTL.
+            this._emitStopTyping();
         });
 
         document.getElementById('attach-btn').addEventListener('click', () => {
             document.getElementById('file-input').click();
         });
         document.getElementById('file-input').addEventListener('change', (e) => {
+            // Stage the file instead of sending it immediately. The
+            // user can then type a caption in the composer and hit
+            // Send to send the file + caption as one message. The
+            // × on the preview clears the stage.
             const file = e.target.files[0];
+            // Reset the input value so picking the same file twice
+            // still triggers `change`.
             e.target.value = '';
-            if (file) this._sendFile(file);
+            if (file) this._stageFile(file);
+        });
+        document.getElementById('attach-preview-clear').addEventListener('click', () => {
+            this._clearStagedFile();
         });
 
         // Modals
@@ -554,6 +625,25 @@ class ChatApp {
         });
         document.getElementById('invite-email').addEventListener('keydown', (e) => {
             if (e.key === 'Escape') this._closeInviteModal();
+        });
+
+        // Members popover (and owner-only Ban tab)
+        document.getElementById('members-cancel').addEventListener('click', () => this._closeMembersPopover());
+        document.getElementById('members-backdrop').addEventListener('click', (e) => {
+            if (e.target.id === 'members-backdrop') this._closeMembersPopover();
+        });
+        document.getElementById('members-tab-members').addEventListener('click', () => this._showMembersTab('members'));
+        document.getElementById('members-tab-bans').addEventListener('click', () => this._showMembersTab('bans'));
+
+        // Ban-reason modal (a small two-field form so we can capture
+        // an optional reason alongside the action).
+        document.getElementById('ban-cancel').addEventListener('click', () => this._closeBanModal());
+        document.getElementById('ban-backdrop').addEventListener('click', (e) => {
+            if (e.target.id === 'ban-backdrop') this._closeBanModal();
+        });
+        document.getElementById('ban-form').addEventListener('submit', (e) => {
+            e.preventDefault();
+            this._handleSubmitBan();
         });
 
         this._loadRooms();
@@ -617,7 +707,11 @@ class ChatApp {
     }
 
     async _deleteRoom(roomId, roomName) {
-        if (!confirm(`Delete the room "${roomName}"? This removes it from your list. Other members keep their access.`)) {
+        // "Real" delete: removes the room AND all of its messages,
+        // memberships, and bans. Other members will lose access too.
+        // The previous wording ("Other members keep their access.")
+        // no longer reflects reality.
+        if (!confirm(`Delete the room "${roomName}" and all its messages? This cannot be undone.`)) {
             return;
         }
         try {
@@ -804,6 +898,7 @@ class ChatApp {
         document.getElementById('attach-btn').disabled = false;
         document.getElementById('leave-room-btn').disabled = false;
         document.getElementById('invite-btn').disabled = false;
+        document.getElementById('members-btn').disabled = false;
         // Surface the @assistant hint when the active room has AI enabled.
         // The backend strips the mention before sending to the LLM, so users
         // only need to type it as a whole word — no special syntax required.
@@ -822,9 +917,25 @@ class ChatApp {
         // and old ids must not block new ones that happen to share an id
         // (autoincrement is shared across rooms).
         this._renderedIds = new Set();
+        // Drop any in-flight typing/AI streaming state from the
+        // previous room. The DOM indicator lives in the cleared
+        // messages container so we just reset the JS state.
+        this._clearTypingState();
+        this._aiBubbles.clear();
+        this._lastAiMention = null;
+        this._typingEl = null;
+        this._lastTypingSentAt = 0;
+        // Drop any staged attachment from a previous room; we don't
+        // want an image staged in room A to suddenly attach itself
+        // when the user enters room B and types.
+        this._clearStagedFile();
 
         this._connectWebSocket(roomId);
         this._loadHistory(roomId);
+        // Members list is needed for the mention autocomplete; also
+        // surfaces the room owner id so the moderation UI knows
+        // when to render kick/ban controls.
+        this._loadMembers(roomId);
     }
 
     _setAiHint(enabled) {
@@ -850,6 +961,12 @@ class ChatApp {
             this._loadRooms();
             return;
         }
+        // Leaving the room means the user is no longer typing. Send
+        // a stop_typing before closing the socket so any active
+        // indicator clears on the other clients immediately rather
+        // than waiting for the server-side TTL.
+        this._emitStopTyping();
+        this._clearTypingQuietTimer();
         if (this.ws) {
             this.ws.close();
             this.ws = null;
@@ -866,6 +983,24 @@ class ChatApp {
         document.getElementById('attach-btn').disabled = true;
         document.getElementById('leave-room-btn').disabled = true;
         document.getElementById('invite-btn').disabled = true;
+        document.getElementById('members-btn').disabled = true;
+        // Drop the cached member list — the next room has its own.
+        this.members = [];
+        this.currentRoomOwnerId = null;
+        // Drop any in-flight typing/AI streaming state. A streaming
+        // bubble that was opened just before the user leaves is
+        // dropped along with the room — the persisted WSMessage
+        // for completed streams still arrives via the regular chat
+        // envelope on any other connected clients.
+        this._clearTypingState();
+        this._aiBubbles.clear();
+        this._lastAiMention = null;
+        if (this._typingEl && this._typingEl.parentNode) {
+            this._typingEl.parentNode.removeChild(this._typingEl);
+            this._typingEl = null;
+        }
+        // Clear any staged attachment too.
+        this._clearStagedFile();
         document.getElementById('messages-container').innerHTML =
             '<div class="messages-empty">No messages here yet.</div>';
         document.querySelectorAll('.room-item').forEach((el) => el.classList.remove('active'));
@@ -951,6 +1086,32 @@ class ChatApp {
                     this._toast(msg.error, true);
                     return;
                 }
+                // Typing presence envelopes. Distinct from chat
+                // messages because they carry no `message_type`.
+                if (msg.type === 'typing' || msg.type === 'stop_typing') {
+                    this._handleTypingEnvelope(msg);
+                    return;
+                }
+                // AI streaming envelopes. The placeholder bubble is
+                // keyed by `msg.id` (the request_id we generated on
+                // the originating pod); ai_chunk appends, ai_end
+                // finalises, ai_error swaps to the error bubble.
+                if (msg.type === 'ai_start') {
+                    this._handleAiStart(msg);
+                    return;
+                }
+                if (msg.type === 'ai_chunk') {
+                    this._handleAiChunk(msg);
+                    return;
+                }
+                if (msg.type === 'ai_end') {
+                    this._handleAiEnd(msg);
+                    return;
+                }
+                if (msg.type === 'ai_error') {
+                    this._handleAiError(msg);
+                    return;
+                }
                 this._renderMessage(msg);
             } catch (err) {
                 console.error('WS parse error', err);
@@ -970,15 +1131,50 @@ class ChatApp {
         if (!this.currentRoomId) return;
         const input = document.getElementById('message-input');
         const text = input.value.trim();
-        if (!text) return;
+        const staged = this.pendingFile;
+        // Nothing to send: no typed text AND no staged file. Don't
+        // even disable/re-enable the button — the input handler
+        // already disables on empty input, and the staged preview
+        // has its own × button.
+        if (!text && !staged) return;
         if (this.isSending) return;
         this.isSending = true;
 
+        // Stash the @assistant mention so the AI error bubble's
+        // Try Again button can re-fire it without the user
+        // re-typing. Only meaningful for text sends; we capture it
+        // before HTTP/WS so the value is available by the time
+        // ai_error arrives (which can be many seconds later).
+        if (text && containsAssistantMention(text)) {
+            this._lastAiMention = text;
+        }
+
+        // Sending a message implicitly ends typing — stop_typing now
+        // so the indicator clears for everyone else immediately.
+        this._emitStopTyping();
+
         try {
-            const res = await this._authFetch(`/messages?room_id=${this.currentRoomId}`, {
-                method: 'POST',
-                body: JSON.stringify({ message_type: 'text', content: text }),
-            });
+            let res;
+            if (staged) {
+                // Single combined message: file/image/video + caption.
+                // The caption is whatever's in the input (may be empty
+                // — the server stores NULL when empty, see the router).
+                res = await this._authFetch(`/messages?room_id=${this.currentRoomId}`, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        message_type: staged.messageType,
+                        file_name: staged.file.name,
+                        mime_type: staged.file.type,
+                        data: staged.dataUrl.split(',')[1],
+                        caption: text || null,
+                    }),
+                });
+            } else {
+                res = await this._authFetch(`/messages?room_id=${this.currentRoomId}`, {
+                    method: 'POST',
+                    body: JSON.stringify({ message_type: 'text', content: text }),
+                });
+            }
             if (!res.ok) {
                 const data = await res.json().catch(() => ({}));
                 throw new Error(extractErrorMessage(data, 'Failed to send'));
@@ -991,6 +1187,9 @@ class ChatApp {
             if (sent) this._renderMessage(sent);
             input.value = '';
             document.getElementById('send-btn').disabled = true;
+            // Clear the stage AFTER the render so the user sees their
+            // message appear with the preview intact.
+            if (staged) this._clearStagedFile();
         } catch (err) {
             this._toast(err.message, true);
         } finally {
@@ -998,6 +1197,10 @@ class ChatApp {
         }
     }
 
+    // _sendFile is retained for any future caller that wants to
+    // stage + send in one shot (e.g. a drag-drop into the chat
+    // pane). The composer no longer calls it directly; that path
+    // goes through _stageFile → _sendMessage.
     async _sendFile(file) {
         if (!this.currentRoomId) {
             this._toast('Join a room first.', true);
@@ -1047,6 +1250,762 @@ class ChatApp {
         });
     }
 
+    // ---------- Staged attachment ----------
+
+    async _stageFile(file) {
+        if (file.size > 10 * 1024 * 1024) {
+            this._toast('File too large (max 10 MB).', true);
+            return;
+        }
+        // Revoke any previous object URL before replacing the stage
+        // so we don't leak an unused URL until the next clear.
+        this._clearStagedFile();
+
+        let messageType = 'file';
+        if (file.type.startsWith('image/')) messageType = 'image';
+        else if (file.type.startsWith('video/')) messageType = 'video';
+
+        // Read the file once now so the eventual send doesn't have
+        // to re-decode it (the user might type a long caption).
+        let dataUrl;
+        try {
+            dataUrl = await this._readAsDataURL(file);
+        } catch (err) {
+            this._toast('Could not read file.', true);
+            return;
+        }
+        const objectUrl = URL.createObjectURL(file);
+
+        this.pendingFile = { file, messageType, dataUrl, objectUrl };
+
+        const preview = document.getElementById('attach-preview');
+        const thumb = document.getElementById('attach-preview-thumb');
+        const nameEl = document.getElementById('attach-preview-name');
+        const sizeEl = document.getElementById('attach-preview-size');
+
+        // Thumbnail: an <img> for images (cheap, uses the object
+        // URL), a glyph otherwise. Revoke the object URL on clear.
+        thumb.innerHTML = '';
+        if (messageType === 'image') {
+            const img = document.createElement('img');
+            img.alt = file.name;
+            img.src = objectUrl;
+            thumb.appendChild(img);
+        } else if (messageType === 'video') {
+            thumb.textContent = '🎬';
+        } else {
+            thumb.textContent = '📎';
+        }
+        nameEl.textContent = file.name;
+        sizeEl.textContent = this._formatBytes(file.size);
+        preview.hidden = false;
+        // The composer can now be sent even with an empty input
+        // (because the file itself counts as content).
+        document.getElementById('send-btn').disabled = false;
+        document.getElementById('message-input').focus();
+    }
+
+    _clearStagedFile() {
+        if (this.pendingFile) {
+            if (this.pendingFile.objectUrl) URL.revokeObjectURL(this.pendingFile.objectUrl);
+            this.pendingFile = null;
+        }
+        const preview = document.getElementById('attach-preview');
+        if (preview) preview.hidden = true;
+        const thumb = document.getElementById('attach-preview-thumb');
+        if (thumb) thumb.innerHTML = '';
+        // If the input is also empty, re-disable Send (otherwise the
+        // staged file already enabled it and there's nothing to
+        // disable — leave it alone).
+        const input = document.getElementById('message-input');
+        if (input && input.value.trim().length === 0) {
+            document.getElementById('send-btn').disabled = true;
+        }
+    }
+
+    _formatBytes(n) {
+        if (n < 1024) return `${n} B`;
+        if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+        return `${(n / 1024 / 1024).toFixed(1)} MB`;
+    }
+
+    // ---------- Members / moderation ----------
+
+    async _loadMembers(roomId) {
+        try {
+            const res = await this._authFetch(`/rooms/${roomId}/members`);
+            if (!res.ok) throw new Error('Failed to load members');
+            const rows = await res.json();
+            this.members = rows || [];
+            // Track the owner id for the moderation UI. is_owner is
+            // server-computed; we use it to decide whether to show
+            // kick/ban buttons at all.
+            const owner = this.members.find((m) => m.is_owner);
+            this.currentRoomOwnerId = owner ? owner.user_id : null;
+        } catch (err) {
+            this._toast(err.message, true);
+            this.members = [];
+            this.currentRoomOwnerId = null;
+        }
+    }
+
+    _openMembersPopover() {
+        if (!this.currentRoomId) return;
+        // Owners get the Ban tab. Anyone else only sees Members.
+        const banTab = document.getElementById('members-tab-bans');
+        const isOwner = this.user && this.currentRoomOwnerId === this.user.id;
+        banTab.hidden = !isOwner;
+        this._showMembersTab('members');
+        document.getElementById('members-backdrop').hidden = false;
+    }
+    _closeMembersPopover() {
+        document.getElementById('members-backdrop').hidden = true;
+    }
+    _showMembersTab(tab) {
+        const membersList = document.getElementById('members-list');
+        const bansList = document.getElementById('bans-list');
+        const membersTab = document.getElementById('members-tab-members');
+        const bansTab = document.getElementById('members-tab-bans');
+        const empty = document.getElementById('members-empty');
+
+        const onMembers = tab === 'members';
+        membersTab.classList.toggle('active', onMembers);
+        bansTab.classList.toggle('active', !onMembers);
+        membersList.hidden = !onMembers;
+        bansList.hidden = onMembers;
+
+        if (onMembers) this._renderMembersList();
+        else this._renderBansList();
+
+        // Hide the empty placeholder when both tabs can be empty
+        // independently; each render path sets the text itself.
+        empty.hidden = true;
+    }
+
+    _renderMembersList() {
+        const list = document.getElementById('members-list');
+        const empty = document.getElementById('members-empty');
+        list.innerHTML = '';
+        const isCallerOwner = this.user && this.currentRoomOwnerId === this.user.id;
+        if (!this.members.length) {
+            empty.textContent = 'No members.';
+            empty.hidden = false;
+            return;
+        }
+        for (const m of this.members) {
+            const row = document.createElement('div');
+            row.className = 'member-row';
+            row.setAttribute('role', 'listitem');
+
+            const nameWrap = document.createElement('div');
+            nameWrap.className = 'member-name';
+            const nameText = document.createElement('span');
+            nameText.textContent = m.username;
+            nameWrap.appendChild(nameText);
+            if (m.is_owner) {
+                const badge = document.createElement('span');
+                badge.className = 'member-badge';
+                badge.textContent = 'owner';
+                nameWrap.appendChild(badge);
+            }
+            if (m.is_ai) {
+                const badge = document.createElement('span');
+                badge.className = 'member-badge ai-badge';
+                badge.textContent = 'AI';
+                nameWrap.appendChild(badge);
+            }
+            row.appendChild(nameWrap);
+
+            // Owner-only actions: kick + ban. Skip for the owner
+            // themselves and for the AI user (server enforces both,
+            // we just hide the buttons so the click doesn't 400).
+            if (isCallerOwner && !m.is_owner && !m.is_ai) {
+                const actions = document.createElement('div');
+                actions.className = 'member-actions';
+                const kickBtn = document.createElement('button');
+                kickBtn.type = 'button';
+                kickBtn.className = 'btn btn-ghost btn-sm';
+                kickBtn.textContent = 'Kick';
+                kickBtn.title = `Remove ${m.username} from the room (they can rejoin)`;
+                kickBtn.addEventListener('click', () => this._handleKick(m.user_id, m.username));
+                const banBtn = document.createElement('button');
+                banBtn.type = 'button';
+                banBtn.className = 'btn btn-ghost btn-sm';
+                banBtn.textContent = 'Ban';
+                banBtn.title = `Ban ${m.username} (cannot rejoin until unbanned)`;
+                banBtn.addEventListener('click', () => this._openBanModal(m.user_id, m.username));
+                actions.appendChild(kickBtn);
+                actions.appendChild(banBtn);
+                row.appendChild(actions);
+            }
+            list.appendChild(row);
+        }
+    }
+
+    async _renderBansList() {
+        const list = document.getElementById('bans-list');
+        const empty = document.getElementById('members-empty');
+        list.innerHTML = '';
+        try {
+            const res = await this._authFetch(`/rooms/${this.currentRoomId}/bans`);
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(extractErrorMessage(data, 'Could not load ban list'));
+            }
+            const rows = await res.json();
+            if (!rows.length) {
+                empty.textContent = 'No active bans.';
+                empty.hidden = false;
+                return;
+            }
+            for (const b of rows) {
+                const row = document.createElement('div');
+                row.className = 'member-row';
+                row.setAttribute('role', 'listitem');
+                const nameWrap = document.createElement('div');
+                nameWrap.className = 'member-name';
+                const nameText = document.createElement('span');
+                nameText.textContent = b.username;
+                nameWrap.appendChild(nameText);
+                if (b.reason) {
+                    const reason = document.createElement('span');
+                    reason.className = 'ban-reason-display';
+                    reason.textContent = `— ${b.reason}`;
+                    nameWrap.appendChild(reason);
+                }
+                row.appendChild(nameWrap);
+                const actions = document.createElement('div');
+                actions.className = 'member-actions';
+                const unbanBtn = document.createElement('button');
+                unbanBtn.type = 'button';
+                unbanBtn.className = 'btn btn-ghost btn-sm';
+                unbanBtn.textContent = 'Unban';
+                unbanBtn.addEventListener('click', () => this._handleUnban(b.user_id, b.username));
+                actions.appendChild(unbanBtn);
+                row.appendChild(actions);
+                list.appendChild(row);
+            }
+        } catch (err) {
+            this._toast(err.message, true);
+        }
+    }
+
+    async _handleKick(userId, username) {
+        if (!confirm(`Kick ${username} from "${this.currentRoomName}"? They can rejoin via the invite link.`)) {
+            return;
+        }
+        try {
+            const res = await this._authFetch(`/rooms/${this.currentRoomId}/members/${userId}`, {
+                method: 'DELETE',
+            });
+            if (!res.ok && res.status !== 204) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(extractErrorMessage(data, 'Could not kick'));
+            }
+            this._toast(`${username} was kicked.`);
+            await this._loadMembers(this.currentRoomId);
+            this._renderMembersList();
+        } catch (err) {
+            this._toast(err.message, true);
+        }
+    }
+
+    _openBanModal(userId, username) {
+        this._pendingBan = { userId, username };
+        document.getElementById('ban-reason').value = '';
+        document.getElementById('ban-error').textContent = '';
+        document.getElementById('ban-sub').textContent = `Ban ${username} from "${this.currentRoomName}". They won't be able to rejoin until you unban them.`;
+        document.getElementById('ban-backdrop').hidden = false;
+        setTimeout(() => document.getElementById('ban-reason').focus(), 0);
+    }
+    _closeBanModal() {
+        document.getElementById('ban-backdrop').hidden = true;
+        this._pendingBan = null;
+    }
+    async _handleSubmitBan() {
+        if (!this._pendingBan) return;
+        const reason = document.getElementById('ban-reason').value.trim() || null;
+        const errEl = document.getElementById('ban-error');
+        errEl.textContent = '';
+        try {
+            const res = await this._authFetch(`/rooms/${this.currentRoomId}/bans`, {
+                method: 'POST',
+                body: JSON.stringify({
+                    user_id: this._pendingBan.userId,
+                    reason,
+                }),
+            });
+            if (!res.ok && res.status !== 201) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(extractErrorMessage(data, 'Could not ban'));
+            }
+            this._toast(`${this._pendingBan.username} was banned.`);
+            this._closeBanModal();
+            // Refresh the members list (the banned user is now
+            // gone from members) and re-render.
+            await this._loadMembers(this.currentRoomId);
+            this._renderMembersList();
+        } catch (err) {
+            errEl.textContent = err.message;
+        }
+    }
+
+    async _handleUnban(userId, username) {
+        if (!confirm(`Unban ${username}? They'll be able to rejoin "${this.currentRoomName}".`)) {
+            return;
+        }
+        try {
+            const res = await this._authFetch(`/rooms/${this.currentRoomId}/bans/${userId}`, {
+                method: 'DELETE',
+            });
+            if (!res.ok && res.status !== 204) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(extractErrorMessage(data, 'Could not unban'));
+            }
+            this._toast(`${username} was unbanned.`);
+            await this._renderBansList();
+        } catch (err) {
+            this._toast(err.message, true);
+        }
+    }
+
+    // ---------- Mention autocomplete ----------
+
+    _onComposerKeyDown(e) {
+        // If the mention popover is open, route navigation keys to
+        // it before they hit the composer.
+        if (this._mentionState.open) {
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                this._moveMentionSelection(1);
+                return;
+            }
+            if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                this._moveMentionSelection(-1);
+                return;
+            }
+            if (e.key === 'Enter' || e.key === 'Tab') {
+                e.preventDefault();
+                this._acceptMentionSelection();
+                return;
+            }
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                this._closeMentionPopover();
+                return;
+            }
+        }
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            this._sendMessage();
+        }
+    }
+
+    _onComposerInput() {
+        const input = document.getElementById('message-input');
+        const sendBtn = document.getElementById('send-btn');
+        // Send is enabled when there's text OR a staged file.
+        const hasText = input.value.trim().length > 0;
+        const hasFile = !!this.pendingFile;
+        sendBtn.disabled = !(hasText || hasFile);
+
+        // Emit typing presence. Skip when the composer is empty (no
+        // point broadcasting "is typing" with no content) and when
+        // the WS is closed. Throttled server-side at the router; the
+        // client-side throttle here just reduces noise on the bus.
+        if (hasText && this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this._maybeEmitTyping();
+        } else {
+            this._emitStopTyping();
+        }
+
+        // Detect a mention trigger: a `@` that starts a token at the
+        // cursor. We look at the last `@` whose preceding char is
+        // whitespace (or the start of the input) and check that the
+        // cursor sits somewhere in `[start, end)` of that token.
+        this._updateMentionPopover();
+    }
+
+    // ---------- Typing emission ----------
+
+    _maybeEmitTyping() {
+        const now = Date.now();
+        if (now - this._lastTypingSentAt < 2000) {
+            // Within the throttle window — re-arm the quiet timer so
+            // a stop_typing still fires if the user stops typing.
+            this._armTypingQuietTimer();
+            return;
+        }
+        this._lastTypingSentAt = now;
+        try {
+            this.ws.send(JSON.stringify({ type: 'typing' }));
+        } catch (e) {
+            // WS may have closed between the readyState check and
+            // send() — swallow and let the next input try again.
+        }
+        this._armTypingQuietTimer();
+    }
+
+    _emitStopTyping() {
+        this._clearTypingQuietTimer();
+        // Only send if we've actually sent a typing recently — avoids
+        // a spurious stop_typing when the composer is empty on mount.
+        if (this._lastTypingSentAt === 0) return;
+        this._lastTypingSentAt = 0;
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            try {
+                this.ws.send(JSON.stringify({ type: 'stop_typing' }));
+            } catch (e) { /* socket already closed */ }
+        }
+    }
+
+    _armTypingQuietTimer() {
+        this._clearTypingQuietTimer();
+        this._typingQuietTimer = setTimeout(() => {
+            this._typingQuietTimer = null;
+            this._emitStopTyping();
+        }, this._typingQuietMs);
+    }
+
+    _clearTypingQuietTimer() {
+        if (this._typingQuietTimer) {
+            clearTimeout(this._typingQuietTimer);
+            this._typingQuietTimer = null;
+        }
+    }
+
+    // ---------- Typing envelope handling ----------
+
+    _handleTypingEnvelope(env) {
+        // Ignore our own typing — the composer already shows our text.
+        if (this.user && env.user_id === this.user.id) return;
+        if (env.type === 'typing') {
+            this._typingUsers.set(env.user_id, {
+                username: env.username,
+                isAi: env.username === 'assistant',
+                seq: (this._typingUsers.get(env.user_id)?.seq || 0) + 1,
+            });
+        } else if (env.type === 'stop_typing') {
+            this._typingUsers.delete(env.user_id);
+        }
+        this._renderTypingIndicator();
+    }
+
+    _renderTypingIndicator() {
+        if (!this._typingEl) {
+            const container = document.getElementById('messages-container');
+            const el = document.createElement('div');
+            el.className = 'typing-indicator';
+            el.hidden = true;
+            el.setAttribute('aria-live', 'polite');
+            container.appendChild(el);
+            this._typingEl = el;
+        }
+        const users = Array.from(this._typingUsers.values());
+        if (users.length === 0) {
+            this._typingEl.hidden = true;
+            this._typingEl.innerHTML = '';
+            return;
+        }
+        // One or two names → "alice is typing". Three → "alice and bob are".
+        // Four+ → first two + "and N others are". Same convention for
+        // AI rows (which surface as "assistant is replying…").
+        const names = users.map((u) => u.username);
+        const hasAi = users.some((u) => u.isAi);
+        const humanNames = names.filter((n) => n !== 'assistant');
+        let label;
+        if (hasAi && humanNames.length === 0) {
+            label = 'assistant is replying';
+        } else if (hasAi) {
+            label = `${this._joinNames(humanNames)} and the assistant are typing`;
+        } else {
+            label = `${this._joinNames(humanNames)} ${humanNames.length === 1 ? 'is' : 'are'} typing`;
+        }
+        this._typingEl.className = 'typing-indicator' + (hasAi && humanNames.length === 0 ? ' ai-typing' : '');
+        this._typingEl.innerHTML = '';
+        const dots = document.createElement('span');
+        dots.className = 'typing-dots';
+        for (let i = 0; i < 3; i++) {
+            const d = document.createElement('span');
+            d.className = 'typing-dot';
+            dots.appendChild(d);
+        }
+        const text = document.createElement('span');
+        text.textContent = label;
+        this._typingEl.appendChild(text);
+        this._typingEl.appendChild(dots);
+        this._typingEl.hidden = false;
+        this._scrollToBottom(true);
+    }
+
+    _joinNames(names) {
+        if (names.length === 0) return '';
+        if (names.length === 1) return names[0];
+        if (names.length === 2) return `${names[0]} and ${names[1]}`;
+        return `${names[0]}, ${names[1]}, and ${names.length - 2} other${names.length - 2 === 1 ? '' : 's'}`;
+    }
+
+    _clearTypingState() {
+        this._typingUsers.clear();
+        if (this._typingEl) {
+            this._typingEl.hidden = true;
+            this._typingEl.innerHTML = '';
+        }
+    }
+
+    // ---------- AI streaming envelope handling ----------
+
+    _handleAiStart(env) {
+        // Open a placeholder bubble. We render it via the same path
+        // as a normal AI message so the user sees the purple border
+        // + "🤖 assistant" author line — only the content is empty
+        // (with a blinking cursor) until the first chunk arrives.
+        const messagesEl = document.getElementById('messages-container');
+        const empty = messagesEl.querySelector('.messages-empty');
+        if (empty) empty.remove();
+
+        const wrap = document.createElement('div');
+        wrap.className = 'message received ai-message ai-streaming-bubble';
+        wrap.dataset.aiId = env.id;
+
+        const author = document.createElement('div');
+        author.className = 'author ai-author';
+        author.textContent = `🤖 ${env.username || 'assistant'}`;
+        wrap.appendChild(author);
+
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        const text = document.createElement('span');
+        bubble.appendChild(text);
+        const cursor = document.createElement('span');
+        cursor.className = 'ai-streaming-cursor';
+        bubble.appendChild(cursor);
+        wrap.appendChild(bubble);
+
+        messagesEl.appendChild(wrap);
+        this._aiBubbles.set(env.id, { wrap, bubble, text, cursor });
+        // Suppress the typing indicator for the AI — the streaming
+        // bubble is the more informative affordance.
+        this._typingUsers.delete(env.user_id);
+        this._renderTypingIndicator();
+        this._scrollToBottom(true);
+    }
+
+    _handleAiChunk(env) {
+        const entry = this._aiBubbles.get(env.id);
+        if (!entry) {
+            // Late chunk after we've already cleared the bubble (e.g.
+            // race with ai_error). Ignore — the final persisted
+            // message will land via the regular WS chat envelope.
+            return;
+        }
+        // textContent is the safe path; we're appending server-supplied
+        // string fragments. Cursor stays put; new chunks append left
+        // of it.
+        entry.text.textContent += env.delta || '';
+        this._scrollToBottom();
+    }
+
+    _handleAiEnd(env) {
+        const entry = this._aiBubbles.get(env.id);
+        if (!entry) return;
+        // Drop the placeholder bubble entirely. The server
+        // immediately follows ai_end by broadcasting the same content
+        // as a regular WSMessage (with a real DB id); _renderMessage
+        // will create the final bubble with the canonical rendering
+        // path (author line, mention highlighting, time stamp, etc).
+        // Keeping the placeholder would duplicate the AI's reply.
+        if (entry.wrap.parentNode) entry.wrap.parentNode.removeChild(entry.wrap);
+        this._aiBubbles.delete(env.id);
+    }
+
+    _handleAiError(env) {
+        const entry = this._aiBubbles.get(env.id);
+        // Only render an error bubble to clients that were watching
+        // the stream (had an ai_start for this id). A client that
+        // joined mid-stream never saw the AI was working and has no
+        // context for an error bubble — they should just see the
+        // usual "no messages" state until the next event.
+        if (!entry) return;
+        if (entry.wrap.parentNode) entry.wrap.parentNode.removeChild(entry.wrap);
+        this._aiBubbles.delete(env.id);
+        this._renderAiError(env.reason || 'The assistant is unavailable right now.');
+    }
+
+    _renderAiError(reason) {
+        const messagesEl = document.getElementById('messages-container');
+        const empty = messagesEl.querySelector('.messages-empty');
+        if (empty) empty.remove();
+
+        const wrap = document.createElement('div');
+        wrap.className = 'message received ai-message ai-error-bubble';
+
+        const author = document.createElement('div');
+        author.className = 'author ai-author';
+        author.textContent = '🤖 assistant';
+        wrap.appendChild(author);
+
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        const reasonEl = document.createElement('div');
+        reasonEl.className = 'ai-error-reason';
+        reasonEl.textContent = reason;
+        bubble.appendChild(reasonEl);
+        // Try Again — re-fires the user's last @assistant mention
+        // through the regular send path. The mention content is
+        // client-side only; no server-side retry endpoint.
+        if (this._lastAiMention) {
+            const actions = document.createElement('div');
+            actions.className = 'ai-error-actions';
+            const retry = document.createElement('button');
+            retry.type = 'button';
+            retry.className = 'btn btn-ghost btn-sm';
+            retry.textContent = 'Try again';
+            retry.addEventListener('click', () => {
+                // Re-stage the message text into the composer and
+                // trigger send. We bypass _onComposerInput so we
+                // don't accidentally emit a typing envelope; the
+                // actual send goes through the same path as a fresh
+                // @assistant mention.
+                wrap.parentNode && wrap.parentNode.removeChild(wrap);
+                this._resendAiMention(this._lastAiMention);
+            });
+            actions.appendChild(retry);
+            bubble.appendChild(actions);
+        }
+        wrap.appendChild(bubble);
+        messagesEl.appendChild(wrap);
+        this._scrollToBottom(true);
+    }
+
+    async _resendAiMention(text) {
+        // Re-send the @assistant message via the same path as a
+        // regular text send. We bypass _sendMessage's empty-input
+        // guard by stuffing the value into the composer first.
+        const input = document.getElementById('message-input');
+        input.value = text;
+        this._onComposerInput();
+        await this._sendMessage();
+    }
+
+    _detectMentionQuery() {
+        const input = document.getElementById('message-input');
+        const text = input.value;
+        const caret = input.selectionStart;
+        // Walk back from the caret looking for an `@`. The token
+        // must not contain whitespace (otherwise it's not a mention).
+        // We also bail out if there's a word character directly before
+        // the `@` (which would mean the `@` is part of an email).
+        let at = -1;
+        for (let i = caret - 1; i >= 0; i--) {
+            const ch = text[i];
+            if (ch === '@') { at = i; break; }
+            // Bail on whitespace BEFORE the @: the @ belongs to a
+            // separate earlier token, so we should close the popover.
+            if (/\s/.test(ch)) return null;
+            // Bail on characters that can't be part of a mention
+            // username.
+            if (!/[A-Za-z0-9_]/.test(ch)) return null;
+        }
+        if (at < 0) return null;
+        // Reject the email-shape match (admin@assistant.com): the
+        // char immediately before `@` must be whitespace or BOL.
+        if (at > 0 && /[\w]/.test(text[at - 1])) return null;
+        return text.substring(at + 1, caret).toLowerCase();
+    }
+
+    _updateMentionPopover() {
+        const query = this._detectMentionQuery();
+        if (query === null) {
+            this._closeMentionPopover();
+            return;
+        }
+        // Build the candidate list from cached members. Don't show
+        // the caller themselves in the autocomplete (no point
+        // tagging yourself).
+        const callerName = this.user && this.user.username ? this.user.username.toLowerCase() : null;
+        const candidates = (this.members || [])
+            .filter((m) => !m.is_ai)  // AI has its own hint + trigger; not in the autocomplete
+            .filter((m) => !callerName || m.username.toLowerCase() !== callerName)
+            .filter((m) => m.username.toLowerCase().startsWith(query))
+            .slice(0, 8);
+        if (!candidates.length) {
+            this._closeMentionPopover();
+            return;
+        }
+        this._mentionState = { open: true, query, candidates, activeIndex: 0 };
+        this._renderMentionPopover();
+    }
+
+    _renderMentionPopover() {
+        const pop = document.getElementById('mention-popover');
+        pop.innerHTML = '';
+        for (let i = 0; i < this._mentionState.candidates.length; i++) {
+            const m = this._mentionState.candidates[i];
+            const item = document.createElement('div');
+            item.className = 'mention-popover-item' + (i === this._mentionState.activeIndex ? ' active' : '');
+            item.setAttribute('role', 'option');
+            item.dataset.index = String(i);
+            item.textContent = `@${m.username}`;
+            // mousedown so the click happens before the input's
+            // blur handler can close the popover.
+            item.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                this._acceptMention(i);
+            });
+            pop.appendChild(item);
+        }
+        // Anchor the popover just above the composer input.
+        const input = document.getElementById('message-input');
+        const rect = input.getBoundingClientRect();
+        pop.style.left = `${rect.left}px`;
+        pop.style.bottom = `${window.innerHeight - rect.top + 6}px`;
+        pop.style.width = `${Math.max(180, rect.width)}px`;
+        pop.hidden = false;
+    }
+
+    _moveMentionSelection(delta) {
+        const state = this._mentionState;
+        if (!state.candidates.length) return;
+        state.activeIndex = (state.activeIndex + delta + state.candidates.length) % state.candidates.length;
+        this._renderMentionPopover();
+    }
+
+    _acceptMentionSelection() {
+        if (this._mentionState.activeIndex < 0) return;
+        this._acceptMention(this._mentionState.activeIndex);
+    }
+
+    _acceptMention(index) {
+        const state = this._mentionState;
+        const m = state.candidates[index];
+        if (!m) return;
+        const input = document.getElementById('message-input');
+        const text = input.value;
+        const caret = input.selectionStart;
+        // Find the `@` that started this mention token.
+        let at = caret - 1;
+        while (at >= 0 && text[at] !== '@') at--;
+        if (at < 0) return;
+        const before = text.substring(0, at);
+        const after = text.substring(caret);
+        const inserted = `@${m.username} `;
+        input.value = before + inserted + after;
+        const newCaret = (before + inserted).length;
+        input.setSelectionRange(newCaret, newCaret);
+        input.focus();
+        this._closeMentionPopover();
+        // Re-evaluate send-btn enabled state — input value changed.
+        this._onComposerInput();
+    }
+
+    _closeMentionPopover() {
+        const pop = document.getElementById('mention-popover');
+        if (pop) pop.hidden = true;
+        this._mentionState = { open: false, query: '', candidates: [], activeIndex: -1 };
+    }
+
     _renderMessage(msg) {
         if (!msg || !msg.message_type) return;
         // Dedupe by message id. The HTTP POST response and the WebSocket
@@ -1082,7 +2041,13 @@ class ChatApp {
         bubble.className = 'bubble';
 
         if (msg.message_type === 'text') {
-            bubble.textContent = msg.content || '';
+            // Render the text bubble as a mixed DOM tree so @mentions
+            // can be wrapped in `.mention` spans. `textContent` would
+            // collapse the structure into a single string; we build
+            // a list of (kind, value) parts by scanning for `@`
+            // tokens and rely on textContent for each non-mention
+            // chunk so we never inject raw HTML from user content.
+            this._appendTextWithMentions(bubble, msg.content || '', msg.mentions || [], msg.user_id);
         } else if (msg.message_type === 'image' && msg.data) {
             const img = document.createElement('img');
             img.alt = msg.file_name || 'image';
@@ -1119,6 +2084,19 @@ class ChatApp {
         } else {
             bubble.textContent = '(unsupported message)';
         }
+
+        // Caption: rendered below any non-text bubble when the
+        // composer staged a file and the user typed a message with
+        // it. Skipped for plain text messages (their content is
+        // already the bubble body).
+        if (msg.message_type !== 'text' && msg.caption && msg.caption.trim()) {
+            const cap = document.createElement('div');
+            cap.className = 'bubble-caption';
+            // Reuse the mention-renderer for the caption so the same
+            // rule (text + .mention spans) applies uniformly.
+            this._appendTextWithMentions(cap, msg.caption, msg.mentions || [], msg.user_id);
+            bubble.appendChild(cap);
+        }
         wrap.appendChild(bubble);
 
         if (msg.created_at) {
@@ -1141,6 +2119,69 @@ class ChatApp {
         el.textContent = text;
         messagesEl.appendChild(el);
         this._scrollToBottom();
+    }
+
+    // Split `text` into (plain | mention) chunks using the same
+    // whole-word rule the server uses, and append them into `parent`
+    // as DOM nodes. Each plain chunk goes in as a text node (so the
+    // browser escapes any HTML in the source); each mention goes in
+    // as a <span class="mention"> with `data-username` for the click
+    // handler. `known` is the list of mentions the server already
+    // validated against the room's members — used to decide which
+    // matches are "real" mentions (and therefore highlight-worthy)
+    // vs. stray @-tokens. `senderId` highlights self-mentions.
+    _appendTextWithMentions(parent, text, known, senderId) {
+        if (!text) return;
+        // Same regex shape as server-side app/mentions.py::_MENTION_RE.
+        // Capture group is the bare username; matches at non-word
+        // boundaries so `admin@assistant.com` is excluded.
+        const re = /(?<![\w])@([A-Za-z0-9_]{1,32})/g;
+        const knownLower = new Set((known || []).map((u) => String(u).toLowerCase()));
+        const isSelf = this.user && senderId != null && senderId === this.user.id;
+        let cursor = 0;
+        for (const m of text.matchAll(re)) {
+            const idx = m.index;
+            const username = m.group(1);
+            // Plain text before the mention (textContent is the
+            // safe path — never innerHTML).
+            if (idx > cursor) {
+                parent.appendChild(document.createTextNode(text.substring(cursor, idx)));
+            }
+            const lower = username.toLowerCase();
+            if (knownLower.has(lower)) {
+                const span = document.createElement('span');
+                span.className = 'mention' + (isSelf ? ' mention-self' : '');
+                span.dataset.username = username;
+                span.textContent = `@${username}`;
+                // Click → insert "@username " at the end of the
+                // composer (or at the caret) and focus it. This is
+                // the affordance for "I want to mention them too".
+                span.addEventListener('click', () => this._insertMention(span.dataset.username));
+                parent.appendChild(span);
+            } else {
+                // Not a room member; render as plain text (no
+                // highlight, no click handler).
+                parent.appendChild(document.createTextNode(m[0]));
+            }
+            cursor = idx + m[0].length;
+        }
+        if (cursor < text.length) {
+            parent.appendChild(document.createTextNode(text.substring(cursor)));
+        }
+    }
+
+    _insertMention(username) {
+        const input = document.getElementById('message-input');
+        if (!input) return;
+        const insertion = `@${username} `;
+        const caret = input.selectionStart;
+        const before = input.value.substring(0, caret);
+        const after = input.value.substring(caret);
+        input.value = before + insertion + after;
+        const newCaret = (before + insertion).length;
+        input.setSelectionRange(newCaret, newCaret);
+        input.focus();
+        this._onComposerInput();
     }
 
     _formatTime(iso) {
@@ -1190,6 +2231,10 @@ class ChatApp {
             this.ws.close();
             this.ws = null;
         }
+        // Drop typing/AI streaming state — we're being navigated away.
+        this._clearTypingState();
+        this._aiBubbles.clear();
+        this._clearTypingQuietTimer();
         localStorage.removeItem(STORAGE_TOKEN);
         localStorage.removeItem(STORAGE_USER);
         // Preserve the current path so /login can return the user there after
@@ -1217,6 +2262,9 @@ class ChatApp {
             this.ws.close();
             this.ws = null;
         }
+        this._clearTypingState();
+        this._aiBubbles.clear();
+        this._clearTypingQuietTimer();
         localStorage.removeItem(STORAGE_TOKEN);
         localStorage.removeItem(STORAGE_USER);
         window.location.href = '/login';

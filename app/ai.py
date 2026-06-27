@@ -4,25 +4,35 @@ OLLAMA_MODEL); can call DuckDuckGo for /search-triggered queries.
 
 Key design decisions
 ---------------------
-- Fire-and-forget: the routers call `asyncio.create_task(maybe_reply(...))`
+- Fire-and-forget: the routers call `asyncio.create_task(stream_reply(...))`
   and return immediately. The AI's HTTP call to Ollama runs on a background
   task and does NOT block the WebSocket receive loop.
+- Streaming: `stream_reply` opens an `ndjson` stream to Ollama and emits
+  `ai_start` / `ai_chunk` / `ai_end` envelopes over the WebSocket as
+  tokens arrive, so the UI can render progressively. A final persisted
+  `WSMessage` is broadcast at the end so non-streaming clients still see
+  the bubble.
 - Loop prevention: triggering_user_id is checked against the AI user's id
   at the top. AI messages are never reprocessed.
 - Empty-reply filter: if Ollama returns an empty content string (or only
   whitespace), we skip the persist+broadcast step — no empty bubbles
   in the chat.
+- Failure UX: when the stream errors before producing content we broadcast
+  an `ai_error` envelope with a human-readable reason. The client renders
+  a dedicated error bubble with a retry affordance.
 - Context window: only the last 30 messages are sent to Ollama, ordered
   oldest → newest. Binary messages (image/file/video) are summarized as
   "[User X sent an image: filename.jpg]" rather than including the bytes.
 - Mention regex: \\b@assistant\\b case-insensitive (Python's re.IGNORECASE).
 - Room disable: rooms with ai_enabled=False skip the trigger entirely.
-- Crash isolation: the entire body of `maybe_reply` is wrapped in a
+- Crash isolation: the entire body of `stream_reply` is wrapped in a
   try/except that logs and swallows. A failed AI reply must never take
   down the WS receive loop on any pod.
 """
 
+import asyncio
 import logging
+import json
 import re
 from typing import Optional
 
@@ -208,6 +218,10 @@ async def _call_ollama(messages: list[dict], timeout_s: float = 60.0) -> str:
 
     Returns "" on any error (timeout, non-2xx, malformed JSON, empty
     content) so the caller can treat it as "no reply".
+
+    Retained as the non-streaming fallback used by callers that need
+    a single-shot reply (none today; left in place for tests and any
+    future caller that wants a simple synchronous response).
     """
     url = f"{_ollama_url()}/api/chat"
     payload = {
@@ -231,6 +245,70 @@ async def _call_ollama(messages: list[dict], timeout_s: float = 60.0) -> str:
         log.warning("Ollama response JSON parse failed: %s", e)
         return ""
     return content.strip()
+
+
+async def _stream_ollama(messages: list[dict], timeout_s: float = 90.0):
+    """Streaming Ollama chat. Async generator yielding content chunks.
+
+    Sends `stream: True` and parses the `application/x-ndjson` body
+    line-by-line. Each line is `{"message": {"content": "tok"}, "done": false}`
+    until a final `{"done": true, ...}` arrives. Yields each `content`
+    string verbatim — caller accumulates the full reply.
+
+    Failures (timeout, non-2xx, malformed line, network error) are
+    logged but do NOT raise: the iterator simply ends. The caller
+    decides what "empty stream" means (broadcast ai_error vs ai_end
+    with empty content).
+    """
+    url = f"{_ollama_url()}/api/chat"
+    payload = {
+        "model": OLLAMA_MODEL or "llama3.2",
+        "messages": messages,
+        "stream": True,
+    }
+    try:
+        client = httpx.AsyncClient(timeout=timeout_s)
+    except Exception as e:
+        log.warning("Ollama streaming client init failed: %s", e)
+        return
+
+    try:
+        async with client.stream("POST", url, json=payload) as response:
+            if response.status_code != 200:
+                # Drain the body so the connection closes cleanly,
+                # but don't bother buffering it — we already know
+                # the request failed.
+                try:
+                    await response.aread()
+                except Exception:
+                    pass
+                log.warning("Ollama streaming returned HTTP %s", response.status_code)
+                return
+            # `aiter_lines()` splits on \n and skips empty lines. Each
+            # line is a JSON object — parse incrementally so a partial
+            # stream (cut off mid-line) is discarded cleanly.
+            async for raw in response.aiter_lines():
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    # Tolerate partial/fractured lines; just skip them.
+                    continue
+                if obj.get("done"):
+                    # Terminal frame — Ollama's final summary line.
+                    # Any `done_reason` / metrics are not surfaced
+                    # to the caller; we're done streaming tokens.
+                    return
+                chunk = ((obj.get("message") or {}).get("content")) or ""
+                if chunk:
+                    yield chunk
+    except Exception as e:
+        # Network error mid-stream (DNS, connection reset, server
+        # closed early, etc.). Log and end the iterator; the caller
+        # will see "empty buffer" and broadcast ai_error.
+        log.warning("Ollama streaming failed: %s", e)
+        return
 
 
 # ---------- Context assembly ----------
@@ -279,7 +357,49 @@ async def maybe_reply(
     triggering_message_id: int,
     triggering_text: str,
 ) -> None:
-    """Background task: read context, call Ollama, persist + broadcast.
+    """Compatibility shim — wraps the streaming reply path.
+
+    Kept so existing callers (and tests) that pass no `request_id`
+    still get a sensible reply. Internally it now goes through
+    `stream_reply` with a generated request_id; the streaming
+    envelopes are broadcast as usual, and a final persisted message
+    is sent. If you don't need streaming UX, prefer this entry point.
+    """
+    import uuid
+    await stream_reply(
+        room_id=room_id,
+        triggering_user_id=triggering_user_id,
+        triggering_message_id=triggering_message_id,
+        triggering_text=triggering_text,
+        request_id=str(uuid.uuid4()),
+    )
+
+
+async def stream_reply(
+    room_id: int,
+    triggering_user_id: int,
+    triggering_message_id: int,
+    triggering_text: str,
+    request_id: str,
+) -> None:
+    """Background task: stream an Ollama reply and broadcast progress.
+
+    Broadcasts the following envelopes to the room over the WebSocket:
+
+    - `{"type": "ai_start", "id": request_id, "user_id": ai_user_id,
+        "username": "assistant"}` once the room/persona check passes.
+    - `{"type": "ai_chunk", "id": request_id, "delta": "tok"}` per
+        coalesced chunk (≤16 chars or ≤50ms, whichever first).
+    - `{"type": "ai_end", "id": request_id, "content": "..."}` when
+        the stream finishes successfully, just before the persisted
+        chat message is broadcast.
+    - `{"type": "ai_error", "id": request_id, "reason": "..."}` if
+        the stream fails or produces empty content.
+
+    After `ai_end` (only on success), the same MessageCreate +
+    broadcast path used by user messages persists the AI's reply
+    and emits a regular WSMessage envelope so non-streaming clients
+    (or clients that connected mid-stream) still see the bubble.
 
     Designed to be called via `asyncio.create_task` from the routers.
     Opens its own DB session so it outlives the request's session.
@@ -288,10 +408,6 @@ async def maybe_reply(
     """
     global _AI_USER_ID_CACHE
     try:
-        # Open the session in the background task so it survives past
-        # the request handler's return. The request's session is closed
-        # by FastAPI's dependency teardown the moment the response is
-        # sent, which would happen before Ollama replies.
         db = WriteSessionLocal()
         try:
             # Lazy-resolve the AI user once per process.
@@ -336,10 +452,62 @@ async def maybe_reply(
             if final_user:
                 messages.append({"role": "user", "content": final_user})
 
-            content = await _call_ollama(messages)
+            # Announce the bubble opening BEFORE we start consuming
+            # the stream so the client can render a placeholder
+            # immediately. Without this, the user would see nothing
+            # until the first chunk arrived (~hundreds of ms).
+            await manager.broadcast(json.dumps({
+                "type": "ai_start",
+                "id": request_id,
+                "user_id": ai_user_id,
+                "username": AI_USERNAME,
+            }), room_id)
+
+            # Coalesce Ollama's natural cadence (dozens of tokens/sec)
+            # into ~50ms / 16-char windows so we don't flood the WS
+            # with one frame per token. Anything below either threshold
+            # buffers; once we cross either, flush and reset.
+            buffer = ""
+            full = ""
+            last_flush = asyncio.get_event_loop().time()
+            async for chunk in _stream_ollama(messages):
+                buffer += chunk
+                full += chunk
+                now = asyncio.get_event_loop().time()
+                if len(buffer) >= 16 or (now - last_flush) >= 0.05:
+                    await manager.broadcast(json.dumps({
+                        "type": "ai_chunk",
+                        "id": request_id,
+                        "delta": buffer,
+                    }), room_id)
+                    buffer = ""
+                    last_flush = now
+
+            # Flush any tail before signalling end.
+            if buffer:
+                await manager.broadcast(json.dumps({
+                    "type": "ai_chunk",
+                    "id": request_id,
+                    "delta": buffer,
+                }), room_id)
+
+            content = full.strip()
             if not content:
-                # Empty / failed reply: don't persist, don't broadcast.
+                # Empty / failed reply: tell the client the stream is
+                # done but flag it as an error so the placeholder is
+                # replaced with the error bubble (not left empty).
+                await manager.broadcast(json.dumps({
+                    "type": "ai_error",
+                    "id": request_id,
+                    "reason": "The assistant didn't return a reply. Please try again.",
+                }), room_id)
                 return
+
+            await manager.broadcast(json.dumps({
+                "type": "ai_end",
+                "id": request_id,
+                "content": content,
+            }), room_id)
 
             db_msg = crud.create_message(
                 db=db,
@@ -368,4 +536,14 @@ async def maybe_reply(
     except Exception as e:
         # Last-resort: log and swallow. A failed AI reply must not take
         # down the WS receive loop on any pod.
-        log.exception("AI maybe_reply crashed: %s", e)
+        log.exception("AI stream_reply crashed: %s", e)
+        try:
+            await manager.broadcast(json.dumps({
+                "type": "ai_error",
+                "id": request_id,
+                "reason": "The assistant hit an unexpected error. Please try again.",
+            }), room_id)
+        except Exception:
+            # If even the error broadcast fails, the user already saw
+            # nothing — there's nothing else we can do.
+            pass
