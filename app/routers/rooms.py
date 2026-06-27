@@ -119,7 +119,7 @@ def list_members(
 
 
 @router.delete("/{room_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-def kick_member(
+async def kick_member(
     room_id: int,
     user_id: int,
     db: Session = Depends(get_db),
@@ -154,7 +154,7 @@ def kick_member(
 
 
 @router.post("/{room_id}/bans", response_model=schemas.BanOut, status_code=status.HTTP_201_CREATED)
-def ban_member(
+async def ban_member(
     room_id: int,
     body: schemas.BanCreate,
     db: Session = Depends(get_db),
