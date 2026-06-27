@@ -159,8 +159,11 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
                 # Intersect @-mentions in the content with the room's
                 # actual members so we don't persist (or highlight)
                 # mentions of users not in the room.
+                # `list_room_members` returns (User, joined_at) tuples
+                # so the members endpoint can render joined_at without
+                # a second round-trip — unpack accordingly.
                 member_usernames = [
-                    u.username for u in crud.list_room_members(db, room_id)
+                    user.username for user, _joined_at in crud.list_room_members(db, room_id)
                 ]
                 extracted_mentions = extract_mentions(msg.content or "", member_usernames)
                 db_msg = crud.create_message(

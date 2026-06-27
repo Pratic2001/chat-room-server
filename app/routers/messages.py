@@ -122,11 +122,13 @@ async def create_message(
     # room's actual member list so we don't persist (or highlight)
     # `@randomname` for someone not in the room. Read the list once
     # here; the WS path does the same and the membership list is
-    # tiny in practice.
+    # tiny in practice. `list_room_members` returns (User, joined_at)
+    # tuples so the members endpoint can render joined_at without a
+    # second round-trip — unpack accordingly.
     mentions: list[str] = []
     if body.message_type == "text" and body.content:
         member_usernames = [
-            u.username for u in crud.list_room_members(db, room_id)
+            user.username for user, _joined_at in crud.list_room_members(db, room_id)
         ]
         mentions = extract_mentions(body.content, member_usernames)
 
