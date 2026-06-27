@@ -90,6 +90,21 @@ a:hover { text-decoration: underline; }
     overflow: hidden; clip: rect(0,0,0,0);
     border: 0;
 }
+/* `<input type="file">` is special: even with the standard visually-hidden
+ * clip-trick above, Chromium / Firefox / WebKit render the native "No
+ * file chosen" control as a small white box inside the flex container
+ * (it's a UA shadow-DOM thing — clip + 1px dimensions don't shrink the
+ * host element reliably across browsers, and the label text spills into
+ * the layout). The composer put this input directly beside the attach
+ * button, so the result was a white box visible at all times.
+ *
+ * The file input is only ever invoked programmatically (the attach
+ * button calls `.click()` on it from script.js), so there's no label or
+ * focusable surface that needs the visual-hide trick for accessibility
+ * purposes — `display: none` is safe here. If a future change wants to
+ * associate this input with a custom-styled button, prefer
+ * `<label for="file-input">` over re-introducing a visible input. */
+#file-input { display: none; }
 
 /* ---------- Buttons ---------- */
 .btn {

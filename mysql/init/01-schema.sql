@@ -70,17 +70,50 @@ CREATE TABLE IF NOT EXISTS messages (
 
 -- Migration: per-message @mentions list. Stored as a JSON array of
 -- lowercase usernames that were mentioned in `content` and are actual
--- members of the room at send time. Idempotent on MySQL 8
--- (`ADD COLUMN IF NOT EXISTS` is supported there; on 5.7 you'd need a
--- stored-procedure guard). Mirrors database_setup.sql so the two stay
--- in lock-step — drift between them caused the live cluster to 500 on
--- `GET /messages/{room_id}/messages` with `Unknown column 'messages.mentions'`.
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS mentions JSON NULL;
+-- members of the room at send time. Mirrors database_setup.sql so the
+-- two stay in lock-step — drift between them caused the live cluster
+-- to 500 on `GET /messages/{room_id}/messages` with
+-- `Unknown column 'messages.mentions'`.
+--
+-- Why dynamic SQL and not `ADD COLUMN IF NOT EXISTS`:
+-- `ADD COLUMN IF NOT EXISTS` is **not** natively supported by any
+-- standard MySQL 8.0.x release (it was a MariaDB extension that some
+-- third-party distributions adopted, but the official mysql:8.0-debian
+-- image from Oracle/MySQL AB rejects it with ERROR 1064). Running this
+-- script with that syntax aborted the entire 01-schema.sql mid-file on
+-- MySQL 8.0.46, leaving the rest of the schema (caption column,
+-- room_bans table) plus the user's `repl` account un-created, and the
+-- datadir non-empty so every subsequent pod restart skipped the init
+-- scripts entirely. The replica bootstrap then failed with
+-- `Access denied for user 'repl'@'...'` because no `repl` user existed.
+-- See RUNBOOK §9.10. The portable fix is to check
+-- INFORMATION_SCHEMA.COLUMNS first and only issue the ALTER when the
+-- column is missing — works on every MySQL 5.7+, MariaDB, and Aurora.
+SET @col_exists := (
+    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'messages'
+      AND COLUMN_NAME = 'mentions'
+);
+SET @sql := IF(@col_exists = 0,
+    'ALTER TABLE messages ADD COLUMN mentions JSON NULL',
+    'DO 0');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 -- Migration: optional caption typed alongside a file/image/video. NULL on
 -- pure text messages. The composer sends a single combined message when
--- the user attaches a file and types text in the input.
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS caption TEXT NULL;
+-- the user attaches a file and types text in the input. Same
+-- dynamic-SQL guard as the `mentions` column above.
+SET @col_exists := (
+    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'messages'
+      AND COLUMN_NAME = 'caption'
+);
+SET @sql := IF(@col_exists = 0,
+    'ALTER TABLE messages ADD COLUMN caption TEXT NULL',
+    'DO 0');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 -- Room bans: removes a user from a room AND blocks rejoin until the ban
 -- is lifted. Idempotent (IF NOT EXISTS) so re-running this file on a

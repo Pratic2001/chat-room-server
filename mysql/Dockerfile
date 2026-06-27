@@ -72,6 +72,7 @@ ARG REPLICATION_PASSWORD=placeholder
 COPY init/01-schema.sql /docker-entrypoint-initdb.d/01-schema.sql
 COPY init/02-replication-user.sql.template /tmp/02-replication-user.sql.template
 COPY init/99-grants.sql.template /tmp/99-grants.sql.template
+COPY init/100-init-complete.sh /docker-entrypoint-initdb.d/100-init-complete.sh
 
 # Substitute the build-arg passwords into the templates. We use a
 # delimiter (|) that the passwords (base64-ish) will never contain, so the
@@ -82,6 +83,10 @@ COPY init/99-grants.sql.template /tmp/99-grants.sql.template
 #   01-schema.sql → CREATE TABLE statements
 #   02-replication-user.sql → CREATE USER 'repl' + GRANT REPLICATION SLAVE
 #   99-grants.sql → ALTER USER 'root' to the build-time password
+#   100-init-complete.sh → write $DATADIR/.chatroom_init_complete marker
+#                            (read by replication_bootstrap.sh to detect
+#                             broken first-init — see that file for the
+#                             full rationale)
 RUN set -eux; \
     sed "s|__MYSQL_ROOT_PASSWORD__|${MYSQL_ROOT_PASSWORD}|g" \
         /tmp/99-grants.sql.template \
@@ -92,7 +97,8 @@ RUN set -eux; \
     rm /tmp/99-grants.sql.template /tmp/02-replication-user.sql.template; \
     unset MYSQL_ROOT_PASSWORD; \
     unset REPLICATION_PASSWORD; \
-    chmod 644 /docker-entrypoint-initdb.d/*.sql
+    chmod 644 /docker-entrypoint-initdb.d/*.sql; \
+    chmod 755 /docker-entrypoint-initdb.d/*.sh
 
 # Per-pod bootstrap script. Lives in the image at /usr/local/bin/ so the
 # ENTRYPOINT below can invoke it directly. The script decides master vs

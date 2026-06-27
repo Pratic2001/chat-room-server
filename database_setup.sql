@@ -48,11 +48,35 @@ ALTER TABLE rooms MODIFY COLUMN secret_phrase_hash VARCHAR(512) NULL;
 -- only thing standing between you and a failure here).
 ALTER TABLE rooms ADD UNIQUE INDEX rooms_name_unique (name);
 
--- AI assistant config (idempotent on MySQL 8 — `ADD COLUMN IF NOT EXISTS`
--- is supported). For MySQL 5.7 these would error and need to be wrapped in
--- a stored procedure check; that path is out of scope here.
-ALTER TABLE rooms ADD COLUMN IF NOT EXISTS ai_enabled TINYINT(1) NOT NULL DEFAULT 0;
-ALTER TABLE rooms ADD COLUMN IF NOT EXISTS ai_persona VARCHAR(32) NULL;
+-- AI assistant config. Idempotent via dynamic SQL — see the explanation
+-- in mysql/init/01-schema.sql (the same migrations need to be portable
+-- on every MySQL 5.7+, MariaDB, and Aurora). Plain
+-- `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` is **not** natively
+-- supported by any standard MySQL 8.0.x release — using it aborts the
+-- rest of the init script with ERROR 1064 and leaves the cluster in a
+-- half-initialised state where subsequent restarts skip the init
+-- scripts entirely.
+SET @col_exists := (
+    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'rooms'
+      AND COLUMN_NAME = 'ai_enabled'
+);
+SET @sql := IF(@col_exists = 0,
+    'ALTER TABLE rooms ADD COLUMN ai_enabled TINYINT(1) NOT NULL DEFAULT 0',
+    'DO 0');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @col_exists := (
+    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'rooms'
+      AND COLUMN_NAME = 'ai_persona'
+);
+SET @sql := IF(@col_exists = 0,
+    'ALTER TABLE rooms ADD COLUMN ai_persona VARCHAR(32) NULL',
+    'DO 0');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 -- Room members table (many-to-metween users and rooms)
 CREATE TABLE IF NOT EXISTS room_members (
@@ -93,15 +117,33 @@ CREATE TABLE IF NOT EXISTS messages (
 
 -- Migration: per-message @mentions list. Stored as a JSON array of
 -- lowercase usernames that were mentioned in `content` and are actual
--- members of the room at send time. Idempotent on MySQL 8 (ADD COLUMN
--- IF NOT EXISTS is supported there; the schema also has a guard
--- procedure for older versions below).
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS mentions JSON NULL;
+-- members of the room at send time. Idempotent via dynamic SQL — see
+-- the explanation in mysql/init/01-schema.sql (plain
+-- `ADD COLUMN IF NOT EXISTS` is rejected by stock MySQL 8.0.x).
+SET @col_exists := (
+    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'messages'
+      AND COLUMN_NAME = 'mentions'
+);
+SET @sql := IF(@col_exists = 0,
+    'ALTER TABLE messages ADD COLUMN mentions JSON NULL',
+    'DO 0');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 -- Migration: optional caption typed alongside a file/image/video.
 -- NULL on pure text messages. The composer sends a single combined
 -- message when the user attaches a file and types text in the input.
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS caption TEXT NULL;
+SET @col_exists := (
+    SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'messages'
+      AND COLUMN_NAME = 'caption'
+);
+SET @sql := IF(@col_exists = 0,
+    'ALTER TABLE messages ADD COLUMN caption TEXT NULL',
+    'DO 0');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
 -- Room bans: removes a user from a room AND blocks rejoin until the
 -- ban is lifted. Idempotent (IF NOT EXISTS) so re-running this file

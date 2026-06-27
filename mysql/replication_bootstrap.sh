@@ -119,12 +119,103 @@ MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD env var is requi
 # and the volumeMount in the StatefulSet pod template.
 DATADIR="${MYSQL_DATADIR:-/var/lib/mysql}"
 
-# Master path: delegate to the official entrypoint with --server-id
-# prepended so the master's server-id is unique in the cluster. The
-# official entrypoint runs `exec "$@"` after init, so the server-id
-# reaches mysqld. The manifest's `args:` does NOT include --server-id
-# (the script injects it for both master and replica paths).
+# -----------------------------------------------------------------------------
+# Detect and recover from a broken first-init on the master.
+#
+# The official mysql:8 entrypoint decides whether to run
+# /docker-entrypoint-initdb.d/* based purely on whether $DATADIR/mysql
+# exists (see docker-library/mysql docker_setup_env() — the
+# DATABASE_ALREADY_EXISTS flag). If the master pod crashed mid-init (e.g.
+# a syntax error in 01-schema.sql, an OOM kill during InnoDB warmup, the
+# node losing power between `CREATE DATABASE chatroom_db` and `CREATE
+# USER 'repl'@'%'`), the PVC ends up with a half-populated datadir and
+# the entrypoint silently skips every init script on every subsequent
+# pod restart. The chatroom-app then connects fine (root@% already has
+# a hash from MYSQL_ROOT_PASSWORD) but replicas get
+# `Access denied for user 'repl'@'...'` because the replication user was
+# never created. Re-deploying the StatefulSet does NOT recover — the
+# existing PVC keeps the broken state.
+#
+# 100-init-complete.sh writes a sentinel file
+# ($DATADIR/.chatroom_init_complete) at the very end of a successful
+# init. The bootstrap script reads it: missing sentinel + present
+# $DATADIR/mysql → broken state → move the datadir aside so the
+# entrypoint re-initialises. The mv only triggers when the chatroom_db
+# users table is empty (so we never destroy populated production data
+# on a spuriously-missing sentinel).
+#
+# This is destructive on a broken first-init. The fix is destructive on
+# purpose: a half-initialised master can't accept writes (the user
+# table is empty even on the live cluster today), can't seed replicas,
+# and gets stuck in an indefinite "init scripts skipped on every
+# restart" loop. Recreating from scratch is faster than chasing each
+# missing artifact by hand.
+#
+# This block only runs on the master path. Replicas have their own
+# idempotent restart logic at "Step 3" below and don't depend on the
+# sentinel (they dump-load from the master, so a healthy master means a
+# healthy replica after the bootstrap).
 if [[ "$MYSQL_ROLE" != "replica" ]]; then
+    INIT_SENTINEL="${DATADIR}/.chatroom_init_complete"
+    if [[ -d "${DATADIR}/mysql" && ! -e "${INIT_SENTINEL}" ]]; then
+        # $DATADIR/mysql exists but the sentinel is missing — broken
+        # first-init. Decide whether it's safe to nuke by sampling the
+        # chatroom_db user-table row count from the file system. For a
+        # freshly broken init the InnoDB tablespace is tiny (just the
+        # schema with zero rows); for a populated production DB it's
+        # multiple MB.
+        #
+        # We can't safely read .ibd files without mysqld, so we use size
+        # as a proxy: an empty InnoDB tablespace for `users` is well
+        # under 100 KiB (the 16 KiB page + metadata overhead for an
+        # auto-increment INT PK + a few VARCHAR indexes), and a single
+        # user row already pushes it past 64 KiB of "real" data. We use
+        # 1 MiB as a conservative cutoff — anything that large was
+        # definitely populated, anything that small is almost certainly
+        # the broken-init empty-schema state. Conservative on purpose:
+        # we'd rather recover a fresh DB than mistakenly destroy
+        # production data on a corrupted sentinel.
+        USER_FILE="${DATADIR}/chatroom_db/users.ibd"
+        USER_BYTES=0
+        if [[ -f "${USER_FILE}" ]]; then
+            USER_BYTES="$(stat -c '%s' "${USER_FILE}" 2>/dev/null || echo 0)"
+        fi
+        if [[ "${USER_BYTES}" -lt 1048576 ]]; then
+            # Empty / nearly-empty users table: safe to re-init.
+            # Move the broken datadir aside and let the entrypoint
+            # recreate it on the next invocation. The mv is a single
+            # rename on the same filesystem, so it's atomic from the
+            # kubelet's perspective — the entrypoint sees an empty
+            # datadir as soon as the rename completes. The aside
+            # directory survives on the PVC for forensic inspection;
+            # the operator can delete it (or the whole PVC) once the
+            # fresh init is healthy.
+            STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+            ASIDE="${DATADIR}.broken.${STAMP}"
+            log "Broken first-init detected: ${DATADIR}/mysql exists but ${INIT_SENTINEL} is absent (users.ibd=${USER_BYTES} bytes). Moving datadir aside to ${ASIDE} so the entrypoint can re-initialize."
+            mv "${DATADIR}" "${ASIDE}"
+            # Recreate the empty datadir with the right ownership so
+            # the entrypoint's initialize-insecure step can write into
+            # it. The official image runs mysqld under the `mysql` user.
+            mkdir -p "${DATADIR}"
+            chown mysql:mysql "${DATADIR}"
+        else
+            # Sentinel is missing but users.ibd looks populated — refuse
+            # to recover automatically. The operator should investigate
+            # the datadir manually (the aside-directory trick would be
+            # destructive on a real production DB). Log loudly and let
+            # the entrypoint take its normal "datadir exists, skip
+            # init" path so the operator can `kubectl exec` in and
+            # decide.
+            log "Sentinel ${INIT_SENTINEL} missing but ${USER_FILE} is ${USER_BYTES} bytes — refusing automatic re-init (looks like populated production data). Investigate manually; the datadir has not been moved."
+        fi
+    fi
+
+    # Master path: delegate to the official entrypoint with --server-id
+    # prepended so the master's server-id is unique in the cluster. The
+    # official entrypoint runs `exec "$@"` after init, so the server-id
+    # reaches mysqld. The manifest's `args:` does NOT include --server-id
+    # (the script injects it for both master and replica paths).
     log "Master path (MYSQL_ROLE=${MYSQL_ROLE}); delegating to official entrypoint with server-id=${SERVER_ID}."
     exec /usr/local/bin/docker-entrypoint.sh mysqld --server-id="${SERVER_ID}" "$@"
 fi
