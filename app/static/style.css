@@ -864,6 +864,12 @@ textarea {
     border: 1px solid var(--border);
     border-radius: 10px;
 }
+/* The HTML `hidden` attribute defaults to `display:none`, but any author
+ * rule that sets `display` (here: `flex`) wins. Without this override the
+ * empty preview chip renders as a small white box beside the attach
+ * button before the user has picked a file. Matches the convention used
+ * by `.composer-hint[hidden]`, `.modal-backdrop[hidden]`, etc. */
+.attach-preview[hidden] { display: none; }
 .attach-preview-thumb {
     width: 36px;
     height: 36px;
