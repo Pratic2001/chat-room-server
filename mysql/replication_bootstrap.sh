@@ -182,23 +182,76 @@ if [[ "$MYSQL_ROLE" != "replica" ]]; then
         fi
         if [[ "${USER_BYTES}" -lt 1048576 ]]; then
             # Empty / nearly-empty users table: safe to re-init.
-            # Move the broken datadir aside and let the entrypoint
-            # recreate it on the next invocation. The mv is a single
-            # rename on the same filesystem, so it's atomic from the
-            # kubelet's perspective — the entrypoint sees an empty
-            # datadir as soon as the rename completes. The aside
-            # directory survives on the PVC for forensic inspection;
-            # the operator can delete it (or the whole PVC) once the
-            # fresh init is healthy.
+            # Two possible recovery strategies, chosen by what the
+            # filesystem underneath $DATADIR allows:
+            #
+            #   1. Rename the datadir aside. Works on local PVs
+            #      (hostPath, CSI local, kubelet-managed emptyDir) —
+            #      `mv` of an unused directory is a single rename on
+            #      the same filesystem, atomic from the kubelet's
+            #      perspective, and the aside directory survives on
+            #      the PVC for forensic inspection.
+            #
+            #   2. In-place cleanup. Required when $DATADIR is itself
+            #      a mount point (NFS, cephfs, glusterfs, AWS EFS, …).
+            #      The Linux kernel returns EBUSY ("Device or resource
+            #      busy") on rename() of any directory that is a
+            #      mountpoint — NFS servers reject it server-side as
+            #      well, so the mv fails with the same error even when
+            #      no client is actively using the volume. In that case
+            #      we cannot move the mount aside; instead we delete
+            #      the contents of $DATADIR in place, leaving the
+            #      mountpoint itself intact. The official entrypoint
+            #      only checks `$DATADIR/mysql` (not `$DATADIR` itself),
+            #      so an empty $DATADIR is sufficient for the
+            #      re-initialisation to kick in.
+            #
+            # Detection: try (1), and if `mv` fails with EBUSY /
+            # EXDEV / ENOTSUP, fall back to (2). Doing the rename
+            # first means local PVs (the common case in kind / k3d /
+            # minikube / single-node clusters) still get the forensic
+            # aside-directory behaviour; only NFS-class storage takes
+            # the in-place path.
             STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
             ASIDE="${DATADIR}.broken.${STAMP}"
             log "Broken first-init detected: ${DATADIR}/mysql exists but ${INIT_SENTINEL} is absent (users.ibd=${USER_BYTES} bytes). Moving datadir aside to ${ASIDE} so the entrypoint can re-initialize."
-            mv "${DATADIR}" "${ASIDE}"
-            # Recreate the empty datadir with the right ownership so
-            # the entrypoint's initialize-insecure step can write into
-            # it. The official image runs mysqld under the `mysql` user.
-            mkdir -p "${DATADIR}"
-            chown mysql:mysql "${DATADIR}"
+            if mv "${DATADIR}" "${ASIDE}" 2>/tmp/chatroom_mv_err; then
+                # Local-PV path: rename succeeded, recreate the empty
+                # datadir so the entrypoint can re-initialise.
+                mkdir -p "${DATADIR}"
+                chown mysql:mysql "${DATADIR}"
+            else
+                # NFS / mountpoint path: rename refused the active
+                # mount. Drop the contents in place instead.
+                #
+                # Why no forensic aside on this path: on NFS the parent
+                # of $DATADIR lives inside kubelet's
+                # pods/<uid>/volumes/... tree, which is owned by root
+                # and disappears when the pod is deleted. So copying
+                # the broken contents there (a) would be racy with the
+                # kubelet's cleanup of the failed pod's volumes dir
+                # and (b) provides no forensic value because the
+                # operator can't keep the aside directory alive across
+                # a redeploy anyway. Logging the original mv error to
+                # the pod's stderr is sufficient — `kubectl logs
+                # mysql-0 --previous` shows the full failure context.
+                log "mv ${DATADIR} -> ${ASIDE} failed ($(cat /tmp/chatroom_mv_err)). $DATADIR is likely a mountpoint (NFS/cephfs/EFS) — cleaning contents in place."
+                rm -f /tmp/chatroom_mv_err
+                # rm -rf the contents but not the directory itself —
+                # the directory IS the mountpoint and cannot be
+                # removed without unmounting. Leaving the directory in
+                # place with nothing inside it is exactly what
+                # initialize-insecure expects.
+                find "${DATADIR}" -mindepth 1 -maxdepth 1 \
+                    -exec rm -rf {} +
+                # Make sure the empty datadir is owned by the mysql
+                # user so the entrypoint's initialize-insecure can
+                # write into it. Belt-and-braces: the directory was
+                # already owned by mysql before (the broken init ran
+                # under that uid), but find+rm can leave the mount
+                # point's metadata untouched.
+                chown mysql:mysql "${DATADIR}" 2>/dev/null || true
+            fi
         else
             # Sentinel is missing but users.ibd looks populated — refuse
             # to recover automatically. The operator should investigate
