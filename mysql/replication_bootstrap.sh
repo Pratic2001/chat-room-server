@@ -637,18 +637,42 @@ done
 # with the master path. gosu is in the official image at
 # /usr/local/bin/gosu.
 #
-# --slave-skip-errors=1061 makes the replica tolerate "ER_DUP_KEYNAME
-# Duplicate key name" errors. The chatroom schema defines indexes inline
-# in CREATE TABLE (see mysql/init/01-schema.sql), so this shouldn't fire
-# in normal operation — but it acts as a defensive belt-and-braces for
-# any future out-of-band DDL that adds an index the replica already has.
-# Without this, a single benign DDL drift stops the replica's SQL thread
-# forever, which surfaces in the frontend as 403s / "Failed to load
-# messages" because the read Service round-robins onto a stuck replica
-# whose `room_members` table no longer reflects the master's writes.
-# 1061 is the narrowest skip set that addresses the actual failure mode
-# (and is what every MySQL HA playbook recommends for this scenario);
-# wildcards like "all" or "ddl_exist_errors" would mask real corruption.
+# --slave-skip-errors=1061,1060 makes the replica tolerate two narrow
+# "schema already up-to-date" DDL errors that fire on a dump-loaded
+# replica whose source-of-truth already matches the master's current
+# schema:
+#
+#   1061 ER_DUP_KEYNAME    "Duplicate key name"
+#       Fires when the master's binlog replays a CREATE INDEX (or an
+#       inline KEY clause re-logged from a dump/restore) against a
+#       replica that already has the index from the dump-load. The
+#       chatroom schema defines indexes inline in CREATE TABLE
+#       (see mysql/init/01-schema.sql), so this shouldn't fire in
+#       normal operation — but it acts as a defensive belt-and-braces
+#       for any future out-of-band DDL that adds an index the replica
+#       already has.
+#
+#   1060 ER_DUP_FIELDNAME  "Duplicate column name '%s'"
+#       Fires when the master's binlog replays an ALTER TABLE ... ADD
+#       COLUMN against a replica that already has the column from the
+#       dump-load. The chatroom schema migrations in 01-schema.sql now
+#       use the INFORMATION_SCHEMA.COLUMNS dynamic-SQL guard (plain
+#       `ADD COLUMN IF NOT EXISTS` is rejected by stock MySQL 8.0.x —
+#       see the schema file for the rationale), so fresh masters won't
+#       re-log these ALTERs. But binlog events generated before the
+#       guard was introduced are still in the master's binlog and get
+#       replayed on every fresh replica dump-load. Without 1060 here,
+#       the replica's SQL thread stops on the first such ALTER
+#       (`Worker 1 failed executing transaction ... Error 'Duplicate
+#       column name 'mentions'' ...`), which surfaces in the frontend
+#       as 403s / "Failed to load messages" when a read round-robins
+#       onto a stuck replica whose tables no longer match the master's.
+#
+# Without these, a single benign schema-drift DDL stops the replica's
+# SQL thread forever. 1060,1061 is the narrowest skip set that covers
+# both known failure modes (and is what every MySQL HA playbook
+# recommends for this scenario); wildcards like "all" or
+# "ddl_exist_errors" would mask real corruption.
 log "Starting mysqld in foreground (replica mode)..."
 exec /usr/local/bin/gosu mysql mysqld \
     --server-id="${SERVER_ID}" \
@@ -658,7 +682,7 @@ exec /usr/local/bin/gosu mysql mysqld \
     --binlog-format=ROW \
     --read-only=ON \
     --super-read-only=ON \
-    --slave-skip-errors=1061 \
+    --slave-skip-errors=1061,1060 \
     --socket=/var/run/mysqld/mysqld.sock \
     --pid-file=/var/run/mysqld/mysqld.pid \
     --init-file=/tmp/replica-bootstrap-init.sql \
