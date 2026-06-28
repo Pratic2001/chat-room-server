@@ -7,6 +7,7 @@ from app.routers.auth import get_current_user
 from app.ws_manager import manager
 from typing import List
 from html import escape
+import json
 
 router = APIRouter()
 
@@ -34,7 +35,7 @@ def get_my_rooms(db: Session = Depends(get_read_db), current_user: models.User =
     return rooms
 
 @router.post("/{room_id}/join", response_model=schemas.RoomResponse)
-def join_room(
+async def join_room(
     room_id: int,
     body: schemas.RoomJoin,
     db: Session = Depends(get_db),
@@ -51,11 +52,25 @@ def join_room(
     )
     if not success:
         raise HTTPException(status_code=400, detail="Invalid secret phrase or room not found")
+    # Notify every connected client (including the joiner) so the
+    # members popover and the mention autocomplete refresh in real
+    # time. Without this broadcast the existing clients would only
+    # learn about the new joiner via a page refresh — the same
+    # `member_change` envelope that the leave/kick/ban paths emit,
+    # so the frontend handler is uniform. Fire-and-forget: a fan-out
+    # blip shouldn't fail the join request that already succeeded.
+    await manager.broadcast(json.dumps({
+        "type": "member_change",
+        "room_id": room_id,
+        "user_id": current_user.id,
+        "username": current_user.username,
+        "change": "joined",
+    }), room_id)
     room = crud.get_room_by_id(db, room_id)
     return room
 
 @router.post("/join-by-name", response_model=schemas.RoomResponse)
-def join_room_by_name(
+async def join_room_by_name(
     body: schemas.RoomJoinByName,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
@@ -79,6 +94,15 @@ def join_room_by_name(
     )
     if not success:
         raise HTTPException(status_code=400, detail="Invalid secret phrase")
+    # Same member_change broadcast as /rooms/{id}/join so existing
+    # clients see the new joiner without a page refresh.
+    await manager.broadcast(json.dumps({
+        "type": "member_change",
+        "room_id": room.id,
+        "user_id": current_user.id,
+        "username": current_user.username,
+        "change": "joined",
+    }), room.id)
     return room
 
 
@@ -150,6 +174,19 @@ async def kick_member(
     # not a member" close from the WS endpoint while the membership
     # is still being torn down.
     await manager.disconnect_user(user_id, room_id, code=1000)
+    # Broadcast the kick to everyone still in the room. Sent AFTER
+    # disconnect_user so the kicked user's socket is closed first
+    # and they don't receive their own "you got kicked" envelope
+    # echoed back. Kicked users can rejoin (no ban) — the message is
+    # `change: "kicked"` to match the wire shape the frontend handler
+    # already routes to the right toast wording.
+    await manager.broadcast(json.dumps({
+        "type": "member_change",
+        "room_id": room_id,
+        "user_id": user_id,
+        "username": target.username,
+        "change": "kicked",
+    }), room_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -178,6 +215,17 @@ async def ban_member(
     ban = crud.ban_user(db, room_id, body.user_id, banned_by=current_user.id, reason=body.reason)
     # Close the target's WS so they stop receiving messages immediately.
     await manager.disconnect_user(body.user_id, room_id, code=1000)
+    # Broadcast the ban so every remaining client updates its member
+    # list without a page refresh. Distinct change value from
+    # "kicked" so the frontend can word the toast appropriately
+    # ("alice was banned" vs "alice was kicked").
+    await manager.broadcast(json.dumps({
+        "type": "member_change",
+        "room_id": room_id,
+        "user_id": body.user_id,
+        "username": target.username,
+        "change": "banned",
+    }), room_id)
     return schemas.BanOut(
         id=ban.id,
         room_id=ban.room_id,

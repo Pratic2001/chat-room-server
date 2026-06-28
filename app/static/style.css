@@ -546,12 +546,25 @@ textarea {
 .bubble {
     padding: 8px 12px;
     border-radius: 14px;
+    /* pre-wrap preserves newlines, tabs, and consecutive spaces —
+     * AI replies often come back as bullet/numbered lists or indented
+     * code blocks, and the previous `normal` whitespace collapsed
+     * those into a single run-on sentence. word-wrap + overflow-wrap
+     * still break very long unbroken tokens so the bubble doesn't
+     * overflow horizontally. */
+    white-space: pre-wrap;
     word-wrap: break-word;
     overflow-wrap: anywhere;
     font-size: 14px;
     line-height: 1.4;
     box-shadow: var(--shadow-sm);
 }
+.bubble a {
+    color: var(--accent, #4f6df5);
+    text-decoration: underline;
+    word-break: break-all;
+}
+.bubble a:hover { text-decoration: none; }
 .message.sent .bubble {
     background: var(--sent);
     color: var(--sent-text);
@@ -632,9 +645,30 @@ textarea {
 .composer-input {
     flex: 1;
     padding: 10px 14px;
-    border-radius: 999px;
+    /* Pill radius looked good when the composer was single-line; on
+     * a multi-line textarea the leftmost curve eats into the first
+     * glyph and the rightmost curve pinches long lines. 18px keeps
+     * the rounded-pill feel for the empty/single-line state but
+     * reads as a normal rounded rectangle once the box grows. */
+    border-radius: 18px;
     border: 1px solid var(--border);
     background: var(--surface-2);
+    /* The composer was an <input type="text"> (single-line) and is
+     * now a <textarea> for Shift+Enter newlines. We need to hide the
+     * native resize handle (script.js owns sizing via scrollHeight)
+     * and stop the box from showing a scrollbar as it grows. The
+     * JS sets `height` to `scrollHeight` after each input, so the
+     * user never sees overflow. max-height is enforced via the same
+     * scrollHeight clamp in JS — clamping here too would create a
+     * visible hard cap the user could run into mid-typing. */
+    resize: none;
+    overflow: hidden;
+    font-family: inherit;
+    line-height: 1.4;
+    /* Single-line cap visually matches the old <input> feel; the
+     * textarea grows from this baseline on Shift+Enter / paste. */
+    min-height: 42px;
+    max-height: 200px;
 }
 .composer-input:focus {
     background: var(--surface);

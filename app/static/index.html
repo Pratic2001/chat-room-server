@@ -89,7 +89,12 @@
                         </div>
                         <button type="button" id="attach-preview-clear" class="btn btn-ghost btn-sm attach-preview-clear" aria-label="Remove attachment">×</button>
                     </div>
-                    <input type="text" id="message-input" class="composer-input" placeholder="Type a message" maxlength="4000" disabled aria-describedby="composer-hint">
+                    <!-- Multi-line composer: textarea so Shift+Enter inserts
+                         a newline (single-line <input> would drop it). JS
+                         auto-resizes via scrollHeight so the box grows up
+                         to ~6 rows and shrinks back on clear/send. Enter
+                         still submits; Shift+Enter falls through. -->
+                    <textarea id="message-input" class="composer-input" placeholder="Type a message" rows="1" maxlength="4000" disabled aria-describedby="composer-hint"></textarea>
                     <span id="composer-hint" class="composer-hint" hidden>💡 Type <code>@assistant</code> to ask the AI bot (add <code>/search</code> for web context)</span>
                     <button type="submit" id="send-btn" class="btn btn-primary" disabled>Send</button>
                 </form>

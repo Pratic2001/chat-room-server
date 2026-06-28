@@ -195,6 +195,17 @@ async def create_message(
         )
     await manager.broadcast(ws_msg.model_dump_json(), room_id)
 
+    # Sending via REST also ends typing. Broadcast a stop_typing for
+    # the sender so every other client (including the sender's other
+    # tabs on the same room) clears the indicator immediately instead
+    # of waiting for the 6s TTL. Mirrors the WS path in
+    # `app/routers/chats.py`.
+    await manager.broadcast(json.dumps({
+        "type": "stop_typing",
+        "user_id": current_user.id,
+        "username": current_user.username,
+    }), room_id)
+
     # AI trigger: fire-and-forget. Runs in the background so the HTTP
     # response is not delayed by Ollama latency. The task opens its own
     # DB session (see app/ai.py) so the request-scoped session is not

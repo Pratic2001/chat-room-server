@@ -546,6 +546,13 @@ class ChatApp {
         const input = document.getElementById('message-input');
         input.addEventListener('input', () => this._onComposerInput());
         input.addEventListener('keydown', (e) => this._onComposerKeyDown(e));
+        // Paste also fires `input` on textareas, so we don't need a
+        // separate paste listener — the input handler already triggers
+        // auto-resize + typing emissions. Reset the textarea size once
+        // on mount so a freshly-enabled composer starts at the
+        // min-height (browser default for textarea is 2 rows which
+        // looks off vs. the old <input> baseline).
+        this._autoResizeComposer();
         // Close the mention popover when the composer loses focus.
         input.addEventListener('blur', () => {
             // Slight delay so a mousedown on a popover item can fire
@@ -977,6 +984,9 @@ class ChatApp {
         document.getElementById('current-room-sub').textContent = 'Choose a room from the sidebar, or create a new one.';
         document.getElementById('message-input').disabled = true;
         document.getElementById('message-input').value = '';
+        // Collapse the textarea so the next room starts at the
+        // baseline (in case the previous room had a multi-line draft).
+        this._autoResizeComposer();
         // Drop the AI hint — the next room may not have AI enabled.
         this._setAiHint(false);
         document.getElementById('send-btn').disabled = true;
@@ -1092,6 +1102,17 @@ class ChatApp {
                     this._handleTypingEnvelope(msg);
                     return;
                 }
+                // Membership change envelopes — broadcast by the
+                // routers on join / leave / kick / ban. We refresh
+                // the cached members list (which also re-evaluates
+                // the mention autocomplete via `_updateMentionPopover`
+                // at the tail of `_loadMembers`) and surface a small
+                // toast so the user notices without opening the
+                // Members popover.
+                if (msg.type === 'member_change') {
+                    this._handleMemberChange(msg);
+                    return;
+                }
                 // AI streaming envelopes. The placeholder bubble is
                 // keyed by `msg.id` (the request_id we generated on
                 // the originating pod); ai_chunk appends, ai_end
@@ -1186,6 +1207,10 @@ class ChatApp {
             const sent = await res.json().catch(() => null);
             if (sent) this._renderMessage(sent);
             input.value = '';
+            // The textarea was at some height from the sent message;
+            // collapse it back to the min-height baseline so the next
+            // message starts fresh.
+            this._autoResizeComposer();
             document.getElementById('send-btn').disabled = true;
             // Clear the stage AFTER the render so the user sees their
             // message appear with the preview intact.
@@ -1616,6 +1641,12 @@ class ChatApp {
         const hasFile = !!this.pendingFile;
         sendBtn.disabled = !(hasText || hasFile);
 
+        // Resize the composer to fit its current content. Done on
+        // every input (which also fires on paste, autocorrect
+        // reflows, and programmatic value changes) so the box never
+        // shows a stale height.
+        this._autoResizeComposer();
+
         // Emit typing presence. Skip when the composer is empty (no
         // point broadcasting "is typing" with no content) and when
         // the WS is closed. Throttled server-side at the router; the
@@ -1631,6 +1662,33 @@ class ChatApp {
         // whitespace (or the start of the input) and check that the
         // cursor sits somewhere in `[start, end)` of that token.
         this._updateMentionPopover();
+    }
+
+    // Size the composer textarea to its content. Sets `height` to
+    // scrollHeight so the box grows as the user types (Shift+Enter,
+    // paste, multi-line messages) and shrinks back when cleared.
+    // Capped to the CSS `max-height` (200px ≈ 6 lines at 1.4 line
+    // height); past that the box stops growing and the user can
+    // keep typing — scroll is internal because `overflow: hidden`
+    // is set in CSS, so we scroll the textarea itself to keep the
+    // caret visible.
+    _autoResizeComposer() {
+        const input = document.getElementById('message-input');
+        if (!input) return;
+        // Reset first so `scrollHeight` reflects the natural content
+        // height, not the previous (potentially clamped) height. If
+        // we skipped this, a long message that already hit the cap
+        // would report a clipped scrollHeight and never grow past
+        // it on subsequent edits.
+        input.style.height = 'auto';
+        const max = parseInt(getComputedStyle(input).maxHeight, 10) || 200;
+        const next = Math.min(input.scrollHeight, max);
+        input.style.height = `${next}px`;
+        // Once at cap, scroll the textarea so the caret stays
+        // visible. Without this the user types into a hidden line.
+        if (input.scrollHeight > max) {
+            input.scrollTop = input.scrollHeight;
+        }
     }
 
     // ---------- Typing emission ----------
@@ -1758,6 +1816,47 @@ class ChatApp {
             this._typingEl.hidden = true;
             this._typingEl.innerHTML = '';
         }
+    }
+
+    // ---------- Member change envelope handling ----------
+
+    _handleMemberChange(env) {
+        // Ignore envelopes for a different room (a stale WS message
+        // from a previous room — defensive; the server scopes every
+        // envelope to the room's WS, but a multi-tab client could
+        // theoretically have an old socket still receiving).
+        if (!this.currentRoomId || env.room_id !== this.currentRoomId) return;
+        // Don't react to our own leave/kick — we already tore down
+        // local state in `_leaveRoom` and `_handleUnauthorized`, and
+        // an extra toast on top would be confusing.
+        const isSelf = this.user && env.user_id === this.user.id;
+        // Refetch the canonical member list. We don't splice into
+        // `this.members` because is_ai / is_owner / ordering all
+        // come from the server and would drift if we tried to keep
+        // the local copy in sync.
+        this._loadMembers(this.currentRoomId);
+        // Suppress the typing indicator for this user — they just
+        // left so any in-flight "X is typing" must clear.
+        this._typingUsers.delete(env.user_id);
+        this._renderTypingIndicator();
+        // Don't toast our own transitions — we're already on the
+        // screen watching the action, and the join/leave/kick/ban
+        // is the user's own act.
+        if (isSelf) return;
+        // Wording per change value. `assistant` is the AI user; we
+        // never expect to see them join/leave (they're a permanent
+        // member of every AI-enabled room) but the wording falls
+        // through cleanly if it ever does happen.
+        const who = env.username || 'Someone';
+        let text;
+        switch (env.change) {
+            case 'joined': text = `${who} joined`; break;
+            case 'left':   text = `${who} left`; break;
+            case 'kicked': text = `${who} was kicked`; break;
+            case 'banned': text = `${who} was banned`; break;
+            default:       text = `${who}: ${env.change}`;
+        }
+        this._toast(text);
     }
 
     // ---------- AI streaming envelope handling ----------
@@ -2020,6 +2119,20 @@ class ChatApp {
         this._onComposerInput();
     }
 
+    _insertMention(username) {
+        const input = document.getElementById('message-input');
+        if (!input) return;
+        const insertion = `@${username} `;
+        const caret = input.selectionStart;
+        const before = input.value.substring(0, caret);
+        const after = input.value.substring(caret);
+        input.value = before + insertion + after;
+        const newCaret = (before + insertion).length;
+        input.setSelectionRange(newCaret, newCaret);
+        input.focus();
+        this._onComposerInput();
+    }
+
     _closeMentionPopover() {
         const pop = document.getElementById('mention-popover');
         if (pop) pop.hidden = true;
@@ -2166,10 +2279,12 @@ class ChatApp {
         for (const m of text.matchAll(re)) {
             const idx = m.index;
             const username = m[1];
-            // Plain text before the mention (textContent is the
-            // safe path — never innerHTML).
+            // Plain text before the mention. The plain-text segment
+            // is itself scanned for http(s) URLs so the AI's bare
+            // links become clickable without us parsing the whole
+            // bubble twice.
             if (idx > cursor) {
-                parent.appendChild(document.createTextNode(text.substring(cursor, idx)));
+                this._appendTextWithLinks(parent, text.substring(cursor, idx));
             }
             const lower = username.toLowerCase();
             if (knownLower.has(lower)) {
@@ -2188,6 +2303,56 @@ class ChatApp {
                 parent.appendChild(document.createTextNode(m[0]));
             }
             cursor = idx + m[0].length;
+        }
+        if (cursor < text.length) {
+            this._appendTextWithLinks(parent, text.substring(cursor));
+        }
+    }
+
+    // Append `text` to `parent`, splitting on http(s)://... URLs so
+    // each match becomes a clickable <a target="_blank">. Used by
+    // _appendTextWithMentions for the plain-text segments between
+    // mentions — we never reach this path from a mention token, so
+    // there's no risk of eating the `@user` part of an `@example.com`
+    // URL (the mention regex already grabbed it).
+    //
+    // Trailing-punctuation tradeoff: a URL body uses `[^\s<>]+` so
+    // the link ends at whitespace or angle brackets. A common case
+    // is "see https://example.com." — the `.` ends up inside the
+    // href and the link goes to "https://example.com." (404 in
+    // practice). Stripping the trailing `.` cleanly requires either
+    // excluding it from the URL body class (which breaks every URL
+    // at the first domain dot — much worse) or a two-pass scan with
+    // a domain-shape check (overkill). We accept the rare trailing-
+    // punctuation artifact; the user can still copy the URL out of
+    // the bubble if they need the canonical form.
+    _appendTextWithLinks(parent, text) {
+        if (!text) return;
+        // `\b` doesn't behave usefully around `:` and `/`, so we use
+        // an explicit char class. The leading char must be a
+        // non-word boundary (BOL, whitespace, or open paren/bracket)
+        // so we don't grab the `://` from inside something like
+        // `foo://bar`. The body runs to the next whitespace, `<`,
+        // or `>` — those are unambiguous URL terminators.
+        const re = /(^|[\s(\[])(https?:\/\/[^\s<>]+)/g;
+        let cursor = 0;
+        for (const m of text.matchAll(re)) {
+            const leadIdx = m.index;
+            const leadLen = m[1].length;
+            const url = m[2];
+            // Plain text before the URL (covers the leading
+            // separator plus any text before it).
+            const urlStart = leadIdx + leadLen;
+            if (urlStart > cursor) {
+                parent.appendChild(document.createTextNode(text.substring(cursor, urlStart)));
+            }
+            const a = document.createElement('a');
+            a.href = url;
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.textContent = url;
+            parent.appendChild(a);
+            cursor = urlStart + url.length;
         }
         if (cursor < text.length) {
             parent.appendChild(document.createTextNode(text.substring(cursor)));

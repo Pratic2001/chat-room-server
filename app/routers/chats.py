@@ -258,6 +258,20 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
                     )
                 await manager.broadcast(ws_msg.model_dump_json(), room_id)
 
+                # Sending a message implicitly ends typing. Broadcast
+                # a stop_typing for the sender so every other client
+                # clears its indicator immediately rather than
+                # waiting for the 6s server-side TTL. The sender's
+                # own client ignores their own typing envelopes
+                # (script.js::_handleTypingEnvelope drops anything
+                # where env.user_id === this.user.id), so the echo
+                # is harmless.
+                await manager.broadcast(json.dumps({
+                    "type": "stop_typing",
+                    "user_id": user.id,
+                    "username": user.username,
+                }), room_id)
+
                 # AI trigger: fire-and-forget. Runs in the background so
                 # the WS receive loop is never blocked by Ollama latency.
                 # The task opens its own DB session (see app/ai.py) so
@@ -297,17 +311,50 @@ async def websocket_endpoint(websocket: WebSocket, room_id: int, db: Session = D
         tasks = websocket.scope.get("typing_tasks") or set()
         for t in tasks:
             t.cancel()
-        if websocket.scope.get("user_id") is not None:
+        user_id = websocket.scope.get("user_id")
+        if user_id is not None:
             try:
                 await manager.broadcast(json.dumps({
                     "type": "stop_typing",
-                    "user_id": websocket.scope["user_id"],
+                    "user_id": user_id,
                     "username": user.username,
                 }), room_id)
             except Exception:
                 # Best-effort — the broadcast path may already be torn
                 # down if the manager itself raised during disconnect.
                 pass
+            # Broadcast a member_change "left" so the remaining
+            # clients update their members list in real time. We
+            # de-dupe against kick/ban: the moderation paths in
+            # `app/routers/rooms.py` close the socket via
+            # `manager.disconnect_user` AFTER removing the membership
+            # row, so by the time this finally block runs the user
+            # is no longer a member and we must NOT emit "left" —
+            # the kick/ban broadcast has already done so with the
+            # right change value. A "natural" leave (tab close,
+            # network drop, explicit Leave) leaves the membership
+            # row intact, so the check below distinguishes the two.
+            try:
+                still_member = db.query(models.RoomMember).filter(
+                    models.RoomMember.room_id == room_id,
+                    models.RoomMember.user_id == user_id,
+                ).first() is not None
+            except Exception:
+                # DB session may already be closed on this request
+                # path; skip the broadcast rather than risk a 500
+                # swallowing the disconnect cleanup.
+                still_member = False
+            if still_member and user.username != crud.AI_USERNAME:
+                try:
+                    await manager.broadcast(json.dumps({
+                        "type": "member_change",
+                        "room_id": room_id,
+                        "user_id": user_id,
+                        "username": user.username,
+                        "change": "left",
+                    }), room_id)
+                except Exception:
+                    pass
 
 
 async def _typing_ttl(room_id: int, user_id: int, username: str, seq: int, websocket: WebSocket):
