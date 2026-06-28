@@ -1342,6 +1342,12 @@ class ChatApp {
             // kick/ban buttons at all.
             const owner = this.members.find((m) => m.is_owner);
             this.currentRoomOwnerId = owner ? owner.user_id : null;
+            // Members may have arrived AFTER the user already started
+            // typing in the composer (e.g. they hit `@` while the
+            // fetch was still in flight). Re-run the popover so the
+            // autocomplete isn't stuck in its empty "no members yet"
+            // state.
+            this._updateMentionPopover();
         } catch (err) {
             this._toast(err.message, true);
             this.members = [];
@@ -1923,10 +1929,12 @@ class ChatApp {
         }
         // Build the candidate list from cached members. Don't show
         // the caller themselves in the autocomplete (no point
-        // tagging yourself).
+        // tagging yourself). The room's AI assistant is included —
+        // it's the primary way to invoke it from the composer; the
+        // bot trigger on the server side uses the same regex the
+        // server's mention extractor does.
         const callerName = this.user && this.user.username ? this.user.username.toLowerCase() : null;
         const candidates = (this.members || [])
-            .filter((m) => !m.is_ai)  // AI has its own hint + trigger; not in the autocomplete
             .filter((m) => !callerName || m.username.toLowerCase() !== callerName)
             .filter((m) => m.username.toLowerCase().startsWith(query))
             .slice(0, 8);
@@ -1944,10 +1952,22 @@ class ChatApp {
         for (let i = 0; i < this._mentionState.candidates.length; i++) {
             const m = this._mentionState.candidates[i];
             const item = document.createElement('div');
-            item.className = 'mention-popover-item' + (i === this._mentionState.activeIndex ? ' active' : '');
+            item.className = 'mention-popover-item' + (i === this._mentionState.activeIndex ? ' active' : '') + (m.is_ai ? ' mention-popover-item-ai' : '');
             item.setAttribute('role', 'option');
             item.dataset.index = String(i);
-            item.textContent = `@${m.username}`;
+            // The AI entry gets a 🤖 prefix and an "AI" badge so it
+            // stands out from human members — same convention as the
+            // Members popover.
+            const name = document.createElement('span');
+            name.className = 'mention-popover-name';
+            name.textContent = m.is_ai ? `🤖 @${m.username}` : `@${m.username}`;
+            item.appendChild(name);
+            if (m.is_ai) {
+                const badge = document.createElement('span');
+                badge.className = 'mention-popover-badge';
+                badge.textContent = 'AI';
+                item.appendChild(badge);
+            }
             // mousedown so the click happens before the input's
             // blur handler can close the popover.
             item.addEventListener('mousedown', (e) => {
@@ -2139,9 +2159,13 @@ class ChatApp {
         const knownLower = new Set((known || []).map((u) => String(u).toLowerCase()));
         const isSelf = this.user && senderId != null && senderId === this.user.id;
         let cursor = 0;
+        // String.prototype.matchAll yields plain arrays, not RegExp
+        // match objects — index the capture as m[1], not m.group(1).
+        // m.group(1) would throw `m.group is not a function` the first
+        // time a message body contains an `@`.
         for (const m of text.matchAll(re)) {
             const idx = m.index;
-            const username = m.group(1);
+            const username = m[1];
             // Plain text before the mention (textContent is the
             // safe path — never innerHTML).
             if (idx > cursor) {

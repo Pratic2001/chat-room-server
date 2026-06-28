@@ -966,7 +966,7 @@ textarea {
     min-width: 180px;
     max-height: 220px;
     overflow-y: auto;
-    z-index: 50;
+    z-index: 300;
     padding: 4px;
 }
 .mention-popover-item {
@@ -982,6 +982,25 @@ textarea {
 .mention-popover-item.active,
 .mention-popover-item:hover {
     background: var(--accent-soft, #eef1ff);
+}
+/* Inside each popover item: the username on the left, a small AI
+   badge on the right (mirrors the Members popover). */
+.mention-popover-name {
+    flex: 1 1 auto;
+}
+.mention-popover-badge {
+    flex: 0 0 auto;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    padding: 1px 6px;
+    border-radius: 999px;
+    color: #fff;
+    background: var(--ai-accent, #8b5cf6);
+    text-transform: uppercase;
+}
+.mention-popover-item-ai {
+    border-left: 2px solid var(--ai-accent, #8b5cf6);
 }
 .mention-popover-empty {
     padding: 8px 10px;
