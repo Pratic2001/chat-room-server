@@ -203,12 +203,36 @@ MAIL_USE_TLS=true
 # before the first @assistant mention.
 #
 # OLLAMA_MODEL must be a model you've already pulled. Common choices:
-# llama3.2 (small/fast), llama3.1:8b, mistral, qwen2.5, phi3. The app
-# silently does nothing if Ollama is unreachable, so it's safe to leave
-# these set when the AI feature is unused.
+# llama3.2 (small/fast), llama3.1:8b, mistral, qwen2.5, phi3. For the AI
+# agent's *tool-calling* (web search, news, …) pick a tools-capable model
+# such as qwen3:8b or llama3.3 — llama3.2 still replies but without tools.
+# The app silently does nothing if Ollama is unreachable, so it's safe to
+# leave these set when the AI feature is unused.
 OLLAMA_HOST=http://localhost
 OLLAMA_PORT=11434
 OLLAMA_MODEL=llama3.2
+
+# --- AI agent search providers (web_search / web_news tools) ---------------
+# Used by app/agent_tools.py. The tools try providers in order and always
+# fall back to DuckDuckGo (no key needed), so leaving all three blank keeps
+# DuckDuckGo-only behavior — the default.
+#
+#   BRAVE_API_KEY  — https://brave.com/search/api/  (free tier ~2k queries/
+#                    month). Enables Brave as the primary web + news provider.
+#   GOOGLE_API_KEY — https://developers.google.com/custom-search/v1/overview
+#                    (free tier 100 queries/day).
+#   GOOGLE_CSE_ID  — Programmable Search Engine ID:
+#                    https://programmablesearchengine.google.com/
+#                    GOOGLE_API_KEY and GOOGLE_CSE_ID are both required
+#                    together; they enable Google web search (Google's CSE
+#                    has no news vertical, so web_news never routes there).
+#
+# Provider order: Brave → Google → DuckDuckGo. A provider that errors or
+# returns no results falls through to the next, so a rate-limited or down
+# engine never breaks the search tool.
+BRAVE_API_KEY=
+GOOGLE_API_KEY=
+GOOGLE_CSE_ID=
 ENV_TEMPLATE
 
 # -----------------------------------------------------------------------------

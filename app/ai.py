@@ -1,29 +1,48 @@
-"""AI assistant that replies when a user mentions @assistant in a text
-message. Backed by Ollama (configurable via OLLAMA_HOST / OLLAMA_PORT /
-OLLAMA_MODEL); can call DuckDuckGo for /search-triggered queries.
+"""AI assistant for the chat room: a tool-calling agent backed by Ollama.
+
+When a user mentions @assistant in a text message, a background task builds
+a conversation (persona system prompt + recent history + the current ask)
+and calls Ollama. If the configured model supports native function calling
+(detected via Ollama's `/api/show`), the assistant runs as a **proper agent**:
+it can decide to call tools — `web_search`, `web_news`, `room_users`,
+`current_time`, `calculate` (see app/agent_tools.py) — the server executes
+them and feeds the results back, looping until the model produces a final
+answer. If the model does NOT support tools (e.g. the default `llama3.2`),
+it falls back to the legacy single-shot streaming reply, so nothing breaks
+until a tools-capable model is configured.
 
 Key design decisions
 ---------------------
 - Fire-and-forget: the routers call `asyncio.create_task(stream_reply(...))`
-  and return immediately. The AI's HTTP call to Ollama runs on a background
-  task and does NOT block the WebSocket receive loop.
-- Streaming: `stream_reply` opens an `ndjson` stream to Ollama and emits
-  `ai_start` / `ai_chunk` / `ai_end` envelopes over the WebSocket as
-  tokens arrive, so the UI can render progressively. A final persisted
-  `WSMessage` is broadcast at the end so non-streaming clients still see
-  the bubble.
+  and return immediately. The AI's HTTP calls to Ollama run on a background
+  task and do NOT block the WebSocket receive loop.
+- Two paths, one UX:
+  - Agent path (model supports tools): a non-streaming tool-use loop. Each
+    tool execution broadcasts an `ai_tool` envelope so the client can show
+    "🔍 searching the web…" progress. The final answer is then replayed
+    through the same coalesced `ai_chunk` stream as the legacy path, so the
+    typewriter effect is identical either way.
+  - Legacy path (no tools): a single streaming `/api/chat` call, exactly as
+    before this change.
+- Streaming: `stream_reply` emits `ai_start` / `ai_tool` / `ai_chunk` /
+  `ai_end` envelopes over the WebSocket as work progresses. A final persisted
+  `WSMessage` is broadcast at the end so non-streaming clients still see the
+  bubble.
 - Loop prevention: triggering_user_id is checked against the AI user's id
   at the top. AI messages are never reprocessed.
 - Empty-reply filter: if Ollama returns an empty content string (or only
-  whitespace), we skip the persist+broadcast step — no empty bubbles
-  in the chat.
-- Failure UX: when the stream errors before producing content we broadcast
-  an `ai_error` envelope with a human-readable reason. The client renders
-  a dedicated error bubble with a retry affordance.
+  whitespace) — or the tool loop exhausts its iteration budget — we skip the
+  persist+broadcast step. No empty bubbles.
+- Failure UX: on error we broadcast an `ai_error` envelope with a
+  human-readable reason. The client renders a dedicated error bubble with a
+  retry affordance.
 - Context window: only the last 30 messages are sent to Ollama, ordered
   oldest → newest. Binary messages (image/file/video) are summarized as
   "[User X sent an image: filename.jpg]" rather than including the bytes.
-- Mention regex: \\b@assistant\\b case-insensitive (Python's re.IGNORECASE).
+  History is role-aware: user text → `role:"user"`, AI text →
+  `role:"assistant"`, so the model sees who said what.
+- Mention regex: a lookbehind/lookahead `(?<![\\w])@assistant(?![\\w])`
+  case-insensitive, so `admin@assistant.com` does NOT trigger.
 - Room disable: rooms with ai_enabled=False skip the trigger entirely.
 - Crash isolation: the entire body of `stream_reply` is wrapped in a
   try/except that logs and swallows. A failed AI reply must never take
@@ -31,14 +50,16 @@ Key design decisions
 """
 
 import asyncio
-import logging
 import json
+import logging
 import re
+import time
 from typing import Optional
 
 import httpx
 
 from app import crud, schemas
+from app.agent_tools import TOOLS, run_tool, tool_label, tool_result_count
 from app.crud import AI_USERNAME
 from app.database import (
     OLLAMA_HOST,
@@ -149,52 +170,7 @@ def _system_prompt_for(persona: str | None) -> str:
     return PERSONA_PROMPTS["Professional"]
 
 
-# ---------- Web search (optional) ----------
-
-# /search at the start of a message (or after @assistant) triggers a
-# DuckDuckGo search; the LLM gets the snippets as additional context.
-# This is the v1 explicit-keyword path. Future work could add native
-# tool calling; for now we keep the model-agnostic surface tiny.
-# Same boundary gotcha as _MENTION_RE: `\b` doesn't behave intuitively
-# around `/` (a non-word char). Use explicit lookbehind/lookahead so we
-# only match `/search` as a whole token, not a substring of `my-url/search`.
-_SEARCH_RE = re.compile(r"(?<![\w])/search(?![\w])", re.IGNORECASE)
-
-
-def _maybe_run_search(query: str) -> str:
-    """Run DuckDuckGo for `query` and return a short snippet block.
-    Returns "" on any failure so the chat continues even if the search
-    library isn't installed or the network is down.
-    """
-    # Lazy import so missing duckduckgo-search doesn't break the import
-    # of this module (which would take down the whole app).
-    try:
-        from duckduckgo_search import DDGS
-    except ImportError:
-        log.warning("duckduckgo-search not installed; skipping /search.")
-        return ""
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=5))
-    except Exception as e:
-        # DuckDuckGo occasionally rate-limits or returns unexpected HTML;
-        # treat any exception as a no-result rather than failing the reply.
-        log.warning("DuckDuckGo search failed: %s", e)
-        return ""
-    if not results:
-        return ""
-    parts = ["Search results for: " + query, ""]
-    for r in results:
-        title = r.get("title") or ""
-        href = r.get("href") or r.get("url") or ""
-        body = r.get("body") or r.get("snippet") or ""
-        parts.append(f"- {title} ({href})")
-        if body:
-            parts.append(f"  {body}")
-    return "\n".join(parts)
-
-
-# ---------- Ollama call ----------
+# ---------- Ollama calls ----------
 
 def _ollama_url() -> str:
     """Build the Ollama API base URL.
@@ -213,15 +189,59 @@ def _ollama_url() -> str:
     return f"{host}:{port}"
 
 
-async def _call_ollama(messages: list[dict], timeout_s: float = 60.0) -> str:
-    """POST a chat request to Ollama and return the assistant content.
+# How long (seconds) we trust a cached tool-capability answer before asking
+# Ollama `/api/show` again. Long enough that a request per reply is never
+# needed; short enough that switching OLLAMA_MODEL takes effect quickly.
+TOOLS_CAPABILITY_TTL_S = 600.0
 
-    Returns "" on any error (timeout, non-2xx, malformed JSON, empty
-    content) so the caller can treat it as "no reply".
+# Cached result of `_model_supports_tools()`. Separate sentinel from a real
+# False so we can tell "never checked" from "checked, no tools".
+_TOOLS_SUPPORT_CACHE: Optional[bool] = None
+_TOOLS_SUPPORT_AT: float = 0.0
 
-    Retained as the non-streaming fallback used by callers that need
-    a single-shot reply (none today; left in place for tests and any
-    future caller that wants a simple synchronous response).
+
+async def _model_supports_tools() -> bool:
+    """True iff the configured Ollama model advertises tool-calling.
+
+    Asks Ollama's `/api/show` for the model's `capabilities` list and caches
+    the answer for TOOLS_CAPABILITY_TTL_S. Any failure (network, 404 for an
+    unpulled model, malformed JSON) resolves to False so we fall back to the
+    legacy single-shot path rather than erroring.
+    """
+    global _TOOLS_SUPPORT_CACHE, _TOOLS_SUPPORT_AT
+    now = time.monotonic()
+    if _TOOLS_SUPPORT_CACHE is not None and (now - _TOOLS_SUPPORT_AT) < TOOLS_CAPABILITY_TTL_S:
+        return _TOOLS_SUPPORT_CACHE
+
+    supports = False
+    try:
+        url = f"{_ollama_url()}/api/show"
+        payload = {"model": OLLAMA_MODEL or "llama3.2"}
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(url, json=payload)
+        if r.status_code == 200:
+            caps = r.json().get("capabilities") or []
+            supports = "tools" in caps
+        else:
+            log.warning("Ollama /api/show returned HTTP %s; assuming no tools.", r.status_code)
+    except Exception as e:
+        log.warning("Ollama /api/show failed (%s); assuming no tools.", e)
+
+    _TOOLS_SUPPORT_CACHE = supports
+    _TOOLS_SUPPORT_AT = time.monotonic()
+    return supports
+
+
+async def _chat_ollama(
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    timeout_s: float = 120.0,
+) -> dict:
+    """Non-streaming Ollama chat. Returns the full `message` dict.
+
+    Returns `{"content": str, "tool_calls": list}`. On any failure (timeout,
+    non-2xx, malformed JSON) it returns an all-empty placeholder so the agent
+    loop can decide what to do instead of raising.
     """
     url = f"{_ollama_url()}/api/chat"
     payload = {
@@ -229,22 +249,27 @@ async def _call_ollama(messages: list[dict], timeout_s: float = 60.0) -> str:
         "messages": messages,
         "stream": False,
     }
+    if tools:
+        payload["tools"] = tools
     try:
         async with httpx.AsyncClient(timeout=timeout_s) as client:
             r = await client.post(url, json=payload)
     except Exception as e:
-        log.warning("Ollama POST failed: %s", e)
-        return ""
+        log.warning("Ollama chat POST failed: %s", e)
+        return {"content": "", "tool_calls": []}
     if r.status_code != 200:
-        log.warning("Ollama returned HTTP %s: %s", r.status_code, r.text[:200])
-        return ""
+        log.warning("Ollama chat returned HTTP %s: %s", r.status_code, r.text[:200])
+        return {"content": "", "tool_calls": []}
     try:
         body = r.json()
-        content = (body.get("message") or {}).get("content") or ""
     except Exception as e:
-        log.warning("Ollama response JSON parse failed: %s", e)
-        return ""
-    return content.strip()
+        log.warning("Ollama chat JSON parse failed: %s", e)
+        return {"content": "", "tool_calls": []}
+    msg = body.get("message") or {}
+    return {
+        "content": (msg.get("content") or "").strip(),
+        "tool_calls": msg.get("tool_calls") or [],
+    }
 
 
 async def _stream_ollama(messages: list[dict], timeout_s: float = 90.0):
@@ -259,6 +284,8 @@ async def _stream_ollama(messages: list[dict], timeout_s: float = 90.0):
     logged but do NOT raise: the iterator simply ends. The caller
     decides what "empty stream" means (broadcast ai_error vs ai_end
     with empty content).
+
+    Used only by the legacy fallback path (models without tool support).
     """
     url = f"{_ollama_url()}/api/chat"
     payload = {
@@ -321,12 +348,17 @@ CONTEXT_WINDOW = 30
 
 
 def _build_history(db, room_id: int) -> list[dict]:
-    """Read the last CONTEXT_WINDOW messages for `room_id` and turn
-    them into an Ollama-compatible chat history.
+    """Read the last CONTEXT_WINDOW messages for `room_id` and turn them
+    into an Ollama-compatible, role-aware chat history.
 
-    Binary messages (image/file/video) become a single-line note so the
-    model knows a non-text happened without receiving bytes it can't
-    render. Text messages keep their content.
+    - human text messages → `role:"user"` with a `"username: content"`
+      prefix so the model knows who's speaking;
+    - the AI's own text messages → `role:"assistant"` (this is important for
+      the tool loop: assistant turns must be labelled as such, not flattened
+      into user turns);
+    - binary messages (image/file/video) → a single-line `role:"user"` note
+      so the model knows a non-text happened without receiving bytes it
+      can't render.
     """
     # crud.get_messages_by_room orders DESC by created_at and applies
     # limit/offset; we reverse for chronological (oldest → newest).
@@ -336,7 +368,10 @@ def _build_history(db, room_id: int) -> list[dict]:
     for m in msgs:
         username = m.user.username if m.user else "unknown"
         if m.message_type == "text":
-            history.append({"role": "user", "content": f"{username}: {m.content or ''}"})
+            if username == AI_USERNAME:
+                history.append({"role": "assistant", "content": m.content or ""})
+            else:
+                history.append({"role": "user", "content": f"{username}: {m.content or ''}"})
         else:
             label = {
                 "image": "sent an image",
@@ -382,29 +417,33 @@ async def stream_reply(
     triggering_text: str,
     request_id: str,
 ) -> None:
-    """Background task: stream an Ollama reply and broadcast progress.
+    """Background task: run the AI assistant and broadcast progress.
 
     Broadcasts the following envelopes to the room over the WebSocket:
 
     - `{"type": "ai_start", "id": request_id, "user_id": ai_user_id,
         "username": "assistant"}` once the room/persona check passes.
+    - `{"type": "ai_tool", "id": request_id, "tool": name,
+        "status": "start"|"done", "label": "...", "query": "..."}` per tool
+        execution on the agent path (progress line in the placeholder bubble).
     - `{"type": "ai_chunk", "id": request_id, "delta": "tok"}` per
-        coalesced chunk (≤16 chars or ≤50ms, whichever first).
-    - `{"type": "ai_end", "id": request_id, "content": "..."}` when
-        the stream finishes successfully, just before the persisted
-        chat message is broadcast.
-    - `{"type": "ai_error", "id": request_id, "reason": "..."}` if
-        the stream fails or produces empty content.
+        coalesced chunk of the final answer (≤16 chars or ≤50ms legacy;
+        fixed-size replay on the agent path).
+    - `{"type": "ai_end", "id": request_id, "content": "..."}` when the
+        reply finishes successfully, just before the persisted chat message
+        is broadcast.
+    - `{"type": "ai_error", "id": request_id, "reason": "..."}` if the
+        reply fails or produces empty content.
 
-    After `ai_end` (only on success), the same MessageCreate +
-    broadcast path used by user messages persists the AI's reply
-    and emits a regular WSMessage envelope so non-streaming clients
-    (or clients that connected mid-stream) still see the bubble.
+    After `ai_end` (only on success), the same MessageCreate + broadcast
+    path used by user messages persists the AI's reply and emits a regular
+    WSMessage envelope so non-streaming clients (or clients that connected
+    mid-stream) still see the bubble.
 
     Designed to be called via `asyncio.create_task` from the routers.
     Opens its own DB session so it outlives the request's session.
-    Catches and logs every exception so the background task never
-    crashes the event loop silently.
+    Catches and logs every exception so the background task never crashes
+    the event loop silently.
     """
     global _AI_USER_ID_CACHE
     try:
@@ -426,36 +465,20 @@ async def stream_reply(
 
             # Strip the @assistant mention before sending to the LLM so
             # it doesn't echo "@assistant: ..." in the response.
-            cleaned = _MENTION_RE.sub("", triggering_text).strip()
-
-            # Optional /search: if the cleaned text contains /search,
-            # run DuckDuckGo once and prepend the snippets to the LLM
-            # context as a system message.
-            search_block = ""
-            if _SEARCH_RE.search(cleaned):
-                query = _SEARCH_RE.sub("", cleaned).strip()
-                if query:
-                    search_block = _maybe_run_search(query)
-
-            history = _build_history(db, room_id)
+            final_user = _MENTION_RE.sub("", triggering_text).strip()
+            # A bare "@assistant" with nothing else leaves an empty user
+            # turn — nudge the model with a neutral prompt instead.
+            if not final_user:
+                final_user = "Hello!"
 
             messages: list[dict] = [
                 {"role": "system", "content": _system_prompt_for(room.ai_persona)},
             ]
-            if search_block:
-                messages.append({"role": "system", "content": search_block})
-            messages.extend(history)
-            # Final user-turn (without the @assistant prefix) so the
-            # model has the explicit ask. If /search stripped the whole
-            # message, fall back to the original text minus the keyword.
-            final_user = cleaned or _SEARCH_RE.sub("", triggering_text).strip()
-            if final_user:
-                messages.append({"role": "user", "content": final_user})
+            messages.extend(_build_history(db, room_id))
+            messages.append({"role": "user", "content": final_user})
 
-            # Announce the bubble opening BEFORE we start consuming
-            # the stream so the client can render a placeholder
-            # immediately. Without this, the user would see nothing
-            # until the first chunk arrived (~hundreds of ms).
+            # Announce the bubble opening BEFORE any model work so the
+            # client can render a placeholder immediately.
             await manager.broadcast(json.dumps({
                 "type": "ai_start",
                 "id": request_id,
@@ -463,45 +486,18 @@ async def stream_reply(
                 "username": AI_USERNAME,
             }), room_id)
 
-            # Coalesce Ollama's natural cadence (dozens of tokens/sec)
-            # into ~50ms / 16-char windows so we don't flood the WS
-            # with one frame per token. Anything below either threshold
-            # buffers; once we cross either, flush and reset.
-            buffer = ""
-            full = ""
-            last_flush = asyncio.get_event_loop().time()
-            async for chunk in _stream_ollama(messages):
-                buffer += chunk
-                full += chunk
-                now = asyncio.get_event_loop().time()
-                if len(buffer) >= 16 or (now - last_flush) >= 0.05:
-                    await manager.broadcast(json.dumps({
-                        "type": "ai_chunk",
-                        "id": request_id,
-                        "delta": buffer,
-                    }), room_id)
-                    buffer = ""
-                    last_flush = now
+            # Decide the path: agent (tools) vs legacy (single-shot stream).
+            if await _model_supports_tools():
+                content = await _run_agent_loop(room_id, request_id, messages, db)
+            else:
+                content = await _run_legacy_stream(room_id, request_id, messages)
 
-            # Flush any tail before signalling end.
-            if buffer:
-                await manager.broadcast(json.dumps({
-                    "type": "ai_chunk",
-                    "id": request_id,
-                    "delta": buffer,
-                }), room_id)
+            if content is None:
+                return  # an ai_error was already broadcast by the path
 
-            content = full.strip()
-            if not content:
-                # Empty / failed reply: tell the client the stream is
-                # done but flag it as an error so the placeholder is
-                # replaced with the error bubble (not left empty).
-                await manager.broadcast(json.dumps({
-                    "type": "ai_error",
-                    "id": request_id,
-                    "reason": "The assistant didn't return a reply. Please try again.",
-                }), room_id)
-                return
+            # Replay the final answer through the coalesced ai_chunk stream
+            # so the client's typewriter effect is identical on both paths.
+            await _broadcast_chunks(room_id, request_id, content)
 
             await manager.broadcast(json.dumps({
                 "type": "ai_end",
@@ -547,3 +543,184 @@ async def stream_reply(
             # If even the error broadcast fails, the user already saw
             # nothing — there's nothing else we can do.
             pass
+
+
+# ---------- The agent (tool-calling) loop ----------
+
+# Cap on consecutive model→tool→model iterations before we give up and
+# report an error. 6 is plenty for a search + follow-up; anything more is
+# almost certainly a model stuck in a loop.
+MAX_TOOL_ITERATIONS = 6
+
+
+async def _run_agent_loop(room_id: int, request_id: str, messages: list[dict], db) -> str | None:
+    """Agent path: iterate model↔tool until a final answer arrives.
+
+    Returns the final content string, or None if the loop failed (an
+    `ai_error` envelope is broadcast by the caller's responsibility here —
+    actually we broadcast it and return None).
+
+    Each model response that contains `tool_calls` triggers one or more
+    `ai_tool` envelopes + `run_tool` executions, with the results appended
+    as `role:"tool"` messages so the model can continue.
+    """
+    for _ in range(MAX_TOOL_ITERATIONS):
+        resp = await _chat_ollama(messages, tools=TOOLS)
+        tool_calls = resp.get("tool_calls") or []
+        content = resp.get("content") or ""
+
+        if not tool_calls:
+            if content:
+                return content
+            # No content and no tool calls — the model produced nothing.
+            await _broadcast_ai_error(
+                room_id, request_id,
+                "The assistant didn't return a reply. Please try again.",
+            )
+            return None
+
+        # The model wants to call tools. Record its turn (content is often
+        # empty here, but some models emit a preamble alongside tool_calls —
+        # keep it so the conversation stays coherent).
+        messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls})
+
+        for call in tool_calls:
+            fn = call.get("function") or {}
+            name = fn.get("name", "")
+            arguments = _parse_tool_arguments(fn.get("arguments"))
+            if not name:
+                messages.append({"role": "tool", "content": json.dumps({"error": "malformed tool call"})})
+                continue
+
+            query = arguments.get("query") if isinstance(arguments, dict) else None
+            await manager.broadcast(json.dumps({
+                "type": "ai_tool",
+                "id": request_id,
+                "tool": name,
+                "status": "start",
+                "label": tool_label(name),
+                "query": query or None,
+            }), room_id)
+
+            result = await run_tool(name, arguments, {"room_id": room_id, "db": db})
+            messages.append({"role": "tool", "content": result})
+
+            # Brief "done" so the client can show ✓ / remove the status line.
+            await manager.broadcast(json.dumps({
+                "type": "ai_tool",
+                "id": request_id,
+                "tool": name,
+                "status": "done",
+                "label": tool_label(name),
+                "query": query or None,
+                "summary": _tool_summary(name, result),
+            }), room_id)
+
+    # Exhausted the iteration budget without a final answer.
+    await _broadcast_ai_error(
+        room_id, request_id,
+        "The assistant couldn't finish the task. Please try again.",
+    )
+    return None
+
+
+def _parse_tool_arguments(raw) -> dict:
+    """Normalize Ollama's `arguments` field to a dict.
+
+    Ollama serializes arguments as a JSON *string*; older/other backends may
+    hand us an object already. Malformed strings become an empty dict (the
+    tool handler then reports a clean error).
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _tool_summary(name: str, result: str) -> str:
+    """Short human summary for the `ai_tool` done envelope."""
+    count = tool_result_count(result)
+    if count is not None:
+        return f"found {count} result{'s' if count != 1 else ''}" if count else "no results"
+    return "done"
+
+
+# ---------- Legacy single-shot path (models without tool support) ----------
+
+async def _run_legacy_stream(room_id: int, request_id: str, messages: list[dict]) -> str | None:
+    """Legacy path: stream one Ollama reply, coalescing into ai_chunk frames.
+
+    Returns the final content, or None if the stream produced nothing (an
+    `ai_error` is broadcast in that case).
+    """
+    buffer = ""
+    full = ""
+    last_flush = asyncio.get_event_loop().time()
+    async for chunk in _stream_ollama(messages):
+        buffer += chunk
+        full += chunk
+        now = asyncio.get_event_loop().time()
+        if len(buffer) >= 16 or (now - last_flush) >= 0.05:
+            await manager.broadcast(json.dumps({
+                "type": "ai_chunk",
+                "id": request_id,
+                "delta": buffer,
+            }), room_id)
+            buffer = ""
+            last_flush = now
+
+    # Flush any tail before signalling end.
+    if buffer:
+        await manager.broadcast(json.dumps({
+            "type": "ai_chunk",
+            "id": request_id,
+            "delta": buffer,
+        }), room_id)
+
+    content = full.strip()
+    if not content:
+        await _broadcast_ai_error(
+            room_id, request_id,
+            "The assistant didn't return a reply. Please try again.",
+        )
+        return None
+    return content
+
+
+# ---------- Shared broadcast helpers ----------
+
+async def _broadcast_chunks(room_id: int, request_id: str, content: str) -> None:
+    """Replay a completed answer through the ai_chunk stream.
+
+    The agent path computes the full answer in one (non-streaming) response,
+    so there are no real tokens to stream — we replay the text in fixed-size
+    frames to keep the client's typewriter effect identical to the legacy
+    path. Frames are small enough to look incremental, big enough to finish
+    quickly.
+    """
+    FRAME = 40  # chars per ai_chunk frame
+    DELAY = 0.02  # seconds between frames
+    for i in range(0, len(content), FRAME):
+        await manager.broadcast(json.dumps({
+            "type": "ai_chunk",
+            "id": request_id,
+            "delta": content[i:i + FRAME],
+        }), room_id)
+        await asyncio.sleep(DELAY)
+
+
+async def _broadcast_ai_error(room_id: int, request_id: str, reason: str) -> None:
+    """Broadcast an `ai_error` envelope, swallowing broadcast failures."""
+    try:
+        await manager.broadcast(json.dumps({
+            "type": "ai_error",
+            "id": request_id,
+            "reason": reason,
+        }), room_id)
+    except Exception:
+        pass

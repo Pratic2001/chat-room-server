@@ -123,7 +123,9 @@ fi
          ./scripts/write_runtime_env.sh --from-stdin
        then paste 10 values (MYSQL_PASSWORD, SECRET_KEY, ROOM_SECRET_KEY,
        REPLICATION_PASSWORD, MAIL_PASSWORD, MAIL_HOST, MAIL_USER, MAIL_PORT,
-       MAIL_FROM, MAIL_USE_TLS), one per line, in that order.
+       MAIL_FROM, MAIL_USE_TLS), one per line, in that order. Three optional
+       lines follow for the AI agent's search providers: BRAVE_API_KEY,
+       GOOGLE_API_KEY, GOOGLE_CSE_ID (blank = DuckDuckGo-only search).
 
   The MySQL image's 99-grants.sql was baked with a specific
   MYSQL_PASSWORD at build time, so the value you supply must match

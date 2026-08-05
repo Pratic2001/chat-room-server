@@ -97,6 +97,10 @@ load_or_generate_runtime_secrets() {
     # the build-images prompt. See the new "Ollama configuration" block
     # in scripts/build_images.sh.
     local ollama_host ollama_port ollama_model
+    # AI agent search providers (optional). Empty = DuckDuckGo-only; set
+    # BRAVE_API_KEY and/or GOOGLE_API_KEY+GOOGLE_CSE_ID to prefer Brave /
+    # Google in the web_search / web_news agent tools.
+    local brave_api_key google_api_key google_cse_id
 
     if [[ -n "$existing_env" && -f "$existing_env" ]]; then
         # Reuse — exact same values the previous build/deploy used.
@@ -160,6 +164,11 @@ load_or_generate_runtime_secrets() {
             printf '%s\n' "${OLLAMA_HOST-http://ollama}"   > /tmp/_crs_ollama_host
             printf '%s\n' "${OLLAMA_PORT-11434}"          > /tmp/_crs_ollama_port
             printf '%s\n' "${OLLAMA_MODEL-llama3.2}"      > /tmp/_crs_ollama_model
+            # AI agent search providers. Older .env.runtime files won't
+            # have these; treat unset as empty (DuckDuckGo-only).
+            printf '%s\n' "${BRAVE_API_KEY-}"  > /tmp/_crs_brave_api_key
+            printf '%s\n' "${GOOGLE_API_KEY-}" > /tmp/_crs_google_api_key
+            printf '%s\n' "${GOOGLE_CSE_ID-}"  > /tmp/_crs_google_cse_id
         )
         mysql_pw="$(cat /tmp/_crs_mysql_pw)";          rm -f /tmp/_crs_mysql_pw
         jwt="$(cat /tmp/_crs_jwt)";                    rm -f /tmp/_crs_jwt
@@ -179,6 +188,9 @@ load_or_generate_runtime_secrets() {
         ollama_host="$(cat /tmp/_crs_ollama_host)";       rm -f /tmp/_crs_ollama_host
         ollama_port="$(cat /tmp/_crs_ollama_port)";       rm -f /tmp/_crs_ollama_port
         ollama_model="$(cat /tmp/_crs_ollama_model)";     rm -f /tmp/_crs_ollama_model
+        brave_api_key="$(cat /tmp/_crs_brave_api_key)";    rm -f /tmp/_crs_brave_api_key
+        google_api_key="$(cat /tmp/_crs_google_api_key)";  rm -f /tmp/_crs_google_api_key
+        google_cse_id="$(cat /tmp/_crs_google_cse_id)";    rm -f /tmp/_crs_google_cse_id
     else
         # Generate. Same algorithms as change_db_password.sh.
         mysql_pw="$(generate_url_safe_password)"
@@ -225,6 +237,11 @@ load_or_generate_runtime_secrets() {
         ollama_host="http://ollama"
         ollama_port="11434"
         ollama_model="llama3.2"
+        # Search providers: blank by default (DuckDuckGo-only). The
+        # build-images prompt collects the optional keys.
+        brave_api_key=""
+        google_api_key=""
+        google_cse_id=""
     fi
 
     printf "MYSQL_PASSWORD=%q\n"   "$mysql_pw"
@@ -245,6 +262,9 @@ load_or_generate_runtime_secrets() {
     printf "OLLAMA_HOST=%q\n"     "$ollama_host"
     printf "OLLAMA_PORT=%q\n"     "$ollama_port"
     printf "OLLAMA_MODEL=%q\n"    "$ollama_model"
+    printf "BRAVE_API_KEY=%q\n"    "$brave_api_key"
+    printf "GOOGLE_API_KEY=%q\n"   "$google_api_key"
+    printf "GOOGLE_CSE_ID=%q\n"    "$google_cse_id"
 }
 
 # Atomically write app/.env.runtime with the three secrets + the rest of
@@ -299,6 +319,12 @@ write_runtime_env_file() {
     local ollama_host="${OLLAMA_HOST-http://ollama}"
     local ollama_port="${OLLAMA_PORT-11434}"
     local ollama_model="${OLLAMA_MODEL-llama3.2}"
+    # AI agent search providers (optional). Blank = DuckDuckGo-only. These
+    # are passed to HTTP headers / query params with no URL-decoding step
+    # in the app, so they're emitted verbatim (like MAIL_USER / MAIL_FROM).
+    local brave_api_key="${BRAVE_API_KEY-}"
+    local google_api_key="${GOOGLE_API_KEY-}"
+    local google_cse_id="${GOOGLE_CSE_ID-}"
 
     local mysql_pw_enc jwt_enc fernet_enc repl_pw_enc mysql_port_enc
     local mail_host_enc mail_port_enc mail_user_enc mail_password_enc mail_from_enc mail_use_tls_enc
@@ -414,7 +440,7 @@ MAIL_USE_TLS=${mail_use_tls_enc}
 # for local dev (uvicorn) — the app's bus code prefers REDIS_SENTINELS
 # when both are set, and falls back to REDIS_URL when REDIS_SENTINELS is
 # blank. REDIS_MASTER_NAME is Sentinel's logical name for the master
-# group; it must match the `sentinel monitor` line in
+# group; it must match the \`sentinel monitor\` line in
 # k8s/28-redis-sentinel-statefulset.yaml.
 #
 # Override REDIS_URL for local dev (redis://localhost:6379/0). Leave
@@ -432,8 +458,10 @@ REDIS_MASTER_NAME="${redis_master_name}"
 # --- Ollama (AI assistant backend; consumed by app/ai.py) ---------------
 # The AI assistant is opt-in per room (set ai_enabled=true at room
 # creation). When @assistant is mentioned in a text message, app/ai.py
-# POSTs to ${OLLAMA_HOST}:${OLLAMA_PORT}/api/chat with the room's
+# POSTs to \${OLLAMA_HOST}:\${OLLAMA_PORT}/api/chat with the room's
 # persona system prompt and the last 30 messages as context.
+# (Escaped so the pattern renders literally even when the caller runs
+# under `set -u` with OLLAMA_HOST/OLLAMA_PORT unset, e.g. write_runtime_env.sh.)
 #
 # OLLAMA_HOST may include scheme (http://, https://) and optionally a
 # port. app/ai.py::_ollama_url only appends ":OLLAMA_PORT" when no port
@@ -452,6 +480,22 @@ REDIS_MASTER_NAME="${redis_master_name}"
 OLLAMA_HOST="${ollama_host}"
 OLLAMA_PORT=${ollama_port}
 OLLAMA_MODEL="${ollama_model}"
+
+# --- AI agent search providers (consumed by app/agent_tools.py) ----------
+# Optional — the web_search / web_news agent tools try these in order and
+# always fall back to DuckDuckGo (no key needed). Leave all blank to keep
+# DuckDuckGo-only behavior.
+#   BRAVE_API_KEY  — https://brave.com/search/api/  (primary web + news)
+#   GOOGLE_API_KEY — https://developers.google.com/custom-search/v1/overview
+#   GOOGLE_CSE_ID  — Programmable Search Engine ID
+#                    (https://programmablesearchengine.google.com/);
+#                    GOOGLE_API_KEY + GOOGLE_CSE_ID are both required for
+#                    Google web search (Google has no news vertical).
+# These are passed to HTTP headers / query params with no URL-decoding step
+# in the app, so they're emitted verbatim (same as MAIL_USER / MAIL_FROM).
+BRAVE_API_KEY="${brave_api_key}"
+GOOGLE_API_KEY="${google_api_key}"
+GOOGLE_CSE_ID="${google_cse_id}"
 EOF
 
     # Atomic rename. If mv fails the tmp file is left for the caller to
@@ -555,6 +599,13 @@ render_k8s_secrets() {
     local ollama_host="${OLLAMA_HOST:-http://ollama}"
     local ollama_port="${OLLAMA_PORT:-11434}"
     local ollama_model="${OLLAMA_MODEL:-llama3.2}"
+    # AI agent search providers. API keys are credentials → chatroom-app
+    # Secret; the CSE id is a public Programmable Search Engine identifier
+    # → ConfigMap. Emitted verbatim (the app passes them straight to HTTP
+    # headers / query params, so URL-encoding would corrupt them).
+    local brave_api_key="${BRAVE_API_KEY:-}"
+    local google_api_key="${GOOGLE_API_KEY:-}"
+    local google_cse_id="${GOOGLE_CSE_ID:-}"
 
     # URL-encode the values that feed a URL parser (MYSQL_PASSWORD,
     # SECRET_KEY, ROOM_SECRET_KEY, REPLICATION_PASSWORD, MYSQL_HOST,
@@ -642,6 +693,12 @@ stringData:
   SECRET_KEY: "${jwt_enc}"
   ROOM_SECRET_KEY: "${fernet_enc}"
   MAIL_PASSWORD: "${mail_password_enc}"
+  # AI agent search providers (app/agent_tools.py). Brave / Google are
+  # tried first when keys are set; DuckDuckGo is the keyless fallback.
+  # API keys are credentials → Secret. See also GOOGLE_CSE_ID in the
+  # chatroom-app ConfigMap below.
+  BRAVE_API_KEY: "${brave_api_key}"
+  GOOGLE_API_KEY: "${google_api_key}"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -680,7 +737,7 @@ data:
   # automatically picks up the new Sentinel-managed Redis topology.
   REDIS_SENTINELS: "${redis_sentinels}"
   # REDIS_MASTER_NAME: Sentinel's logical name for the master group.
-  # Must match the `sentinel monitor` line in
+  # Must match the \`sentinel monitor\` line in
   # k8s/28-redis-sentinel-statefulset.yaml.
   REDIS_MASTER_NAME: "${redis_master_name}"
   # Ollama (AI assistant). These are URLs / model names, not secrets —
@@ -693,6 +750,11 @@ data:
   OLLAMA_HOST: "${ollama_host}"
   OLLAMA_PORT: "${ollama_port}"
   OLLAMA_MODEL: "${ollama_model}"
+  # GOOGLE_CSE_ID is a public Programmable Search Engine identifier (not a
+  # credential) → ConfigMap. Paired with GOOGLE_API_KEY (in the chatroom-app
+  # Secret) it enables Google web search in the AI agent. Brave uses only
+  # the Secret key BRAVE_API_KEY.
+  GOOGLE_CSE_ID: "${google_cse_id}"
 EOF
 
     # Atomic rename. Same error-handling choice as write_runtime_env_file.

@@ -525,6 +525,16 @@ textarea {
     color: var(--ai-author);
     font-weight: 600;
 }
+/* Tool-progress line shown inside the streaming AI bubble while the agent
+ * is calling a tool (web search, news, …). "🔍 searching the web…" is the
+ * canonical example. Rendered as a dim, italic line between the author and
+ * the answer text; removed when the first ai_chunk of the answer arrives. */
+.ai-tool-status {
+    font-size: 0.85em;
+    font-style: italic;
+    color: var(--text-muted);
+    margin: 2px 0 4px;
+}
 /* Make the AI toggle row's label sit inline with its checkbox (the
  * default <label> wraps to a new line, which makes the form look like
  * the AI toggle is a separate field). Overrides the generic `label`

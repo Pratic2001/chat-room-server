@@ -37,9 +37,14 @@
 #   MAIL_PORT
 #   MAIL_FROM
 #   MAIL_USE_TLS
+#   BRAVE_API_KEY         (optional — blank = DuckDuckGo-only search)
+#   GOOGLE_API_KEY        (optional — needs GOOGLE_CSE_ID too)
+#   GOOGLE_CSE_ID         (optional)
 # (The order after the four secrets matches the prompt order in
 # scripts/build_images.sh, so a piped-from-build invocation lines up
-# row-for-row.)
+# row-for-row. The three search keys may be omitted entirely — they
+# default to blank / DuckDuckGo-only, which is also what an existing
+# app/.env.runtime without them is treated as.)
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -96,8 +101,8 @@ fi
 # Acquire the three values
 # -----------------------------------------------------------------------------
 if [[ "$FROM_STDIN" -eq 1 ]]; then
-    log "Reading 10 values from stdin (4 secrets + 6 MAIL_*)..."
-    # Read exactly ten lines, in order. Trailing newline tolerated.
+    log "Reading 10 values (+ 3 optional search keys) from stdin..."
+    # Read the ten required lines, in order. Trailing newline tolerated.
     IFS= read -r MYSQL_PASSWORD      || fail "stdin closed before MYSQL_PASSWORD."
     IFS= read -r SECRET_KEY          || fail "stdin closed before SECRET_KEY."
     IFS= read -r ROOM_SECRET_KEY     || fail "stdin closed before ROOM_SECRET_KEY."
@@ -108,9 +113,14 @@ if [[ "$FROM_STDIN" -eq 1 ]]; then
     IFS= read -r MAIL_PORT           || fail "stdin closed before MAIL_PORT."
     IFS= read -r MAIL_FROM           || fail "stdin closed before MAIL_FROM."
     IFS= read -r MAIL_USE_TLS        || fail "stdin closed before MAIL_USE_TLS."
+    # Optional: 3 AI-agent search-provider keys. Blank if absent. Reading
+    # them only-if-present keeps the historic 10-line contract working.
+    IFS= read -r BRAVE_API_KEY   || BRAVE_API_KEY=""
+    IFS= read -r GOOGLE_API_KEY  || GOOGLE_API_KEY=""
+    IFS= read -r GOOGLE_CSE_ID   || GOOGLE_CSE_ID=""
 elif [[ -n "$FROM_FILE" ]]; then
     [[ -f "$FROM_FILE" ]] || fail "--from-file: $FROM_FILE not found."
-    log "Reading 10 values from $FROM_FILE (4 secrets + 6 MAIL_*)..."
+    log "Reading 10 values (+ 3 optional search keys) from $FROM_FILE ..."
     {
         IFS= read -r MYSQL_PASSWORD       || fail "$FROM_FILE: missing MYSQL_PASSWORD on line 1."
         IFS= read -r SECRET_KEY           || fail "$FROM_FILE: missing SECRET_KEY on line 2."
@@ -122,6 +132,10 @@ elif [[ -n "$FROM_FILE" ]]; then
         IFS= read -r MAIL_PORT            || fail "$FROM_FILE: missing MAIL_PORT on line 8."
         IFS= read -r MAIL_FROM            || fail "$FROM_FILE: missing MAIL_FROM on line 9."
         IFS= read -r MAIL_USE_TLS         || fail "$FROM_FILE: missing MAIL_USE_TLS on line 10."
+        # Optional: 3 AI-agent search-provider keys (blank lines if not set).
+        IFS= read -r BRAVE_API_KEY   || BRAVE_API_KEY=""
+        IFS= read -r GOOGLE_API_KEY  || GOOGLE_API_KEY=""
+        IFS= read -r GOOGLE_CSE_ID   || GOOGLE_CSE_ID=""
     } < "$FROM_FILE"
 else
     log "Generating fresh credentials..."
@@ -171,6 +185,15 @@ if [[ -n "${MAIL_USE_TLS:-}" ]]; then
         n|no|0|false)  MAIL_USE_TLS="false" ;;
         *) fail "MAIL_USE_TLS must be y/n/yes/no/true/false (or blank). Got: '$MAIL_USE_TLS'." ;;
     esac
+fi
+
+# AI-agent search providers are optional (blank = DuckDuckGo-only). If only
+# one Google key is set the pair can't work — warn so it's fixed before
+# deploy, not discovered later. A partial pair just means Google is skipped;
+# DuckDuckGo still works.
+if [[ -n "${GOOGLE_API_KEY:-}" && -z "${GOOGLE_CSE_ID:-}" ]] || [[ -z "${GOOGLE_API_KEY:-}" && -n "${GOOGLE_CSE_ID:-}" ]]; then
+    log "WARNING: GOOGLE_API_KEY and GOOGLE_CSE_ID must both be set for Google search;"
+    log "         Google will be skipped (DuckDuckGo still works)."
 fi
 
 # -----------------------------------------------------------------------------

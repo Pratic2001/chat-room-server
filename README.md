@@ -23,15 +23,50 @@ cluster — both via one-command installers.
 - **Real-time chat** — WebSockets for live delivery; the same state is reachable
   over REST for history pagination, uploads and invites. Text, image, file and
   video messages (images get a 200×200 thumbnail).
-- **AI assistant** — opt-in per room (`ai_enabled=true`). Mention `@assistant`
-  in a text message and the room's persona (Professional, Funny, Chaotic,
-  Sarcastic, Anime-girlfriend, Peter-Griffin, Stewie-Griffin) replies through
-  Ollama. `/search <query>` adds DuckDuckGo context.
+- **AI agent** — opt-in per room (`ai_enabled=true`). Mention `@assistant` and a
+  tool-calling agent backed by Ollama replies in the room's persona
+  (Professional, Funny, Chaotic, Sarcastic, Anime-girlfriend, Peter-Griffin,
+  Stewie-Griffin). The agent decides itself when to use tools — it can search
+  the web (`web_search`), pull recent news (`web_news`), see who's in the room
+  (`room_users`), read the time (`current_time`) and do arithmetic
+  (`calculate`). It auto-detects whether the configured Ollama model supports
+  tool-calling and falls back to a plain (still streaming) reply otherwise.
 - **Secure by default** — passwords bcrypt-hashed, JWTs for auth, room pass
   phrases stored encrypted (Fernet) so they can be emailed on invite.
 - **HA-ready** — the k8s layout runs MySQL master + read-replicas, Redis +
   Sentinel failover, and a multi-replica app tier; pods tolerate node loss and
   reschedule within ~25s of a node failure.
+
+### AI agent & tools
+
+Rooms with **Enable AI assistant** get a synthetic `@assistant` participant.
+Mention `@assistant` and the room's persona replies — but the assistant is now
+an **agent**: if the configured Ollama model supports function calling, it can
+decide to call tools mid-conversation and the results are fed back before it
+composes the final answer. While a tool runs you'll see a small
+"🔍 searching the web…" status line in the chat bubble.
+
+Available tools (see `app/agent_tools.py`):
+
+| Tool | What it does |
+|---|---|
+| `web_search(query)` | Web results (title/URL/snippet) — Brave or Google first, DuckDuckGo as fallback |
+| `web_news(query)` | Recent news headlines for breaking-news questions |
+| `room_users()` | The usernames currently in the room, so it can address people |
+| `current_time()` | Server UTC + local time for time/date/schedule questions |
+| `calculate(expression)` | Safe arithmetic (`2+2*7`, `sqrt(144)`) — no `eval` |
+
+Search is multi-provider: `web_search` / `web_news` try **Brave**
+(`BRAVE_API_KEY`), then **Google** (`GOOGLE_API_KEY` + `GOOGLE_CSE_ID`; web
+only), and always fall back to **DuckDuckGo** (no key) when a provider is
+unconfigured, fails, or returns nothing. Leave the keys blank to keep
+DuckDuckGo-only behavior — the results each carry an `engine` field so the
+agent can cite its source.
+
+Tool-calling needs a model that advertises `tools` in its Ollama capabilities
+(`qwen3:8b` and `llama3.3` do; `llama3.2` doesn't). The server detects this per
+model via `OLLAMA_MODEL` and falls back to a single streaming reply when tools
+aren't available, so nothing breaks if you keep the default.
 
 ---
 
@@ -180,7 +215,8 @@ chatroom-mysql:latest`) — see `RUNBOOK.md` §5 for each tool.
 | `ROOM_SECRET_KEY` | Fernet key for encrypting room pass phrases. |
 | `MAIL_HOST`, `MAIL_PORT`, `MAIL_USER`, `MAIL_PASSWORD`, `MAIL_FROM`, `MAIL_USE_TLS` | SMTP for invite emails (blank host disables). |
 | `REDIS_URL`, `REDIS_SENTINELS`, `REDIS_MASTER_NAME` | WS cross-pod fan-out. |
-| `OLLAMA_HOST`, `OLLAMA_PORT`, `OLLAMA_MODEL` | AI assistant endpoint. |
+| `OLLAMA_HOST`, `OLLAMA_PORT`, `OLLAMA_MODEL` | AI agent endpoint. For tool-calling (web search, news, …) configure a tools-capable model, e.g. `qwen3:8b` or `llama3.3`. The default `llama3.2` still works but replies without tools. |
+| `BRAVE_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_CSE_ID` | Optional AI-agent search providers (see "AI agent & tools"). Leave blank for DuckDuckGo-only. |
 | `MYSQL_ROOT_PASSWORD`, `REPLICATION_PASSWORD` | MySQL image build args / k8s Secrets (baked at build time). |
 
 Generate a Fernet key with:

@@ -13,8 +13,11 @@ pydantic[email]
 # pod's locally-tracked WS connections. The official `redis` package
 # ships an asyncio client (`redis.asyncio`).
 redis>=5.0
-# AI assistant (app/ai.py): httpx is the async HTTP client used to call
-# Ollama's /api/chat endpoint. duckduckgo-search is the no-key web search
-# library used when a message contains "/search <query>".
+# AI agent (app/ai.py + app/agent_tools.py): httpx is the async HTTP
+# client used for Ollama's /api/chat (streaming + tool-calling), /api/show
+# (tool-capability detection), and the Brave / Google search APIs (optional
+# BRAVE_API_KEY / GOOGLE_API_KEY + GOOGLE_CSE_ID). duckduckgo-search is the
+# keyless fallback for the web_search / web_news agent tools, tried after
+# any configured providers.
 httpx>=0.27
 duckduckgo-search>=6.0

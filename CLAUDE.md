@@ -19,6 +19,7 @@ A FastAPI chat-room backend backed by MySQL, with a vanilla-JS/HTML/CSS frontend
 - `app/routers/rooms.py` — Create/list/join/delete rooms and the SMTP-backed `/rooms/{id}/invite`. The owner-only `DELETE /rooms/{id}` removes the caller's membership, not the room itself.
 - `app/routers/messages.py` — REST message fetch (`GET /messages/{room_id}/messages`) and upload (`POST /messages?room_id=...`). Owns a hand-rolled `_serialize` because Pydantic v2 will not auto-coerce `LargeBinary` bytes to `str` for the response model — calling `MessageResponse.model_validate` on an ORM instance with binary data raises.
 - `app/routers/chats.py` — WebSocket endpoint `/ws/{room_id}`. Authenticates via `?token=...` query param or `Authorization: Bearer` header, sends last 50 messages on connect, then loops. Image messages get a 200×200 thumbnail via Pillow.
+- `app/agent_tools.py` — The AI agent's tool registry: Ollama JSON-schema tool definitions + handlers (`web_search`, `web_news`, `room_users`, `current_time`, `calculate`), the `run_tool` dispatcher, and `TOOL_LABELS`. See the "AI assistant" section below for how the tool loop uses it.
 - `app/static/` — Frontend (`index.html`, `login.html`, `signup.html`, `script.js`, `style.css`).
 - `database_setup.sql` — Idempotent CREATE TABLE statements plus the two migrations that retro-fit existing installs: drop NOT NULL on `rooms.secret_phrase_hash`, add unique index on `rooms.name`.
 - `scripts/create_env.sh` — Bootstraps `.env` with documented placeholders. Refuses to clobber an existing `.env` unless `--force` is passed.
@@ -97,26 +98,60 @@ frontend `<select>` shows friendly labels).
 
 Trigger: when a user sends a text message containing the whole-word
 mention `@assistant` (case-insensitive, regex `(?<![\w])@assistant(?![\w])`
-so `admin@assistant.com` does NOT trigger), `app/ai.py::maybe_reply`
+so `admin@assistant.com` does NOT trigger), `app/ai.py::stream_reply`
 runs as a background `asyncio` task. The task reads the last 30 messages
-for context, builds an Ollama chat prompt with the room's persona system
-prompt + history, and POSTs to `OLLAMA_HOST/api/chat`. If the message
-also contains a `/search <query>` keyword (same word-boundary regex),
-DuckDuckGo snippets are added as additional context before the LLM
-call. The reply is persisted to MySQL and broadcast via the existing
-WebSocket manager, so every connected client sees it like any other
-message.
+for context (role-aware: human text → `role:"user"` prefixed with
+`username:`, AI text → `role:"assistant"`, binary → a one-line note),
+builds an Ollama chat prompt with the room's persona system prompt +
+history, and calls `OLLAMA_HOST/api/chat`.
+
+**Two paths, one UX.** `app/ai.py` asks Ollama's `/api/show` whether the
+configured model (`OLLAMA_MODEL`) advertises the `tools` capability (cached
+for ~10 min):
+- **Agent path (tools-capable model, e.g. `qwen3:8b`, `llama3.3`):** a
+  tool-use loop. The model may emit `tool_calls`; `app/ai.py` dispatches each
+  to `app/agent_tools.py::run_tool` (web_search / web_news / room_users /
+  current_time / calculate), appends the result as a `role:"tool"` message,
+  and re-calls the model — up to `MAX_TOOL_ITERATIONS` (6) — until a final
+  answer arrives without tool calls. Every tool execution broadcasts an
+  `ai_tool` envelope so the client shows "🔍 searching the web…".
+- **Legacy path (no tool support, e.g. the default `llama3.2`):** a single
+  streaming `/api/chat` reply, unchanged behavior.
+
+Search tools are multi-provider. `web_search` / `web_news` route through
+`app/agent_tools.py::_search_with_fallback`, which tries **Brave**
+(`BRAVE_API_KEY`), then **Google** (`GOOGLE_API_KEY` + `GOOGLE_CSE_ID`, web
+only), and finally **DuckDuckGo** (keyless) — the first non-empty result
+set wins, and a provider that is unconfigured, fails, or returns nothing
+falls through to the next. With no keys set the tools are DuckDuckGo-only,
+identical to before.
+
+On both paths the final answer is streamed to the client as coalesced
+`ai_chunk` envelopes (the agent path replays the computed answer in
+fixed-size frames so the typewriter effect matches), then `ai_end`, then the
+reply is persisted to MySQL and broadcast as a normal `WSMessage` via the
+WebSocket manager, so every connected client sees it like any other message.
+Errors broadcast an `ai_error` envelope (dedicated error bubble with a
+"Try again" affordance in the frontend).
 
 The AI does NOT reply to image/file/video messages (it observes them
 silently — they appear in its context as one-line notes like
 `"bob sent an image: cat.jpg"`). The AI does NOT reply to its own
-messages (loop prevention in `maybe_reply`). The AI is a `RoomMember`
+messages (loop prevention in `stream_reply`). The AI is a `RoomMember`
 of every AI-enabled room; its membership is created at room creation,
 so no separate join API is needed.
 
 Frontend: create-room modal has an "Enable AI assistant" checkbox + a
 persona dropdown. Messages from the AI render with a purple bubble
-border and a 🤖-prefixed author line.
+border and a 🤖-prefixed author line; while a tool runs, a dim italic
+"🔍 searching the web…" line appears in the streaming bubble
+(`.ai-tool-status`).
+
+**Adding a tool:** one entry in `app/agent_tools.py` — a JSON-schema
+`function` in `_TOOL_DEFS`, a handler in `_HANDLERS`, and (optionally) a
+label in `TOOL_LABELS`. Handlers share the signature
+`handler(arguments: dict, ctx: dict)` and may be sync or async; `ctx`
+carries `{"room_id", "db"}` for tools that read room state (`room_users`).
 
 ## Conventions / things that are easy to miss
 

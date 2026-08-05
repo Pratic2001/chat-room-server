@@ -227,18 +227,39 @@ MAIL_USE_TLS="$(prompt_default MAIL_USE_TLS 'Use TLS (true/false):' 'true')"
 OLLAMA_HOST="$(prompt_default OLLAMA_HOST 'Ollama host (with scheme, e.g. http://1.2.3.4):' 'http://localhost')"
 OLLAMA_PORT="$(prompt_default OLLAMA_PORT 'Ollama port:' '11434')"
 OLLAMA_MODEL="$(prompt_default OLLAMA_MODEL 'Ollama model:' 'llama3.2')"
+# AI agent search providers (optional). Leave blank for DuckDuckGo-only —
+# web_search / web_news fall back to DuckDuckGo (no key needed). Set
+# BRAVE_API_KEY and/or GOOGLE_API_KEY + GOOGLE_CSE_ID to prefer Brave /
+# Google. Same default-as-existing-value behavior as the prompts above.
+BRAVE_API_KEY="$(prompt_default BRAVE_API_KEY 'Brave API key (https://brave.com/search/api/; blank = skip):' '')"
+GOOGLE_API_KEY="$(prompt_default GOOGLE_API_KEY 'Google API key (blank = skip Google):' '')"
+GOOGLE_CSE_ID="$(prompt_default GOOGLE_CSE_ID 'Google Programmable Search Engine ID:' '')"
+if [[ -n "$GOOGLE_API_KEY" && -z "$GOOGLE_CSE_ID" ]] || [[ -z "$GOOGLE_API_KEY" && -n "$GOOGLE_CSE_ID" ]]; then
+    warn "GOOGLE_API_KEY and GOOGLE_CSE_ID must both be set for Google search; Google will be skipped (DuckDuckGo still works)."
+fi
 
 # Generate the runtime env + rendered Secrets/ConfigMap using the same shared
 # helpers build_images.sh uses. We override the two MySQL credentials with the
-# baked-in values, and the SMTP/Ollama values with what was just collected.
+# baked-in values, and the SMTP/Ollama/search values with what was just
+# collected above.
+#
+# IMPORTANT: the eval must NOT clobber the prompted values. The prompts above
+# (MAIL_*, OLLAMA_*, BRAVE_API_KEY, GOOGLE_API_KEY, GOOGLE_CSE_ID) run first,
+# but load_or_generate_runtime_secrets would reset those same variables to
+# their generated defaults (blank SMTP, http://ollama, blank search keys),
+# silently discarding what the operator just typed — a bug that kept the
+# SMTP/Ollama prompts in this mode dead. So we filter the eval output down to
+# the non-prompted config vars (MySQL/Redis secrets and topology); the
+# prompted values survive untouched.
 # shellcheck disable=SC1091
 source scripts/_random_password.sh
-eval "$(load_or_generate_runtime_secrets "")"
+eval "$(load_or_generate_runtime_secrets "" | grep -vE '^(MYSQL_PASSWORD|REPLICATION_PASSWORD|MAIL_HOST|MAIL_PORT|MAIL_USER|MAIL_PASSWORD|MAIL_FROM|MAIL_USE_TLS|OLLAMA_HOST|OLLAMA_PORT|OLLAMA_MODEL|BRAVE_API_KEY|GOOGLE_API_KEY|GOOGLE_CSE_ID)=')"
 MYSQL_PASSWORD="$MYSQL_ROOT_PASSWORD"
 REPLICATION_PASSWORD="$REPLICATION_PASSWORD"
 export MYSQL_PASSWORD REPLICATION_PASSWORD \
        MAIL_HOST MAIL_PORT MAIL_USER MAIL_PASSWORD MAIL_FROM MAIL_USE_TLS \
-       OLLAMA_HOST OLLAMA_PORT OLLAMA_MODEL
+       OLLAMA_HOST OLLAMA_PORT OLLAMA_MODEL \
+       BRAVE_API_KEY GOOGLE_API_KEY GOOGLE_CSE_ID
 
 log "Writing app/.env.runtime + k8s/secrets.runtime.yaml ..."
 write_runtime_env_file "$REPO_DIR/app/.env.runtime" "scripts/install-k8s.sh"

@@ -954,7 +954,7 @@ class ChatApp {
         const hint = document.getElementById('composer-hint');
         if (!input || !hint) return;
         if (enabled) {
-            input.placeholder = 'Type a message — try @assistant …';
+            input.placeholder = 'Type a message — try @assistant (I can search the web) …';
             hint.hidden = false;
         } else {
             input.placeholder = 'Type a message';
@@ -1131,6 +1131,13 @@ class ChatApp {
                 }
                 if (msg.type === 'ai_error') {
                     this._handleAiError(msg);
+                    return;
+                }
+                // Tool-execution progress on the agent path ("🔍 searching
+                // the web…"). Shows a status line inside the streaming
+                // bubble; cleared by the first ai_chunk of the answer.
+                if (msg.type === 'ai_tool') {
+                    this._handleAiTool(msg);
                     return;
                 }
                 this._renderMessage(msg);
@@ -1889,7 +1896,7 @@ class ChatApp {
         wrap.appendChild(bubble);
 
         messagesEl.appendChild(wrap);
-        this._aiBubbles.set(env.id, { wrap, bubble, text, cursor });
+        this._aiBubbles.set(env.id, { wrap, bubble, text, cursor, toolStatus: null });
         // Suppress the typing indicator for the AI — the streaming
         // bubble is the more informative affordance.
         this._typingUsers.delete(env.user_id);
@@ -1905,11 +1912,44 @@ class ChatApp {
             // message will land via the regular WS chat envelope.
             return;
         }
+        // The answer is starting — drop any "searching the web…" tool
+        // status line so the typewriter replaces it.
+        this._clearAiToolStatus(entry);
         // textContent is the safe path; we're appending server-supplied
         // string fragments. Cursor stays put; new chunks append left
         // of it.
         entry.text.textContent += env.delta || '';
         this._scrollToBottom();
+    }
+
+    _handleAiTool(env) {
+        // Agent-path progress: the model decided to call a tool (web
+        // search, news, …). Show a status line inside the live streaming
+        // bubble so the user knows the assistant is doing something
+        // between the ask and the answer.
+        const entry = this._aiBubbles.get(env.id);
+        if (!entry) return;
+        if (env.status === 'start') {
+            this._clearAiToolStatus(entry);
+            const status = document.createElement('div');
+            status.className = 'ai-tool-status';
+            const query = env.query ? `: "${env.query}"` : '';
+            status.textContent = `🔍 ${env.label || env.tool || 'working'}${query}…`;
+            entry.bubble.insertBefore(status, entry.cursor);
+            entry.toolStatus = status;
+            this._scrollToBottom();
+        } else if (env.status === 'done') {
+            // Result landed; the next ai_chunk will clear the line, but
+            // drop it now so a long tool chain doesn't stack statuses.
+            this._clearAiToolStatus(entry);
+        }
+    }
+
+    _clearAiToolStatus(entry) {
+        if (entry.toolStatus && entry.toolStatus.parentNode) {
+            entry.toolStatus.parentNode.removeChild(entry.toolStatus);
+        }
+        entry.toolStatus = null;
     }
 
     _handleAiEnd(env) {

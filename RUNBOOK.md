@@ -1009,7 +1009,7 @@ http://localhost:8000/
 You should see the chat frontend served by FastAPI's static-files
 mount.
 
-### 7.6 AI assistant smoke test
+### 7.6 AI assistant (agent) smoke test
 
 If you enabled the AI at build time (you answered the "Ollama
 configuration" prompts in `scripts/build_images.sh` and the
@@ -1030,14 +1030,32 @@ curl -s -X POST http://localhost:8000/rooms/ \
 #   {"message_type":"text","content":"hi @assistant, tell me a joke"}
 # Within ~15s the AI should respond with a Funny-persona reply that
 # also reaches every other connected client (cross-pod fan-out via the
-# Redis bus).
+# Redis bus). In the web UI the reply streams with a 🤖 author line.
+
+# To see the agent use its tools, send a question that needs live info
+# AND have a tools-capable model configured (OLLAMA_MODEL):
+#   {"message_type":"text","content":"@assistant what's the latest news on AI"}
+# The UI shows a "🔍 searching the web…" / "checking the latest news…"
+# status line while the tool runs, then the composed answer types out.
+
+# Tool-calling note: the assistant only uses tools (web_search, web_news,
+# room_users, current_time, calculate) when the configured OLLAMA_MODEL
+# advertises the `tools` capability in `ollama show <model>`. Popular
+# tools-capable models: `qwen3:8b`, `llama3.3`. The default `llama3.2` does
+# NOT support tools — it still replies, just without calling tools.
+
+# Search providers: web_search / web_news use DuckDuckGo (keyless) unless
+# you configure others. To prefer Brave / Google, set BRAVE_API_KEY (and,
+# for Google, GOOGLE_API_KEY + GOOGLE_CSE_ID together) in app/.env.runtime
+# and re-run scripts/build_images.sh + deploy_k8s.sh — or set them in .env
+# for local dev. Providers are tried Brave → Google → DuckDuckGo, and the
+# keyless DuckDuckGo is always the final fallback.
 
 # If the AI never replies:
-#   - Check the app pod's logs for "Ollama POST failed" or
-#     "AI maybe_reply crashed" warnings.
-#   - Confirm the model is pulled on the Ollama side
-#     (`ollama pull llama3.2` against OLLAMA_HOST).
-#   - Confirm OLLAMA_HOST is reachable from the pod
+#   - Check the app pod's logs for "Ollama chat POST failed", "Ollama
+#     chat returned HTTP", "AI stream_reply crashed", or "assumed no tools".
+#   - Confirm the model is pulled on the Ollama side and reachable from
+#     the pod
 #     (`kubectl -n chatroom exec <app-pod> -- curl -sv $OLLAMA_HOST`).
 #   - Try "@ASSISTANT ping" — the mention is case-insensitive, and
 #     typos here are the most common cause of "the AI never fires".
