@@ -55,6 +55,18 @@
 --   BACKUP_ADMIN   only needed for `LOCK INSTANCE FOR BACKUP` and
 --                  the clone-plugin transport; not used here
 --   SUPER          intentionally never granted to a non-root account
+--
+-- Auth plugin: 'repl' is declared as mysql_native_password, NOT the MySQL 8
+-- default caching_sha2_password. Replica CHANGE MASTER TO connects over a
+-- plaintext TCP channel (no TLS, no --get-server-public-key configured in
+-- mysql/replication_bootstrap.sh), and caching_sha2_password refuses that and
+-- surfaces as Last_IO_Errno 2061 (Authentication plugin 'caching_sha2_password'
+-- cannot be loaded / requires a secure connection) on every replica — pods are
+-- 1/1 Ready but nothing streams. mysql_native_password authenticates over
+-- plaintext and is the MySQL-documented route for non-TLS async replication.
+-- (The MySQL server still runs --default-authentication-plugin=
+-- caching_sha2_password for app logins; this account is an explicit exception
+-- because only the replication channel uses it.)
 -- Why IF NOT EXISTS: this init script runs once on the master's first
 -- boot (empty datadir) and the resulting CREATE USER event also lands in
 -- the binlog. When a replica later bootstraps via mysqldump (see
@@ -65,7 +77,7 @@
 -- permanently — see RUNBOOK §9.14. CREATE USER IF NOT EXISTS is a no-op
 -- when the user already exists, so the master init path is unchanged
 -- and the replica replay path succeeds.
-CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED BY '__REPLICATION_PASSWORD__';
+CREATE USER IF NOT EXISTS 'repl'@'%' IDENTIFIED WITH mysql_native_password BY '__REPLICATION_PASSWORD__';
 GRANT SELECT, RELOAD, LOCK TABLES,
       SHOW VIEW, TRIGGER, EVENT,
       REPLICATION SLAVE ON *.* TO 'repl'@'%';
