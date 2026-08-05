@@ -287,9 +287,9 @@ chmod 600 "$REPO_DIR/app/.env.runtime" "$REPO_DIR/k8s/secrets.runtime.yaml"
 # local image names + imagePullPolicy: Never). Rewrite the two chatroom image
 # refs and flip the pull policy so kubelet actually fetches from Docker Hub.
 log "Rewriting image refs to docker.io/$REG_USER/chatroom-*:$REG_TAG ..."
-sed -i "s|image: chat-room-server:latest|image: ${APP_IMG}|; s|imagePullPolicy: Never|imagePullPolicy: PullIfNotPresent|" \
+sed -i "s|image: chat-room-server:latest|image: ${APP_IMG}|; s|imagePullPolicy: Never|imagePullPolicy: IfNotPresent|" \
     "$REPO_DIR/k8s/40-app-deployment.yaml"
-sed -i "s|image: chatroom-mysql:latest|image: ${MYSQL_IMG}|; s|imagePullPolicy: Never|imagePullPolicy: PullIfNotPresent|" \
+sed -i "s|image: chatroom-mysql:latest|image: ${MYSQL_IMG}|; s|imagePullPolicy: Never|imagePullPolicy: IfNotPresent|" \
     "$REPO_DIR/k8s/23-mysql-statefulset.yaml"
 
 log "Deploying to the cluster (pulling $APP_IMG and $MYSQL_IMG) ..."
