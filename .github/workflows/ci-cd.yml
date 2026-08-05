@@ -1,0 +1,175 @@
+# ci-cd.yml — build + push + release pipeline for chat-room-server.
+#
+# What it does:
+#   * Builds the two images the app needs:
+#       - pratic2001/chatroom-app     (FastAPI app, from the root Dockerfile)
+#       - pratic2001/chatroom-mysql   (custom MySQL 8 image, from mysql/Dockerfile)
+#     and pushes them to Docker Hub.
+#   * On a v* tag, also cuts a GitHub Release carrying the two install
+#     scripts (install-k8s.sh, install-non-cluster.sh) and docker-compose.yml
+#     so anyone can download and run them. The release job bakes the tag into
+#     the scripts' REPO_REF so a standalone downloaded script installs that
+#     exact version.
+#
+# Image tagging:
+#   * tag vX.Y.Z   -> pratic2001/chatroom-app:vX.Y.Z + :latest
+#   * push to main -> pratic2001/chatroom-app:main (rolling) + :latest
+#   * other pushes -> build only (CI validation, no push)
+#
+# Required repository secrets (https://github.com/Pratic2001/chat-room-server/settings/secrets/actions):
+#   DOCKERHUB_USERNAME   - your Docker Hub username (pratic2001)
+#   DOCKERHUB_TOKEN      - a Docker Hub personal-access token (Read/Write/Delete)
+#   MYSQL_ROOT_PASSWORD  - baked into the mysql image's 99-grants.sql. Must be
+#                          URL-safe (no @ : / ? # [ ] %). If unset, a random
+#                          one is generated for the build (images then only
+#                          deployable by whoever built them).
+#   REPLICATION_PASSWORD - the 'repl'@'%' user password, same constraints.
+#                          Keep it <= 32 bytes (MySQL 8 limit).
+#
+# The same MYSQL_ROOT_PASSWORD / REPLICATION_PASSWORD values are what you
+# pass to `install-k8s.sh --registry pratic2001` on a multi-node cluster:
+#   MYSQL_ROOT_PASSWORD=... REPLICATION_PASSWORD=... ./install-k8s.sh --registry pratic2001
+
+name: CI/CD
+
+on:
+  push:
+    branches: [main, test]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    name: Build & push images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU + Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Decide version + whether to push
+        id: meta
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+            PUSH=1
+          elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            VERSION="main"
+            PUSH=1
+          else
+            VERSION="${GITHUB_SHA:0:8}"
+            PUSH=0
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "push=${PUSH}" >> "$GITHUB_OUTPUT"
+          echo "tagged=$([[ "${GITHUB_REF}" == refs/tags/* ]] && echo 1 || echo 0)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve MySQL credentials
+        id: creds
+        run: |
+          set -euo pipefail
+          gen() { head -c 32 /dev/urandom | base64 | tr -d '=+/@\?#[]:%' | cut -c1-24; }
+          MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-$(gen)}"
+          REPLICATION_PASSWORD="${REPLICATION_PASSWORD:-$(gen | cut -c1-32)}"
+          echo "MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}" >> "$GITHUB_OUTPUT"
+          echo "REPLICATION_PASSWORD=${REPLICATION_PASSWORD}" >> "$GITHUB_OUTPUT"
+        env:
+          MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
+          REPLICATION_PASSWORD: ${{ secrets.REPLICATION_PASSWORD }}
+
+      - name: Build & push chatroom-app
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: ${{ steps.meta.outputs.push == '1' }}
+          tags: |
+            pratic2001/chatroom-app:${{ steps.meta.outputs.version }}
+            pratic2001/chatroom-app:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & push chatroom-mysql
+        uses: docker/build-push-action@v6
+        with:
+          context: ./mysql
+          file: mysql/Dockerfile
+          push: ${{ steps.meta.outputs.push == '1' }}
+          build-args: |
+            MYSQL_ROOT_PASSWORD=${{ steps.creds.outputs.MYSQL_ROOT_PASSWORD }}
+            REPLICATION_PASSWORD=${{ steps.creds.outputs.REPLICATION_PASSWORD }}
+          tags: |
+            pratic2001/chatroom-mysql:${{ steps.meta.outputs.version }}
+            pratic2001/chatroom-mysql:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: Cut release (install scripts)
+    needs: build-and-push
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage install scripts (bake the tag into REPO_REF)
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist
+          for f in install-k8s.sh install-non-cluster.sh; do
+            cp "$f" "dist/$f"
+            sed -i "s|REPO_REF=\"\${REPO_REF:-main}\"|REPO_REF=\"\${REPO_REF:-${TAG}}\"|" "dist/$f"
+            chmod +x "dist/$f"
+          done
+          cp docker-compose.yml dist/docker-compose.yml
+          echo "staged for ${TAG}"
+          ls -la dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: chat-room-server ${{ github.ref_name }}
+          body: |
+            Automated release from the CI/CD pipeline.
+
+            ## Images (Docker Hub)
+            - `pratic2001/chatroom-app:${{ github.ref_name }}` and `:latest`
+            - `pratic2001/chatroom-mysql:${{ github.ref_name }}` and `:latest`
+
+            ## Install scripts
+            Download and run:
+            - **`install-k8s.sh`** — deploy to a Kubernetes cluster (kind / k3d /
+              minikube / Docker Desktop, or `--registry` for multi-node). Asks for
+              your SMTP + Ollama details, then everything is ready to run.
+            - **`install-non-cluster.sh`** — bring the stack up with Docker
+              Compose (no Kubernetes). Same prompts, http://localhost:8000 when done.
+
+            ## Source
+            The full source at this tag is attached as `Source code (tar.gz/zip)`.
+
+            The release scripts bake `REPO_REF=${{ github.ref_name }}` into
+            themselves, so a standalone download installs exactly this version.
+
+            🤖 Generated with [Claude Code](https://claude.com/claude-code)
+          files: |
+            dist/install-k8s.sh
+            dist/install-non-cluster.sh
+            dist/docker-compose.yml
