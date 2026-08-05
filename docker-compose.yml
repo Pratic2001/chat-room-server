@@ -1,0 +1,82 @@
+# docker-compose.yml — non-cluster (plain Docker) deployment of the
+# chat-room stack. Orchestrated by ./install-non-cluster.sh, which:
+#   * builds the two images (chat-room-server, chatroom-mysql) and generates
+#     app/.env.runtime via scripts/build_images.sh BEFORE bringing this up,
+#   * exports MYSQL_ROOT_PASSWORD / REPLICATION_PASSWORD (the values baked
+#     into the mysql image) so the interpolation below works.
+#
+# The app container reads its config from app/.env.runtime (env_file).
+# The environment: overrides below point the hostnames at the compose
+# services instead of the in-cluster k8s service names.
+#
+# Run (from the repo root):
+#   ./install-non-cluster.sh
+#
+# Not part of the k8s deployment — that path lives entirely under k8s/.
+
+name: chatroom
+
+services:
+  mysql:
+    image: chatroom-mysql:latest
+    container_name: chatroom-mysql
+    restart: unless-stopped
+    # MYSQL_ROOT_PASSWORD / REPLICATION_PASSWORD are interpolated from the
+    # shell env (exported by install-non-cluster.sh from app/.env.runtime).
+    # The custom entrypoint (mysql/replication_bootstrap.sh) sees
+    # HOSTNAME=chatroom-mysql — which doesn't match the mysql-<ordinal>
+    # StatefulSet pattern, so it runs as a standalone master (server-id 1).
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?run install-non-cluster.sh (exports this)}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-}
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_DATABASE: chatroom_db
+      MYSQL_SERVER_ID: "1"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  redis:
+    image: redis:7-alpine
+    container_name: chatroom-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  app:
+    image: chat-room-server:latest
+    container_name: chatroom-app
+    restart: unless-stopped
+    env_file:
+      - app/.env.runtime
+    environment:
+      # Compose service names instead of the k8s Service names baked into
+      # app/.env.runtime by build_images.sh.
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_READ_HOST: ""
+      REDIS_URL: redis://redis:6379/0
+      REDIS_SENTINELS: ""
+      REDIS_MASTER_NAME: chatroom-redis
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
+  redis-data:
