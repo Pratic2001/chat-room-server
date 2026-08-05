@@ -62,3 +62,6 @@ coverage.xml
 *.swo
 .DS_Store
 Thumbs.db
+
+# Local copy of CI/registry credentials (see .github/workflows/ci-cd.yml)
+registry.env.local
