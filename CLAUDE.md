@@ -121,10 +121,14 @@ for ~10 min):
 Search tools are multi-provider. `web_search` / `web_news` route through
 `app/agent_tools.py::_search_with_fallback`, which tries **Brave**
 (`BRAVE_API_KEY`), then **Google** (`GOOGLE_API_KEY` + `GOOGLE_CSE_ID`, web
-only), and finally **DuckDuckGo** (keyless) — the first non-empty result
-set wins, and a provider that is unconfigured, fails, or returns nothing
-falls through to the next. With no keys set the tools are DuckDuckGo-only,
-identical to before.
+only), then the always-present keyless fallbacks — **Bing web RSS** (text)
+and **Google News RSS** (news) — and finally **DuckDuckGo** (keyless). The
+first non-empty result set wins; a provider that is unconfigured, fails, or
+returns nothing falls through to the next. The keyless RSS fallbacks were
+added because DuckDuckGo bot-blocks many residential/datacenter IPs (its
+news JSON endpoint 403s nearly always, web text intermittently returns
+zero), so with no API keys set the tools now hit Bing/Google News first and
+DuckDuckGo only as a last resort.
 
 On both paths the final answer is streamed to the client as coalesced
 `ai_chunk` envelopes (the agent path replays the computed answer in

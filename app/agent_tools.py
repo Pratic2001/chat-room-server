@@ -20,20 +20,27 @@ Design notes
   the agent can adapt (search again, ask a follow-up) rather than crash
   the whole loop.
 - `web_search` / `web_news` are multi-provider: Brave (`BRAVE_API_KEY`),
-  Google (`GOOGLE_API_KEY` + `GOOGLE_CSE_ID`, web only), and DuckDuckGo as
-  the always-present last resort. See the "Search providers" section below.
+  Google (`GOOGLE_API_KEY` + `GOOGLE_CSE_ID`, web only), then always-present
+  keyless fallbacks — Bing RSS (web) and Google News RSS (news) — with
+  DuckDuckGo as the final last resort. See the "Search providers" section.
 - `ctx` carries `{"room_id": int, "db": Session}` for tools that need to
   read room state (currently `room_users`). All other tools ignore it.
 """
 
 import asyncio
 import ast
+import html as _html
 import inspect
 import json
 import logging
 import math
 import operator
 import os
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 log = logging.getLogger("uvicorn.error")
@@ -267,7 +274,14 @@ def _search_with_fallback(kind: str, query: str, max_results: int) -> str:
         providers.append(_brave_search)
     if kind == "text" and os.environ.get("GOOGLE_API_KEY") and os.environ.get("GOOGLE_CSE_ID"):
         providers.append(_google_search)
-    providers.append(_ddg_search)  # keyless last resort
+    # Keyless, always-present fallbacks, tried before DuckDuckGo. DuckDuckGo
+    # rate-limits / bot-blocks many residential and datacenter IPs (its JSON
+    # news endpoint returns 403 nearly always, web text intermittently returns
+    # zero), so it is deferred to last resort behind two keyless engines that
+    # are far more reliable: Bing's web RSS (general text) and Google News RSS
+    # (news). Each returns None for the kind it does not serve, so the chain
+    # still falls through as before when a query type doesn't fit.
+    providers.extend([_bing_web_search, _google_news_rss, _ddg_search])
 
     outcome = None  # dict from the last provider that actually ran
     for provider in providers:
@@ -286,6 +300,107 @@ def _search_with_fallback(kind: str, query: str, max_results: int) -> str:
     if isinstance(outcome, dict) and outcome.get("error"):
         return json.dumps({"error": outcome["error"]})
     return json.dumps({"results": [], "note": "no results"})
+
+
+def _bing_web_search(kind: str, query: str, max_results: int) -> str | None:
+    """Keyless general-web search via Bing's public RSS endpoint.
+
+    Web (`text`) only — news queries return None so the chain skips us.
+    Bing's `format=rss` output is plain XML (title/link/description), no API
+    key, and is not subject to the aggressive bot-blocking DuckDuckGo applies
+    to its JSON endpoints. Real web URLs are present in `link`. Never raises:
+    any failure becomes a JSON `error` string so the caller falls through to
+    the next provider.
+    """
+    if kind != "text":
+        return None  # Bing RSS covers web only; news handled elsewhere
+    url = "https://www.bing.com/search?" + urllib.parse.urlencode(
+        {"q": query, "format": "rss"}
+    )
+    try:
+        data = _fetch_url(url)
+    except Exception as e:
+        log.warning("Bing %s search failed: %s", kind, e)
+        return json.dumps({"error": f"bing search failed: {e}"})
+    try:
+        root = ET.fromstring(data)
+        items = root.findall(".//item")
+    except ET.ParseError as e:
+        log.warning("Bing search: unparseable RSS: %s", e)
+        return json.dumps({"error": f"bing search returned unparseable data: {e}"})
+    norm = []
+    for it in items[:max_results]:
+        title = it.findtext("title") or ""
+        link = it.findtext("link") or ""
+        desc = re.sub(r"<[^>]+>", "", it.findtext("description") or "").strip()
+        # &nbsp; / HTML entities survive the XML parse; unescape them.
+        title = _html.unescape(title).strip()
+        desc = _html.unescape(desc)
+        if not title and not desc:
+            continue
+        norm.append({"title": title, "url": link, "snippet": desc})
+    if not norm:
+        return json.dumps({"results": [], "note": "no results"})
+    return json.dumps({"results": norm, "engine": "bing"}, ensure_ascii=False, indent=2)
+
+
+def _google_news_rss(kind: str, query: str, max_results: int) -> str | None:
+    """Keyless news search via Google News RSS (`news.google.com/rss/search`).
+
+    News only — text queries return None so the chain skips us. Unlike the
+    DuckDuckGo news JSON endpoint (403 from most non-browser IPs), this public
+    RSS feed returns a large, current result set with the real publisher in
+    `<source>` and a snippet in `<description>`. Never raises: any failure
+    becomes a JSON `error` string so the caller falls through.
+    """
+    if kind != "news":
+        return None  # Google News RSS covers news only
+    url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
+        {"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"}
+    )
+    try:
+        data = _fetch_url(url)
+    except Exception as e:
+        log.warning("Google News search failed: %s", e)
+        return json.dumps({"error": f"google news search failed: {e}"})
+    try:
+        root = ET.fromstring(data)
+        items = root.findall(".//item")
+    except ET.ParseError as e:
+        log.warning("Google News: unparseable RSS: %s", e)
+        return json.dumps({"error": f"google news returned unparseable data: {e}"})
+    norm = []
+    for it in items[:max_results]:
+        title = _html.unescape(it.findtext("title") or "").strip()
+        link = it.findtext("link") or ""
+        desc = re.sub(r"<[^>]+>", "", it.findtext("description") or "").strip()
+        desc = _html.unescape(desc)
+        pub = it.findtext("pubDate") or ""
+        source = it.findtext("source") or ""
+        if not title and not desc:
+            continue
+        entry = {"title": title, "url": link, "snippet": desc}
+        if source:
+            entry["source"] = source.strip()
+        if pub:
+            entry["date"] = pub
+        norm.append(entry)
+    if not norm:
+        return json.dumps({"results": [], "note": "no results"})
+    return json.dumps({"results": norm, "engine": "google-news"}, ensure_ascii=False, indent=2)
+
+
+def _fetch_url(url: str, timeout: float = 20.0) -> bytes:
+    """GET a URL with a browser-ish User-Agent; raise on any non-200.
+
+    Uses stdlib only so the keyless fallbacks add no runtime dependencies.
+    """
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
 
 
 def _ddg_search(kind: str, query: str, max_results: int) -> str:

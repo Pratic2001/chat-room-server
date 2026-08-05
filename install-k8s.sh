@@ -244,15 +244,16 @@ MAIL_USE_TLS="$(prompt_default MAIL_USE_TLS 'Use TLS (true/false):' 'true')"
 OLLAMA_HOST="$(prompt_default OLLAMA_HOST 'Ollama host (with scheme, e.g. http://1.2.3.4):' 'http://localhost')"
 OLLAMA_PORT="$(prompt_default OLLAMA_PORT 'Ollama port:' '11434')"
 OLLAMA_MODEL="$(prompt_default OLLAMA_MODEL 'Ollama model:' 'llama3.2')"
-# AI agent search providers (optional). Leave blank for DuckDuckGo-only —
-# web_search / web_news fall back to DuckDuckGo (no key needed). Set
-# BRAVE_API_KEY and/or GOOGLE_API_KEY + GOOGLE_CSE_ID to prefer Brave /
-# Google. Same default-as-existing-value behavior as the prompts above.
+# AI agent search providers (optional). Leave blank and the tools still work
+# keyless: web_search falls back to Bing web RSS, web_news to Google News RSS
+# (DuckDuckGo is the final last resort). Set BRAVE_API_KEY and/or GOOGLE_API_KEY
+# + GOOGLE_CSE_ID to prefer Brave / Google. Same default-as-existing-value
+# behavior as the prompts above.
 BRAVE_API_KEY="$(prompt_default BRAVE_API_KEY 'Brave API key (https://brave.com/search/api/; blank = skip):' '')"
 GOOGLE_API_KEY="$(prompt_default GOOGLE_API_KEY 'Google API key (blank = skip Google):' '')"
 GOOGLE_CSE_ID="$(prompt_default GOOGLE_CSE_ID 'Google Programmable Search Engine ID:' '')"
 if [[ -n "$GOOGLE_API_KEY" && -z "$GOOGLE_CSE_ID" ]] || [[ -z "$GOOGLE_API_KEY" && -n "$GOOGLE_CSE_ID" ]]; then
-    warn "GOOGLE_API_KEY and GOOGLE_CSE_ID must both be set for Google search; Google will be skipped (DuckDuckGo still works)."
+    warn "GOOGLE_API_KEY and GOOGLE_CSE_ID must both be set for Google search; Google will be skipped (the keyless Bing/Google-News fallbacks still run)."
 fi
 
 # Generate the runtime env + rendered Secrets/ConfigMap using the same shared

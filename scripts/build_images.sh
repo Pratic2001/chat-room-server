@@ -194,20 +194,22 @@ done
 # qwen3:8b or llama3.3; llama3.2 still replies but without tools.
 OLLAMA_MODEL="$(prompt_default '  OLLAMA_MODEL (must be pulled into the Ollama instance)' "$OLLAMA_MODEL")"
 
-log "AI agent search providers (optional — leave blank to use DuckDuckGo only)..."
+log "AI agent search providers (optional — leave blank; keyless Bing/Google-News fallbacks still work)..."
 # BRAVE_API_KEY enables Brave Search as the primary web + news provider for
 # the AI agent's web_search / web_news tools. GOOGLE_API_KEY + GOOGLE_CSE_ID
-# (both required together) add Google web search. DuckDuckGo is always the
-# final fallback and needs no key, so blanking all three keeps today's
-# behavior. Reuse the existing env value as the default so a re-run that
-# didn't change search config keeps the same providers — same idempotent
-# behavior as the MAIL_*/OLLAMA_* prompts above.
+# (both required together) add Google web search. Blank all three and the
+# tools still work keyless — Bing web RSS (text) and Google News RSS (news)
+# are the always-present fallbacks, with DuckDuckGo as the final last resort.
+# Reuse the existing env value as the default so a re-run that didn't change
+# search config keeps the same providers — same idempotent behavior as the
+# MAIL_*/OLLAMA_* prompts above.
 BRAVE_API_KEY="$(prompt_default '  BRAVE_API_KEY (https://brave.com/search/api/; blank = skip)' "$BRAVE_API_KEY")"
 GOOGLE_API_KEY="$(prompt_default '  GOOGLE_API_KEY (blank = skip Google)' "$GOOGLE_API_KEY")"
 GOOGLE_CSE_ID="$(prompt_default '  GOOGLE_CSE_ID (Programmable Search Engine ID)' "$GOOGLE_CSE_ID")"
 # Google needs both keys; warn (don't fail) if only one is set so the
 # operator fixes it at deploy time instead of wondering why Google never
-# runs. A partial pair just means Google is skipped — DuckDuckGo still works.
+# runs. A partial pair just means Google is skipped — the keyless Bing /
+# Google-News fallbacks still run.
 if [[ -n "$GOOGLE_API_KEY" && -z "$GOOGLE_CSE_ID" ]] || [[ -z "$GOOGLE_API_KEY" && -n "$GOOGLE_CSE_ID" ]]; then
     warn "GOOGLE_API_KEY and GOOGLE_CSE_ID must both be set for Google search; Google will be skipped (DuckDuckGo still works)."
 fi
