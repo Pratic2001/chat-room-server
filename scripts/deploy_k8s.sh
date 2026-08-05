@@ -392,8 +392,12 @@ INGRESS_IP="$(kubectl -n "$NAMESPACE" get ingress chatroom \
 
 if [[ -n "$INGRESS_HOST" || -n "$INGRESS_IP" ]]; then
     printf 'Reachable at:\n'
-    [[ -n "$INGRESS_HOST" ]] && printf '  http://%s/\n' "$INGRESS_HOST"
-    [[ -n "$INGRESS_IP"   ]] && printf '  http://%s/\n'   "$INGRESS_IP"
+    # HTTP stays on the controller's :80 listener; any HTTPS that the cluster
+    # terminates (e.g. the ingress sidecar/edge) is served on :8443.
+    [[ -n "$INGRESS_HOST" ]] && printf '  http://%s/\n'        "$INGRESS_HOST"
+    [[ -n "$INGRESS_IP"   ]] && printf '  http://%s/\n'        "$INGRESS_IP"
+    [[ -n "$INGRESS_HOST" ]] && printf '  https://%s:8443/\n'  "$INGRESS_HOST"
+    [[ -n "$INGRESS_IP"   ]] && printf '  https://%s:8443/\n'  "$INGRESS_IP"
 else
     printf 'No Ingress address yet. Most local clusters (kind/k3d/minikube)\n'
     printf 'do not provision a load-balancer automatically.\n'
