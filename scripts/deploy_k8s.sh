@@ -297,7 +297,13 @@ kubectl scale deployment/chatroom-app --namespace "$NAMESPACE" --replicas="$NODE
 # MySQL is a StatefulSet now (master on mysql-0, read-replicas on
 # mysql-1..N-1). Replicas beyond the first run a mysqldump clone
 # followed by `START SLAVE`, which takes a couple of minutes per
-# replica on a cold start — well within the 5m rollout timeout.
+# replica on a cold start. OrderedReady creates them SERIALLY, so a
+# 3-replica cold install is master-init + 2×(dump-load) in sequence.
+# 5m was too tight — the rollout-status wait below expired right as the
+# last replica (mysql-2) was finishing its dump-load, producing a false
+# "timed out waiting for the condition" even though the StatefulSet
+# converged seconds later. Budget ~2-3 min per replica: 10m for a
+# 3-node cluster.
 log "Scaling statefulset/mysql to $NODE_COUNT replicas..."
 kubectl scale statefulset/mysql --namespace "$NAMESPACE" --replicas="$NODE_COUNT"
 
@@ -330,7 +336,7 @@ kubectl scale statefulset/redis-sentinel --namespace "$NAMESPACE" --replicas="$S
 # the DB or a Redis master, so we want the data plane settled before
 # we wait on the app.
 log "Waiting for MySQL StatefulSet to be ready..."
-kubectl -n "$NAMESPACE" rollout status statefulset/mysql --timeout=5m
+kubectl -n "$NAMESPACE" rollout status statefulset/mysql --timeout=10m
 
 # Reconcile root@% on every ready replica. The chatroom-app's read
 # engine connects as root from a k8s pod IP, so it needs `root@%` on
