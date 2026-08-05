@@ -96,14 +96,16 @@ For a **multi-node / remote cluster** (EKS, GKE, a bare-metal kubeadm cluster)
 whose nodes can't reach your Docker daemon, pull the prebuilt images instead:
 
 ```bash
-MYSQL_ROOT_PASSWORD=... REPLICATION_PASSWORD=... \
-  ./install-k8s.sh --registry pratic2001
+./install-k8s.sh --registry pratic2001
 ```
 
-> The MySQL image bakes its root password at build time, so the two values
-> above must match the `MYSQL_ROOT_PASSWORD` / `REPLICATION_PASSWORD`
-> **GitHub Actions secrets** the CI/CD pipeline used when it built and pushed
-> `pratic2001/chatroom-app` and `pratic2001/chatroom-mysql`.
+> The MySQL image bakes its root + replication passwords at build time from the
+> `MYSQL_ROOT_PASSWORD` / `REPLICATION_PASSWORD` **GitHub Actions secrets**, and
+> since v0.1.2 also stores them inside the image at
+> `/etc/chatroom/mysql-credentials`. The installer auto-extracts them with
+> `docker run ... cat /etc/chatroom/mysql-credentials`, so you don't re-enter
+> them. (Exporting `MYSQL_ROOT_PASSWORD`/`REPLICATION_PASSWORD` still overrides
+> and skips the extraction.)
 
 ### Option B — plain Docker (no Kubernetes)
 
@@ -148,8 +150,9 @@ Every `v*` tag triggers a GitHub Actions workflow that:
    downloaded script installs exactly that version.
 
 Configure these **repository secrets**:
-`DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, and (to make `--registry` deploys
-work) `MYSQL_ROOT_PASSWORD` + `REPLICATION_PASSWORD`.
+`DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`, and `MYSQL_ROOT_PASSWORD` +
+`REPLICATION_PASSWORD` (baked into the MySQL image by the pipeline; the
+installer reads them back out of the image, so you don't re-enter them).
 
 ```bash
 git tag v1.1.0 && git push origin v1.1.0      # image push + release, automated

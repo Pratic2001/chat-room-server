@@ -18,13 +18,13 @@
 #   --registry USER[:TAG] — for a real multi-node / remote cluster whose
 #       nodes can't reach your local Docker daemon (EKS, GKE, a bare-metal
 #       kubeadm cluster, ...). Pulls the prebuilt images pushed by the CI/CD
-#       pipeline instead of building. The MySQL image's root password was
-#       baked in when CI built it, so you MUST supply the same two values
-#       that the pipeline used (set them as GitHub Actions secrets, then
-#       export them here):
+#       pipeline instead of building. The MySQL image's root + replication
+#       passwords are baked in when CI builds it; since v0.1.2 they're also
+#       stored inside the image at /etc/chatroom/mysql-credentials, so this
+#       script auto-extracts them via `docker run` (no need to re-enter).
+#       Exporting them explicitly still works and skips the extraction:
 #
-#       MYSQL_ROOT_PASSWORD=... REPLICATION_PASSWORD=... \
-#           ./install-k8s.sh --registry pratic2001
+#       ./install-k8s.sh --registry pratic2001
 #
 # In both modes the script asks for your Ollama host/port and SMTP details
 # if they aren't already exported, then everything is ready to run.
@@ -174,9 +174,10 @@ if [[ "$MODE" == "build-local" ]]; then
             fail "Can't auto-load images into context '$CURRENT_CTX' from this machine.
   kind / k3d / minikube / Docker Desktop are supported for the build-local path.
   For a real multi-node cluster, deploy the prebuilt images instead:
-    MYSQL_ROOT_PASSWORD=... REPLICATION_PASSWORD=... ./install-k8s.sh --registry pratic2001"
+    ./install-k8s.sh --registry pratic2001
+  (the baked MySQL credentials are auto-extracted from the image)"
             ;;
-    esac
+        esac
 
     log "Deploying to the cluster ..."
     ./scripts/deploy_k8s.sh
@@ -202,12 +203,28 @@ else
 fi
 [[ -n "$REG_USER" ]] || fail "--registry needs a Docker Hub username, e.g. pratic2001 or pratic2001:v1.0.0"
 
+# Image refs: the running images this mode deploys (and reads credentials from).
+APP_IMG="docker.io/$REG_USER/chatroom-app:$REG_TAG"
+MYSQL_IMG="docker.io/$REG_USER/chatroom-mysql:$REG_TAG"
+
 # The MySQL image's 99-grants.sql baked MYSQL_ROOT_PASSWORD at CI build time.
-# The operator must supply the same values the pipeline used (see the GH
-# Actions secrets MYSQL_ROOT_PASSWORD / REPLICATION_PASSWORD). Refuse to
-# proceed with a guess — a wrong password yields a 1045 Access denied.
-: "${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD to the value CI baked into the mysql image (same as the GitHub Actions secret).}"
-: "${REPLICATION_PASSWORD:?Set REPLICATION_PASSWORD to the value CI baked into the mysql image (same as the GitHub Actions secret).}"
+# Since v0.1.2 the same two values are also baked into
+# /etc/chatroom/mysql-credentials INSIDE the image, so the operator no longer
+# has to re-enter the exact pipeline values — we pull them straight out:
+#   docker run --rm pratic2001/chatroom-mysql:latest cat /etc/chatroom/mysql-credentials
+# If both vars are already exported, use those and skip the pull.
+if [ -z "${MYSQL_ROOT_PASSWORD:-}" ] || [ -z "${REPLICATION_PASSWORD:-}" ]; then
+    log "Extracting baked MySQL credentials from ${MYSQL_IMG} ..."
+    CREDS="$(docker run --rm --entrypoint /bin/sh "$MYSQL_IMG" \
+        -c 'cat /etc/chatroom/mysql-credentials' 2>/dev/null || true)"
+    MYSQL_ROOT_PASSWORD="$(printf '%s' "$CREDS" | sed -n 's/^MYSQL_ROOT_PASSWORD=//p')"
+    REPLICATION_PASSWORD="$(printf '%s' "$CREDS" | sed -n 's/^REPLICATION_PASSWORD=//p')"
+fi
+
+# Refuse to proceed unless BOTH values are present (explicit or extracted).
+# A wrong/missing password yields a 1045 Access denied at runtime.
+: "${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD (baked credentials are missing in ${MYSQL_IMG}; use a newer image tag or export it explicitly)}"
+: "${REPLICATION_PASSWORD:?Set REPLICATION_PASSWORD (baked credentials are missing in ${MYSQL_IMG}; use a newer image tag or export it explicitly)}"
 
 # Prompt for SMTP + Ollama unless already exported. Registry mode doesn't run
 # build_images.sh, so we ask here — this is the "everything ready to run" step.
@@ -270,8 +287,6 @@ chmod 600 "$REPO_DIR/app/.env.runtime" "$REPO_DIR/k8s/secrets.runtime.yaml"
 # local image names + imagePullPolicy: Never). Rewrite the two chatroom image
 # refs and flip the pull policy so kubelet actually fetches from Docker Hub.
 log "Rewriting image refs to docker.io/$REG_USER/chatroom-*:$REG_TAG ..."
-APP_IMG="docker.io/$REG_USER/chatroom-app:$REG_TAG"
-MYSQL_IMG="docker.io/$REG_USER/chatroom-mysql:$REG_TAG"
 sed -i "s|image: chat-room-server:latest|image: ${APP_IMG}|; s|imagePullPolicy: Never|imagePullPolicy: PullIfNotPresent|" \
     "$REPO_DIR/k8s/40-app-deployment.yaml"
 sed -i "s|image: chatroom-mysql:latest|image: ${MYSQL_IMG}|; s|imagePullPolicy: Never|imagePullPolicy: PullIfNotPresent|" \

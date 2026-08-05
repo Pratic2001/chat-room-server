@@ -94,6 +94,11 @@ RUN set -eux; \
     sed "s|__REPLICATION_PASSWORD__|${REPLICATION_PASSWORD}|g" \
         /tmp/02-replication-user.sql.template \
         > /docker-entrypoint-initdb.d/02-replication-user.sql; \
+    mkdir -p /etc/chatroom; \
+    printf 'MYSQL_ROOT_PASSWORD=%s\nREPLICATION_PASSWORD=%s\n' \
+        "${MYSQL_ROOT_PASSWORD}" "${REPLICATION_PASSWORD}" \
+        > /etc/chatroom/mysql-credentials; \
+    chmod 640 /etc/chatroom/mysql-credentials; \
     rm /tmp/99-grants.sql.template /tmp/02-replication-user.sql.template; \
     unset MYSQL_ROOT_PASSWORD; \
     unset REPLICATION_PASSWORD; \

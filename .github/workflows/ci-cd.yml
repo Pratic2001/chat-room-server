@@ -26,9 +26,9 @@
 #   REPLICATION_PASSWORD - the 'repl'@'%' user password, same constraints.
 #                          Keep it <= 32 bytes (MySQL 8 limit).
 #
-# The same MYSQL_ROOT_PASSWORD / REPLICATION_PASSWORD values are what you
-# pass to `install-k8s.sh --registry pratic2001` on a multi-node cluster:
-#   MYSQL_ROOT_PASSWORD=... REPLICATION_PASSWORD=... ./install-k8s.sh --registry pratic2001
+# Both values are also written into the baked image at /etc/chatroom/mysql-credentials,
+# so `install-k8s.sh --registry pratic2001` auto-extracts them via docker run —
+# no need to re-enter them on the deploy side (exporting still overrides).
 
 name: CI/CD
 
