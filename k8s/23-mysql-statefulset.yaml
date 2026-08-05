@@ -123,20 +123,19 @@ spec:
             limits:
               cpu: 1000m
               memory: 1Gi
+          # Liveness: use a plain TCP check on 3306, NOT `mysqladmin ping
+          # -h 127.0.0.1 -uroot -p$MYSQL_ROOT_PASSWORD`. Replicas pin
+          # root@localhost to auth_socket (their bootstrap does this so the
+          # local dump-load + read-only replica are reachable), and
+          # auth_socket NEVER authenticates over TCP — only the unix socket.
+          # A password/TCP probe therefore fails against a *healthy* replica,
+          # kubelet kills it (crash-loop: "timed out waiting for the
+          # condition"), and the rollout never completes past mysql-0. A TCP
+          # connection to 3306 is symmetric: it only opens once the server is
+          # serving — the same signal the readiness probe already uses.
           livenessProbe:
-            # mysqladmin ping returns 0 on success. The official mysql image
-            # ships mysqladmin, so no extra tooling needed. We hit
-            # 127.0.0.1 (the pod itself) rather than the StatefulSet pod
-            # DNS because the probe is per-pod — there's no point asking
-            # pod A whether pod B is alive.
-            exec:
-              command:
-                - mysqladmin
-                - ping
-                - -h
-                - "127.0.0.1"
-                - -uroot
-                - -p$(MYSQL_ROOT_PASSWORD)
+            tcpSocket:
+              port: mysql
             initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
