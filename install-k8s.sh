@@ -286,10 +286,19 @@ chmod 600 "$REPO_DIR/app/.env.runtime" "$REPO_DIR/k8s/secrets.runtime.yaml"
 # Point the Deployments at the registry images (the committed manifests use
 # local image names + imagePullPolicy: Never). Rewrite the two chatroom image
 # refs and flip the pull policy so kubelet actually fetches from Docker Hub.
+#
+# imagePullPolicy is set to Always, NOT IfNotPresent. The default registry tag
+# is a floating ":latest"; IfNotPresent reuses whatever :latest a node happens
+# to have cached, so after a cleanup + re-install the nodes silently keep
+# running the OLD image (we saw this bite: a stale :latest that still baked the
+# pre-2061-fix repl user). Always forces kubelet to re-resolve :latest on every
+# start, so a fresh `install-k8s.sh --registry` always pulls the current build.
+# For pinned tags (e.g. --registry pratic2001:v1.0.0) Always is still safe and
+# costs one extra digest lookup.
 log "Rewriting image refs to docker.io/$REG_USER/chatroom-*:$REG_TAG ..."
-sed -i "s|image: chat-room-server:latest|image: ${APP_IMG}|; s|imagePullPolicy: Never|imagePullPolicy: IfNotPresent|" \
+sed -i "s|image: chat-room-server:latest|image: ${APP_IMG}|; s|imagePullPolicy: Never|imagePullPolicy: Always|" \
     "$REPO_DIR/k8s/40-app-deployment.yaml"
-sed -i "s|image: chatroom-mysql:latest|image: ${MYSQL_IMG}|; s|imagePullPolicy: Never|imagePullPolicy: IfNotPresent|" \
+sed -i "s|image: chatroom-mysql:latest|image: ${MYSQL_IMG}|; s|imagePullPolicy: Never|imagePullPolicy: Always|" \
     "$REPO_DIR/k8s/23-mysql-statefulset.yaml"
 
 log "Deploying to the cluster (pulling $APP_IMG and $MYSQL_IMG) ..."

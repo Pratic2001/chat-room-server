@@ -123,16 +123,40 @@ spec:
             limits:
               cpu: 1000m
               memory: 1Gi
-          # Liveness: use a plain TCP check on 3306, NOT `mysqladmin ping
-          # -h 127.0.0.1 -uroot -p$MYSQL_ROOT_PASSWORD`. Replicas pin
-          # root@localhost to auth_socket (their bootstrap does this so the
-          # local dump-load + read-only replica are reachable), and
-          # auth_socket NEVER authenticates over TCP — only the unix socket.
-          # A password/TCP probe therefore fails against a *healthy* replica,
-          # kubelet kills it (crash-loop: "timed out waiting for the
-          # condition"), and the rollout never completes past mysql-0. A TCP
-          # connection to 3306 is symmetric: it only opens once the server is
-          # serving — the same signal the readiness probe already uses.
+          # startupProbe: covers the replica's bootstrap phase. A replica
+          # (mysql/replication_bootstrap.sh) first runs a background
+          # `mysqld --skip-networking` to dump-load the schema from the
+          # master, then execs the official entrypoint which brings up the
+          # real TCP listener. During that whole clone+reload window there is
+          # NO tcp:3306 listener, so any tcpSocket liveness probe sees
+          # "connection refused". That is correct behavior — the replica is
+          # busy, not dead — but kubelet can't tell, so the steady-state
+          # liveness probe (below) would crash-loop it mid-clone.
+          # Kubelet runs ONLY the startup probe until it succeeds, and only
+          # then hands over to liveness. A long budget (15s x 60 = up to
+          # ~15 min) lets a first/clone-heavy replica boot without a
+          # restart-loop; the permanent liveness probe is far away.
+          startupProbe:
+            tcpSocket:
+              port: mysql
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 60
+          # Liveness: TCP check on 3306 — NOT `mysqladmin ping -h 127.0.0.1
+          # -uroot -p$MYSQL_ROOT_PASSWORD`. Once the startup probe above
+          # passes (the real TCP listener is up), kubelet starts running
+          # THIS probe, so a "connection refused" during bootstrap is already
+          # out of scope. Two things it must stay green across:
+          #   (a) the steady-state listener (up after startupProbe succeeded);
+          #   (b) replicas pin root@localhost to auth_socket, which NEVER
+          #       authenticates over TCP — only the unix socket. A password +
+          #       TCP probe always fails against a HEALTHY replica, so it
+          #       would crash-loop it forever. A symmetric TCP connect check
+          #       only opens once the listener is serving, which is the signal
+          #       we actually mean by "alive".
+          # A real dead listener still trips within 30+6*10 = ~90s, which is
+          # fine now that startupProbe holds the bootstrap window.
           livenessProbe:
             tcpSocket:
               port: mysql
