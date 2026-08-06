@@ -35,7 +35,22 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
-# Copy the rest of the source. .dockerignore keeps secrets, build artefacts,
+# Playwright needs a headless Chromium at build time for the AI agent's
+# keyless Google search fallback (app/agent_tools.py::_playwright_search).
+# `--with-deps` apt-installs every system library Chromium needs on this
+# Debian image, then downloads the browser itself. The image runs as a
+# non-root user (below), so the browser MUST be world-readable/executable.
+# PLAYWRIGHT_BROWSERS_PATH pins the install to a known location so the
+# runtime's `sync_playwright()` and the built browser always agree — without
+# it, Playwright looks in the current user's home dir, which differs between
+# the root build step and the non-root runtime. --no-sandbox (passed by the
+# lib, not here) covers the non-root runtime edge.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN python -m playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod -R a+rX /ms-playwright
+
+# Copy the rest of the source. .dockerignore keeps secrets, build artifacts,
 # and VCS metadata out of the build context.
 COPY app/ ./app/
 

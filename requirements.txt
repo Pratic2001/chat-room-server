@@ -16,10 +16,10 @@ redis>=5.0
 # AI agent (app/ai.py + app/agent_tools.py): httpx is the async HTTP
 # client used for Ollama's /api/chat (streaming + tool-calling), /api/show
 # (tool-capability detection), and the Brave / Google search APIs (optional
-# BRAVE_API_KEY / GOOGLE_API_KEY + GOOGLE_CSE_ID). The always-present keyless
-# fallbacks — Bing web RSS and Google News RSS — use only the Python stdlib
-# (urllib + xml.etree), no dependency here. duckduckgo-search backs the final
-# keyless last resort for the web_search/web_news agent tools, tried after the
-# configured providers and the RSS fallbacks.
+# BRAVE_API_KEY / GOOGLE_API_KEY + GOOGLE_CSE_ID). When no API keys are set,
+# playwright drives a headless Chromium to plain Google search — the only
+# keyless path that returns real results (DuckDuckGo/Bing/plain HTTP are all
+# bot-blocked). The browser itself is baked into the image by the Dockerfile
+# (`python -m playwright install --with-deps chromium`).
 httpx>=0.27
-duckduckgo-search>=6.0
+playwright>=1.45

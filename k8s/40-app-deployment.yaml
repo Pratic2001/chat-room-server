@@ -82,7 +82,11 @@ spec:
               memory: 256Mi
             limits:
               cpu: 1000m
-              memory: 1Gi
+              # 1.5Gi (vs 1Gi before) leaves headroom for the headless Chromium
+              # the AI agent launches for keyless Google search (Playwright).
+              # Chromium typically uses ~200-400MB on top of the app's normal
+              # footprint; 1Gi would OOM the pod during a live search.
+              memory: 1.5Gi
           livenessProbe:
             # /healthz is intentionally DB-free (see app/main.py), so a
             # transient MySQL hiccup will not restart the app pods.

@@ -245,10 +245,10 @@ OLLAMA_HOST="$(prompt_default OLLAMA_HOST 'Ollama host (with scheme, e.g. http:/
 OLLAMA_PORT="$(prompt_default OLLAMA_PORT 'Ollama port:' '11434')"
 OLLAMA_MODEL="$(prompt_default OLLAMA_MODEL 'Ollama model:' 'llama3.2')"
 # AI agent search providers (optional). Leave blank and the tools still work
-# keyless: web_search falls back to Bing web RSS, web_news to Google News RSS
-# (DuckDuckGo is the final last resort). Set BRAVE_API_KEY and/or GOOGLE_API_KEY
-# + GOOGLE_CSE_ID to prefer Brave / Google. Same default-as-existing-value
-# behavior as the prompts above.
+# keyless: web_search / web_news fall back to plain Google search driven by a
+# headless Chromium (Playwright, baked into the image). Set BRAVE_API_KEY
+# and/or GOOGLE_API_KEY + GOOGLE_CSE_ID to prefer Brave / Google.
+# Same default-as-existing-value behavior as the prompts above.
 BRAVE_API_KEY="$(prompt_default BRAVE_API_KEY 'Brave API key (https://brave.com/search/api/; blank = skip):' '')"
 GOOGLE_API_KEY="$(prompt_default GOOGLE_API_KEY 'Google API key (blank = skip Google):' '')"
 GOOGLE_CSE_ID="$(prompt_default GOOGLE_CSE_ID 'Google Programmable Search Engine ID:' '')"

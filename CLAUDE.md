@@ -121,14 +121,18 @@ for ~10 min):
 Search tools are multi-provider. `web_search` / `web_news` route through
 `app/agent_tools.py::_search_with_fallback`, which tries **Brave**
 (`BRAVE_API_KEY`), then **Google** (`GOOGLE_API_KEY` + `GOOGLE_CSE_ID`, web
-only), then the always-present keyless fallbacks — **Bing web RSS** (text)
-and **Google News RSS** (news) — and finally **DuckDuckGo** (keyless). The
-first non-empty result set wins; a provider that is unconfigured, fails, or
-returns nothing falls through to the next. The keyless RSS fallbacks were
-added because DuckDuckGo bot-blocks many residential/datacenter IPs (its
-news JSON endpoint 403s nearly always, web text intermittently returns
-zero), so with no API keys set the tools now hit Bing/Google News first and
-DuckDuckGo only as a last resort.
+only), and finally **Playwright** (`app/agent_tools.py::_playwright_search`),
+the always-present keyless fallback. Playwright drives a headless Chromium at
+plain Google (`tbm=nws` vertical for news) — the only keyless source that
+returns real results from real IPs. Every XML/RSS engine previously tried
+(DuckDuckGo JSON, Bing web RSS, Google-News RSS) is bot-blocked, rate-limited,
+or returns junk against a bare HTTP client; a real browser executes Google's
+JS with a genuine fingerprint and gets through without an API key. The
+Chromium binary + system libs are baked into the app image at build time
+(`python -m playwright install --with-deps chromium`), and the provider
+passes `--no-sandbox --disable-dev-shm-usage` because the app runs as a
+non-root user in a container. A provider that is unconfigured fails, or
+returns nothing falls through to the next.
 
 On both paths the final answer is streamed to the client as coalesced
 `ai_chunk` envelopes (the agent path replays the computed answer in

@@ -20,27 +20,22 @@ Design notes
   the agent can adapt (search again, ask a follow-up) rather than crash
   the whole loop.
 - `web_search` / `web_news` are multi-provider: Brave (`BRAVE_API_KEY`),
-  Google (`GOOGLE_API_KEY` + `GOOGLE_CSE_ID`, web only), then always-present
-  keyless fallbacks — Bing RSS (web) and Google News RSS (news) — with
-  DuckDuckGo as the final last resort. See the "Search providers" section.
+  Google (`GOOGLE_API_KEY` + `GOOGLE_CSE_ID`, web only), then the
+  always-present keyless fallback — a headless Chromium (Playwright) driving
+  plain Google search. See the "Search providers" section below.
 - `ctx` carries `{"room_id": int, "db": Session}` for tools that need to
   read room state (currently `room_users`). All other tools ignore it.
 """
 
 import asyncio
 import ast
-import html as _html
 import inspect
 import json
 import logging
 import math
 import operator
 import os
-import re
-import urllib.error
 import urllib.parse
-import urllib.request
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 log = logging.getLogger("uvicorn.error")
@@ -147,17 +142,18 @@ def _safe_eval(expression: str):
 # the tool:
 #
 #   text   → Brave (BRAVE_API_KEY) → Google (GOOGLE_API_KEY + GOOGLE_CSE_ID)
-#            → DuckDuckGo (always last)
-#   news   → Brave (BRAVE_API_KEY) → DuckDuckGo (always last)
+#            → Playwright (keyless, plain Google)
+#   news   → Brave (BRAVE_API_KEY) → Playwright (keyless, Google news)
 #
-# A provider that isn't configured (missing env keys) is skipped, so with
-# no keys set the tools behave exactly as before — DuckDuckGo only.
-# `_search_with_fallback` drives the chain; each provider returns `None`
-# when unconfigured, a JSON string with a `results` array on success (the
-# first non-empty result set wins), an empty `results` array when the
-# engine is up but the query matched nothing, or an `error` key when the
-# engine failed. `httpx` and `duckduckgo-search` are imported lazily so a
-# missing package degrades to a clean error string instead of breaking the
+# A provider that isn't configured (missing env keys) is skipped, so with no
+# keys set the tools still have Playwright — a headless Chromium driving
+# plain Google — as the always-present keyless fallback (unlike the old
+# RSS/DuckDuckGo dead ends, a real browser returns genuine results). Each
+# provider returns `None` when unconfigured, a JSON string with a `results`
+# array on success (the first non-empty result set wins), an empty `results`
+# array when the engine is up but the query matched nothing, or an `error`
+# key when the engine failed. `httpx` and `playwright` are imported lazily so
+# a missing package degrades to a clean error string instead of breaking the
 # tool registry at import time.
 # ---------------------------------------------------------------------------
 
@@ -260,12 +256,12 @@ def _google_search(kind: str, query: str, max_results: int) -> str | None:
 def _search_with_fallback(kind: str, query: str, max_results: int) -> str:
     """Run the provider chain for `kind` ('text' or 'news'); return a JSON string.
 
-    Providers are tried in order; the first with a non-empty result set
-    wins. Unconfigured providers (returning None) are skipped; a provider
-    that errors or returns no results falls through to the next.
-    DuckDuckGo is appended last, so search always has a keyless fallback.
-    If every provider fails, the last error is returned; if every provider
-    is up but nothing matched, a clean empty result set. Never raises.
+    Providers are tried in order; the first with a non-empty result set wins.
+    Unconfigured providers (returning None) are skipped; a provider that errors
+    or returns no results falls through to the next. Brave / Google are tried
+    first when configured; Playwright (plain Google, keyless) is the last
+    resort. If every provider fails, the last error is returned; if every
+    provider is up but nothing matched, a clean empty result set. Never raises.
     """
     if not query or not query.strip():
         return json.dumps({"error": "empty search query"})
@@ -274,14 +270,11 @@ def _search_with_fallback(kind: str, query: str, max_results: int) -> str:
         providers.append(_brave_search)
     if kind == "text" and os.environ.get("GOOGLE_API_KEY") and os.environ.get("GOOGLE_CSE_ID"):
         providers.append(_google_search)
-    # Keyless, always-present fallbacks, tried before DuckDuckGo. DuckDuckGo
-    # rate-limits / bot-blocks many residential and datacenter IPs (its JSON
-    # news endpoint returns 403 nearly always, web text intermittently returns
-    # zero), so it is deferred to last resort behind two keyless engines that
-    # are far more reliable: Bing's web RSS (general text) and Google News RSS
-    # (news). Each returns None for the kind it does not serve, so the chain
-    # still falls through as before when a query type doesn't fit.
-    providers.extend([_bing_web_search, _google_news_rss, _ddg_search])
+    # Keyless always-present last resort: a headless Chromium drives plain
+    # Google search. Every RSS/keyless engine we previously tried (DuckDuckGo,
+    # Bing, Google-News RSS) is bot-blocked or returns junk from real IPs, but
+    # a real browser fingerprint gets genuine Google results without a key.
+    providers.append(_playwright_search)
 
     outcome = None  # dict from the last provider that actually ran
     for provider in providers:
@@ -302,145 +295,107 @@ def _search_with_fallback(kind: str, query: str, max_results: int) -> str:
     return json.dumps({"results": [], "note": "no results"})
 
 
-def _bing_web_search(kind: str, query: str, max_results: int) -> str | None:
-    """Keyless general-web search via Bing's public RSS endpoint.
+def _playwright_search(kind: str, query: str, max_results: int) -> str:
+    """Keyless search via a headless Chromium driving plain Google search.
 
-    Web (`text`) only — news queries return None so the chain skips us.
-    Bing's `format=rss` output is plain XML (title/link/description), no API
-    key, and is not subject to the aggressive bot-blocking DuckDuckGo applies
-    to its JSON endpoints. Real web URLs are present in `link`. Never raises:
-    any failure becomes a JSON `error` string so the caller falls through to
-    the next provider.
-    """
-    if kind != "text":
-        return None  # Bing RSS covers web only; news handled elsewhere
-    url = "https://www.bing.com/search?" + urllib.parse.urlencode(
-        {"q": query, "format": "rss"}
-    )
-    try:
-        data = _fetch_url(url)
-    except Exception as e:
-        log.warning("Bing %s search failed: %s", kind, e)
-        return json.dumps({"error": f"bing search failed: {e}"})
-    try:
-        root = ET.fromstring(data)
-        items = root.findall(".//item")
-    except ET.ParseError as e:
-        log.warning("Bing search: unparseable RSS: %s", e)
-        return json.dumps({"error": f"bing search returned unparseable data: {e}"})
-    norm = []
-    for it in items[:max_results]:
-        title = it.findtext("title") or ""
-        link = it.findtext("link") or ""
-        desc = re.sub(r"<[^>]+>", "", it.findtext("description") or "").strip()
-        # &nbsp; / HTML entities survive the XML parse; unescape them.
-        title = _html.unescape(title).strip()
-        desc = _html.unescape(desc)
-        if not title and not desc:
-            continue
-        norm.append({"title": title, "url": link, "snippet": desc})
-    if not norm:
-        return json.dumps({"results": [], "note": "no results"})
-    return json.dumps({"results": norm, "engine": "bing"}, ensure_ascii=False, indent=2)
+    The single always-present fallback for both `text` and `news` (`news`
+    uses Google's `tbm=nws` news vertical). A real browser executes Google's
+    JS with a genuine fingerprint, which defeats the bot-redirect that blocks
+    a plain HTTP client — and returns real Google results with no API key.
 
-
-def _google_news_rss(kind: str, query: str, max_results: int) -> str | None:
-    """Keyless news search via Google News RSS (`news.google.com/rss/search`).
-
-    News only — text queries return None so the chain skips us. Unlike the
-    DuckDuckGo news JSON endpoint (403 from most non-browser IPs), this public
-    RSS feed returns a large, current result set with the real publisher in
-    `<source>` and a snippet in `<description>`. Never raises: any failure
-    becomes a JSON `error` string so the caller falls through.
-    """
-    if kind != "news":
-        return None  # Google News RSS covers news only
-    url = "https://news.google.com/rss/search?" + urllib.parse.urlencode(
-        {"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"}
-    )
-    try:
-        data = _fetch_url(url)
-    except Exception as e:
-        log.warning("Google News search failed: %s", e)
-        return json.dumps({"error": f"google news search failed: {e}"})
-    try:
-        root = ET.fromstring(data)
-        items = root.findall(".//item")
-    except ET.ParseError as e:
-        log.warning("Google News: unparseable RSS: %s", e)
-        return json.dumps({"error": f"google news returned unparseable data: {e}"})
-    norm = []
-    for it in items[:max_results]:
-        title = _html.unescape(it.findtext("title") or "").strip()
-        link = it.findtext("link") or ""
-        desc = re.sub(r"<[^>]+>", "", it.findtext("description") or "").strip()
-        desc = _html.unescape(desc)
-        pub = it.findtext("pubDate") or ""
-        source = it.findtext("source") or ""
-        if not title and not desc:
-            continue
-        entry = {"title": title, "url": link, "snippet": desc}
-        if source:
-            entry["source"] = source.strip()
-        if pub:
-            entry["date"] = pub
-        norm.append(entry)
-    if not norm:
-        return json.dumps({"results": [], "note": "no results"})
-    return json.dumps({"results": norm, "engine": "google-news"}, ensure_ascii=False, indent=2)
-
-
-def _fetch_url(url: str, timeout: float = 20.0) -> bytes:
-    """GET a URL with a browser-ish User-Agent; raise on any non-200.
-
-    Uses stdlib only so the keyless fallbacks add no runtime dependencies.
-    """
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
-
-
-def _ddg_search(kind: str, query: str, max_results: int) -> str:
-    """Run a DuckDuckGo `text` or `news` search; return a JSON string.
-
-    Returns a JSON string with a `results` array (`title`, `url`, `snippet`,
-    optional `date`) or an `error` key on any failure. Never raises.
+    Chromium must be baked into the image (the Dockerfile runs
+    `python -m playwright install --with-deps chromium`) and needs
+    `--no-sandbox` + `--disable-dev-shm-usage` because the app runs as a
+    non-root user in a container. If the browser or library is missing, or
+    Google serves a challenge, return a JSON `error` string (the caller falls
+    through / the model can adapt). Never raises.
     """
     if not query or not query.strip():
         return json.dumps({"error": "empty search query"})
     try:
-        from duckduckgo_search import DDGS
+        from playwright.sync_api import sync_playwright
     except ImportError:
-        return json.dumps({"error": "duckduckgo-search is not installed; cannot search the web."})
-    norm = []
+        return json.dumps({"error": "playwright is not installed; cannot search the web."})
+
+    base = "https://www.google.com/search"
+    params = {"q": query, "hl": "en", "num": "20"}
+    if kind == "news":
+        params["tbm"] = "nws"
+    url = base + "?" + urllib.parse.urlencode(params)
+
     try:
-        with DDGS() as ddgs:
-            if kind == "news":
-                raw = list(ddgs.news(query, max_results=max_results))
-            else:
-                raw = list(ddgs.text(query, max_results=max_results))
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ])
+            page = browser.new_page()
+            try:
+                page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass  # not fatal; scrape what we have
+                page.wait_for_timeout(1200)  # let the SERP render
+                body_text = page.inner_text("body")
+                if "unusual traffic" in body_text.lower() or "enable javascript" in body_text.lower():
+                    return json.dumps({"error": "google blocked the search request."})
+                results = _parse_google_serp(page, max_results)
+            finally:
+                browser.close()
     except Exception as e:
-        # DuckDuckGo occasionally rate-limits or returns unexpected HTML;
-        # treat it as a tool error the model can recover from.
-        log.warning("DuckDuckGo %s search failed: %s", kind, e)
-        return json.dumps({"error": f"search failed: {e}"})
+        log.warning("Playwright %s search failed: %s", kind, e)
+        return json.dumps({"error": f"playwright search failed: {e}"})
 
-    for r in raw:
-        entry = {
-            "title": r.get("title") or "",
-            "url": r.get("href") or r.get("url") or "",
-            "snippet": r.get("body") or r.get("snippet") or "",
-        }
-        if r.get("date"):
-            entry["date"] = r["date"]
-        norm.append(entry)
-
-    if not norm:
+    if not results:
         return json.dumps({"results": [], "note": "no results"})
-    return json.dumps({"results": norm}, ensure_ascii=False, indent=2)
+    return json.dumps({"results": results, "engine": "google"}, ensure_ascii=False, indent=2)
+
+
+def _parse_google_serp(page, max_results: int) -> list[dict]:
+    """Extract {title, url, snippet} from a rendered Google results page.
+
+    Uses a defensive selector/layout: primary results are `<h3>` titles inside
+    `#search` (anchored by `a h3`); the snippet sits in the block's `.VwiC3b`
+    node. Falls back to `#search a h3` / `.g h3` if the newer class names are
+    absent (Google rotates its markup). URLs are taken from the nearest anchor
+    `href`. Returns deduped results limited to `max_results`.
+    """
+    blocks = []
+    try:
+        blocks = page.eval_on_selector_all(
+            "#search > div > div a h3, #search a h3",
+            """els => els.map(h3 => {
+                const a = h3.closest('a');
+                const container = h3.closest('div[data-sncf], div.g');
+                let snippet = '';
+                const sn = container && container.querySelector('.VwiC3b');
+                if (sn) snippet = sn.innerText || '';
+                return {title: h3.textContent || '', url: a ? a.href : '', snippet};
+            })""",
+        )
+    except Exception:
+        blocks = []
+
+    norm = []
+    seen = set()
+    for b in blocks:
+        title = (b.get("title") or "").strip()
+        url = b.get("url") or ""
+        if not title or not url or url.startswith("javascript") or url in seen:
+            continue
+        if not url.startswith("http"):
+            continue
+        seen.add(url)
+        norm.append({
+            "title": title,
+            "url": url,
+            "snippet": (b.get("snippet") or "").strip(),
+        })
+        if len(norm) >= max_results:
+            break
+    return norm
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +610,7 @@ async def run_tool(name: str, arguments: dict, ctx: dict | None = None) -> str:
         if inspect.iscoroutinefunction(handler):
             result = await handler(arguments or {}, ctx or {})
         else:
-            # Sync handlers (DuckDuckGo searches, etc.) run in a worker
+            # Sync handlers (Playwright web search, etc.) run in a worker
             # thread so the HTTP round-trip doesn't block the event loop,
             # which also serves the WebSocket receive loop.
             result = await asyncio.to_thread(handler, arguments or {}, ctx or {})
